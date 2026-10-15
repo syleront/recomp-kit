@@ -21,9 +21,17 @@ uint32_t resource_find(uint32_t type_id_or_name, uint32_t name_id_or_name,
 uint32_t resource_find_in(uint32_t module, uint32_t type_id_or_name, uint32_t name_id_or_name,
                           bool ansi, std::string *why = nullptr);
 // Map a resource-only DLL from the host file system as data in the guest heap
-// and return its base (its HMODULE), or 0.
+// and return its base (its HMODULE), or 0. The new mapping starts with one
+// reference.
 uint32_t resource_map_module(const std::string &host_path);
-// True for 0, the executable's base and any mapped resource-only DLL.
+// Acquire another reference on a module resource_map_module mapped (LoadLibrary
+// of an already-mapped name), or release one (FreeLibrary). The last release
+// frees the guest image. Both return false when `module` is not a mapped data
+// module; release sets *freed when it actually freed the image.
+bool resource_module_add_ref(uint32_t module);
+bool resource_module_release(uint32_t module, bool *freed = nullptr);
+// True for 0, the executable's base and any mapped resource-only DLL. A module
+// that has been fully released is no longer one.
 bool resource_is_module(uint32_t module);
 // Validate a data-entry handle and return its image-backed payload and size.
 uint32_t resource_data(uint32_t entry, uint32_t *size, std::string *why = nullptr);
