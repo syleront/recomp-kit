@@ -6629,9 +6629,14 @@ static void test_data_module_lifetime() {
           (unsigned long long)loaded_bytes, (unsigned long long)heap_stats().used_bytes);
     check(call_import(&c, "KERNEL32.dll", "GetModuleHandleA", {s}) == 0,
           "GetModuleHandle reports the freed module unloaded");
+    check(call_import(&c, "KERNEL32.dll", "FreeLibrary", {h1}) == 0 &&
+              call_import(&c, "KERNEL32.dll", "GetLastError", {}) == 6,
+          "a FreeLibrary after the final release fails with ERROR_INVALID_HANDLE");
 
     uint32_t h3 = call_import(&c, "KERNEL32.dll", "LoadLibraryA", {s});
     check(h3 != 0 && resource_is_module(h3), "a later load maps it again at %08x", h3);
+    check(call_import(&c, "KERNEL32.dll", "GetModuleHandleA", {s}) == h3,
+          "the reload clears it from the freed set, so GetModuleHandle finds it");
     check(call_import(&c, "KERNEL32.dll", "FreeLibrary", {h3}) == 1 && !resource_is_module(h3) &&
               heap_stats().used_bytes == before.used_bytes,
           "and the reload can be freed again, returning the arena to its baseline");

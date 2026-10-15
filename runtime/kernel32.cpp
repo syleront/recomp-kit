@@ -1204,6 +1204,9 @@ void load_library_named(X86 *c, const std::string &module_name) {
         if (!host.empty() && os_stat(host.c_str(), &st) == 0 && st.is_regular) {
             if (uint32_t base = resource_map_module(host)) {
                 modules()[name] = base;
+                // Mapped again: any earlier release no longer marks it as
+                // unloaded, so GetModuleHandle resolves it from modules().
+                freed_data_modules().erase(name);
                 LOGW("LoadLibrary(\"%s\") -> resource module %08x", module_name.c_str(), base);
                 set_eax(c, base);
                 return;
@@ -1260,14 +1263,34 @@ void k_FreeLibrary(X86 *c) {
         // what lets a content scan that loads and frees hundreds of files
         // reclaim the arena instead of exhausting it.
         bool freed = false;
-        if (resource_module_release(handle, &freed) && freed) {
-            for (auto it = modules().begin(); it != modules().end(); ++it) {
-                if (it->second != handle)
-                    continue;
-                LOGW("FreeLibrary(%08x): released data module \"%s\"", handle, it->first.c_str());
-                freed_data_modules().insert(it->first);
-                modules().erase(it);
-                break;
+        if (resource_module_release(handle, &freed)) {
+            if (freed) {
+                for (auto it = modules().begin(); it != modules().end(); ++it) {
+                    if (it->second != handle)
+                        continue;
+                    LOGW("FreeLibrary(%08x): released data module \"%s\"", handle, it->first.c_str());
+                    freed_data_modules().insert(it->first);
+                    modules().erase(it);
+                    break;
+                }
+            }
+        } else {
+            // Not a data module this runtime mapped. A pseudo handle (a
+            // registered shim DLL with process lifetime) is still a live
+            // module and frees successfully; any other value was never mapped,
+            // so fail the way Win32 and the loader path above do rather than
+            // returning TRUE for a handle the runtime does not own.
+            bool known = false;
+            for (const auto &kv : modules()) {
+                if (kv.second == handle) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                set_last_error(ERROR_INVALID_HANDLE_);
+                set_eax(c, 0);
+                return;
             }
         }
     }
