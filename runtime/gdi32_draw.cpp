@@ -485,6 +485,19 @@ void frame_region(X86 *c) {
                 write_pixel(arg(c, 0), x, y, color);
     set_eax(c, 1);
 }
+// FillRgn paints a region's rectangle with a brush. Regions here are single
+// rectangles, so this is FillRect with the brush supplied explicitly.
+void fill_region(X86 *c) {
+    auto it = objects().find(arg(c, 1));
+    uint32_t color;
+    if (it == objects().end() || it->second.kind != Object::Region ||
+        !brush_color(arg(c, 2), &color)) {
+        set_eax(c, 0);
+        return;
+    }
+    fill(arg(c, 0), it->second.rect, color);
+    set_eax(c, 1);
+}
 void clip_rect(X86 *c, bool exclude) {
     uint32_t hdc = arg(c, 0);
     auto *dc = dc_of(hdc);
@@ -633,6 +646,7 @@ void register_draw() {
                                        G("SetRectRgn", 5, set_region),
                                        G("GetRgnBox", 2, region_box),
                                        G("FrameRgn", 5, frame_region),
+                                       G("FillRgn", 3, fill_region),
                                        G("IntersectClipRect", 5, intersect_clip),
                                        G("ExcludeClipRect", 5, exclude_clip),
                                        G("GetClipBox", 2, get_clip),

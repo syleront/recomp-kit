@@ -36,6 +36,25 @@ void create_font(X86 *c) {
     memcpy(font.logfont.data(), g_mem + p, 92);
     set_eax(c, make_object(font));
 }
+// CreateFontIndirectA receives a 60-byte LOGFONTA. The fourteen scalar fields
+// before lfFaceName are identical to LOGFONTW, only the 32-byte face name
+// differs; widening it gives the same 92-byte object the W form stores.
+void create_font_a(X86 *c) {
+    uint32_t p = arg(c, 0);
+    if (!p || !gm_valid(p, 60)) {
+        set_eax(c, 0);
+        return;
+    }
+    Object font;
+    font.kind = Object::Font;
+    memcpy(font.logfont.data(), g_mem + p, 28);
+    size_t n = 0;
+    while (n < 31 && rd8(p + 28 + n))
+        ++n;
+    for (size_t i = 0; i < n; ++i)
+        font.logfont[28 + 2 * i] = rd8(p + 28 + i);
+    set_eax(c, make_object(font));
+}
 // TEXTMETRICW is 60 bytes on x86: eleven DWORDs, four UTF-16
 // characters, five BYTE fields and three bytes of trailing padding.
 void metrics(uint32_t out, int32_t scale, uint32_t weight) {
@@ -172,24 +191,42 @@ void get_metrics(X86 *c) {
     }
     set_eax(c, 1);
 }
-void extent(X86 *c) {
-    uint32_t dc = arg(c, 0), text = arg(c, 1), n = arg(c, 2), out = arg(c, 3);
+bool extent_units(uint32_t dc, uint32_t text, uint32_t n, uint32_t out) {
     if (!dc_of(dc) || !out || !gm_valid(out, 8) || n > GUEST_SIZE / 2 ||
-        (n && (!text || !gm_valid(text, n * 2)))) {
-        set_eax(c, 0);
-        return;
-    }
+        (n && (!text || !gm_valid(text, n * 2))))
+        return false;
     const Pen pen = pen_of(dc);
     uint64_t width = 0;
     for (uint32_t i = 0; i < n; ++i)
         width += uint64_t(pen.advance(rd16(text + 2 * i)));
-    if (width > INT_MAX) {
+    if (width > INT_MAX)
+        return false;
+    wr32(out, uint32_t(width));
+    wr32(out + 4, uint32_t(pen.height()));
+    return true;
+}
+void extent(X86 *c) {
+    set_eax(c, extent_units(arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)));
+}
+// GetTextExtentPoint32A widens the byte string into a temporary guest buffer so
+// the one measurement path (with its TrueType/bitmap font choice) serves both.
+void extent_a(X86 *c) {
+    uint32_t dc = arg(c, 0), text = arg(c, 1), n = arg(c, 2), out = arg(c, 3);
+    if (!dc_of(dc) || !out || !gm_valid(out, 8)) {
         set_eax(c, 0);
         return;
     }
-    wr32(out, uint32_t(width));
-    wr32(out + 4, uint32_t(pen.height()));
-    set_eax(c, 1);
+    std::string s = n == 0xffffffffu ? gm_str(text) : gm_str(text, n);
+    uint32_t cap = uint32_t(s.size()) + 1;
+    uint32_t buf = heap_alloc(cap * 2, true);
+    if (!buf) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t units = gm_put_wstr(buf, s, cap);
+    bool ok = extent_units(dc, buf, units, out);
+    heap_free(buf);
+    set_eax(c, ok);
 }
 void text_out(X86 *c) {
     uint32_t hdc = arg(c, 0), flags = arg(c, 3), rp = arg(c, 4), text = arg(c, 5), n = arg(c, 6),
@@ -423,13 +460,16 @@ void register_text() {
         "GDI32.dll", n, a, f                                                                       \
     }
     static const ImportShim shims[] = {G("CreateFontIndirectW", 1, create_font),
+                                       G("CreateFontIndirectA", 1, create_font_a),
                                        G("ExtTextOutW", 8, text_out),
                                        G("GetTextExtentPoint32W", 4, extent),
+                                       G("GetTextExtentPoint32A", 4, extent_a),
                                        G("GetTextExtentPointW", 4, extent),
                                        G("GetTextMetricsW", 2, get_metrics),
                                        G("AddFontMemResourceEx", 4, memory_font),
                                        G("EnumFontsW", 4, enumerate),
                                        G("EnumFontFamiliesExW", 5, enumerate),
+                                       G("EnumFontFamiliesExA", 5, enumerate),
                                        G("CreateEnhMetaFileW", 4, unsupported),
                                        G("CreateEnhMetaFileA", 4, unsupported),
                                        G("CloseEnhMetaFile", 1, unsupported),

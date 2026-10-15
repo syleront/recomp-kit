@@ -21,7 +21,7 @@ struct DcState {
     uint32_t pen = 0x4f107, brush = 0x4f100, font = 0x4f10d;
     uint32_t bitmap = 0, palette = 0, region = 0;
     uint32_t text_color = 0, bk_color = 0xffffff;
-    int bk_mode = 2, rop2 = 13, stretch_mode = 1;
+    int bk_mode = 2, rop2 = 13, stretch_mode = 1, map_mode = 1;
     int32_t pos_x = 0, pos_y = 0;
     bool clipped = false;
     std::vector<Rect> clip;

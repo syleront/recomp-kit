@@ -3,6 +3,7 @@
 #include "user32_internal.h"
 #include "memory.h"
 #include "win32.h"
+#include "resources.h"
 #include "gdi_image.h"
 #include <algorithm>
 #include <set>
@@ -891,16 +892,17 @@ void remove_menu_item(X86 *c) {
 void delete_menu_item(X86 *c) {
     remove_menu(c, true);
 }
-void menu_string(X86 *c) {
+void menu_string(X86 *c, bool ansi) {
     auto *m = menu_item(arg(c, 0), arg(c, 1), arg(c, 4) & 0x400);
     if (!m) {
         set_eax(c, 0);
         return;
     }
-    set_eax(c, !arg(c, 2) || !arg(c, 3) ? wide_units(m->text)
-                                        : put_text(arg(c, 2), arg(c, 3), m->text, true));
+    bool text_only = !arg(c, 2) || !arg(c, 3);
+    set_eax(c, text_only ? (ansi ? uint32_t(m->text.size()) : wide_units(m->text))
+                         : put_text(arg(c, 2), arg(c, 3), m->text, !ansi));
 }
-bool read_menu_info(uint32_t p, MenuItem *item) {
+bool read_menu_info(uint32_t p, MenuItem *item, bool ansi = false) {
     if (!p || !gm_valid(p, 44) || (rd32(p) != 44 && rd32(p) != 48) || !gm_valid(p, rd32(p)))
         return false;
     uint32_t mask = rd32(p + 4);
@@ -922,7 +924,7 @@ bool read_menu_info(uint32_t p, MenuItem *item) {
     if (mask & 32)
         item->data = rd32(p + 32);
     if ((mask & 0x40) || ((mask & 0x10) && !(item->type & 0x904)))
-        item->text = gm_wstr(rd32(p + 36));
+        item->text = ansi ? gm_str(rd32(p + 36)) : gm_wstr(rd32(p + 36));
     if (mask & 0x10) {
         if (item->type & 0x100)
             item->data = rd32(p + 36);
@@ -933,7 +935,7 @@ bool read_menu_info(uint32_t p, MenuItem *item) {
         item->bitmap = rd32(p + 44);
     return true;
 }
-void get_menu_info(X86 *c) {
+void get_menu_info(X86 *c, bool ansi) {
     auto *m = menu_item(arg(c, 0), arg(c, 1), arg(c, 2) != 0);
     uint32_t p = arg(c, 3);
     if (!m || !p || !gm_valid(p, 44) || (rd32(p) != 44 && rd32(p) != 48) || !gm_valid(p, rd32(p))) {
@@ -957,7 +959,8 @@ void get_menu_info(X86 *c) {
         wr32(p + 32, m->data);
     if ((mask & 0x40) || ((mask & 0x10) && !(m->type & 0x904))) {
         uint32_t out = rd32(p + 36), cap = rd32(p + 40);
-        wr32(p + 40, out && cap ? put_text(out, cap, m->text, true) : wide_units(m->text));
+        wr32(p + 40, out && cap ? put_text(out, cap, m->text, !ansi)
+                                : (ansi ? uint32_t(m->text.size()) : wide_units(m->text)));
     }
     if (mask & 0x10) {
         if (m->type & 0x100)
@@ -983,12 +986,12 @@ bool menu_contains(uint32_t root, uint32_t target, std::set<uint32_t> *seen = nu
             return true;
     return false;
 }
-void set_menu_info(X86 *c) {
+void set_menu_info(X86 *c, bool ansi) {
     auto *m = menu_item(arg(c, 0), arg(c, 1), arg(c, 2) != 0);
     MenuItem copy;
     if (m)
         copy = *m;
-    bool ok = m && read_menu_info(arg(c, 3), &copy) &&
+    bool ok = m && read_menu_info(arg(c, 3), &copy, ansi) &&
               (!copy.submenu || !menu_contains(copy.submenu, arg(c, 0)));
     if (ok)
         *m = copy;
@@ -1010,29 +1013,104 @@ bool insert_item(uint32_t menu, uint32_t before, bool position, const MenuItem &
     }
     return false;
 }
-void insert_menu_info(X86 *c) {
+void insert_menu_info(X86 *c, bool ansi) {
     MenuItem item;
-    set_eax(c, read_menu_info(arg(c, 3), &item) &&
+    set_eax(c, read_menu_info(arg(c, 3), &item, ansi) &&
                    insert_item(arg(c, 0), arg(c, 1), arg(c, 2) != 0, item));
 }
-void insert_menu(X86 *c) {
+// Build a menu item from the MF_* flag word InsertMenu/AppendMenu/ModifyMenu
+// share. id_or_submenu is uIDNewItem; item_value is the text/data/bitmap,
+// read as ANSI or UTF-16 text when it names a string.
+MenuItem item_from_flags(uint32_t flags, uint32_t id_or_submenu, uint32_t item_value, bool ansi) {
     MenuItem item;
-    uint32_t flags = arg(c, 2), value = arg(c, 4);
     item.type = flags & 0x6b64;
     item.state = flags & 0xb;
     if (flags & 0x10)
-        item.submenu = arg(c, 3);
+        item.submenu = id_or_submenu;
     else
-        item.id = arg(c, 3);
+        item.id = id_or_submenu;
     if (flags & 0x100)
-        item.data = value;
+        item.data = item_value;
     else if (flags & 4)
-        item.bitmap = value;
+        item.bitmap = item_value;
     else if (!(flags & 0x800))
-        item.text = gm_wstr(value);
+        item.text = ansi ? gm_str(item_value) : gm_wstr(item_value);
+    return item;
+}
+void insert_menu(X86 *c, bool ansi) {
+    uint32_t flags = arg(c, 2);
+    MenuItem item = item_from_flags(flags, arg(c, 3), arg(c, 4), ansi);
     bool ok = (!item.submenu || menus.count(item.submenu)) &&
               insert_item(arg(c, 0), arg(c, 1), flags & 0x400, item);
     set_eax(c, ok);
+}
+// AppendMenu adds at the end; ModifyMenu replaces the item at the given
+// command or position, discarding its old checked/unchecked bitmaps.
+void append_menu_a(X86 *c) {
+    uint32_t flags = arg(c, 1);
+    MenuItem item = item_from_flags(flags, arg(c, 2), arg(c, 3), true);
+    set_eax(c, (!item.submenu || menus.count(item.submenu)) &&
+                   insert_item(arg(c, 0), 0xffffffffu, false, item));
+}
+void modify_menu_a(X86 *c) {
+    uint32_t flags = arg(c, 2);
+    MenuItem item = item_from_flags(flags, arg(c, 3), arg(c, 4), true);
+    auto *m = menu_item(arg(c, 0), arg(c, 1), flags & 0x400);
+    bool ok = m && (!item.submenu || menus.count(item.submenu));
+    if (ok)
+        *m = item;
+    set_eax(c, ok);
+}
+void set_menu_item_bitmaps(X86 *c) {
+    auto *m = menu_item(arg(c, 0), arg(c, 1), arg(c, 2) & 0x400);
+    if (m) {
+        m->checked = arg(c, 3);
+        m->unchecked = arg(c, 4);
+    }
+    set_eax(c, m != nullptr);
+}
+// LoadMenuA reads an RT_MENU template out of hInstance. Only the top level of
+// the template is walked; MF_POPUP submenu templates nested inside a resource
+// are not entered, so a popup becomes an empty submenu.
+void parse_menu_template(uint32_t p, uint32_t end, Menu &menu) {
+    uint32_t q = p + 4; // MENUHEADER: wVersion, cbHeaderSize
+    while (q + 4 <= end) {
+        uint32_t flags = rd16(q), id = rd16(q + 2);
+        q += 4;
+        if (!flags)
+            break;
+        MenuItem item;
+        item.type = flags & 0x1f;
+        item.state = flags & 0xe0;
+        item.id = id;
+        std::string text;
+        while (q + 2 <= end && rd16(q)) {
+            uint16_t unit = rd16(q);
+            text += unit < 0x80 ? char(unit) : '?';
+            q += 2;
+        }
+        if (q + 2 <= end)
+            q += 2; // the terminating NUL
+        item.text = text;
+        if (flags & 0x10) { // MF_POPUP
+            uint32_t sub = new_menu();
+            item.submenu = sub;
+            item.id = 0;
+        }
+        menu.items.push_back(item);
+    }
+}
+void load_menu_a(X86 *c) {
+    std::string why;
+    uint32_t entry = resource_find_in(arg(c, 0), 4 /* RT_MENU */, arg(c, 1), true, &why);
+    uint32_t bytes = 0, p = entry ? resource_data(entry, &bytes, &why) : 0;
+    if (!p) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t handle = new_menu();
+    parse_menu_template(p, p + bytes, menus[handle]);
+    set_eax(c, handle);
 }
 // Private clipboard ownership never reaches the host clipboard. GlobalAlloc
 // handles in this runtime are guest heap addresses; EmptyClipboard releases them.
@@ -1130,6 +1208,47 @@ void create_accelerator(X86 *c) {
 }
 void destroy_accelerator(X86 *c) {
     set_eax(c, accelerators.erase(arg(c, 0)) != 0);
+}
+void load_accelerators_a(X86 *c) {
+    std::string why;
+    uint32_t entry = resource_find_in(arg(c, 0), 9 /* RT_ACCELERATOR */, arg(c, 1), true, &why);
+    uint32_t bytes = 0, p = entry ? resource_data(entry, &bytes, &why) : 0;
+    if (!p || !bytes || bytes % 6) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t handle = next_accelerator++;
+    accelerators[handle] = std::vector<uint8_t>(g_mem + p, g_mem + p + bytes);
+    set_eax(c, handle);
+}
+// An accelerator entry is six bytes: a flag byte, a WORD key and a WORD
+// command. FVIRTKEY (1) selects a virtual key; the shift/ctrl/alt bits are not
+// enforced, so a matching key is translated regardless of modifier state. The
+// WM_COMMAND is delivered synchronously, which is how a modal menu is driven.
+void translate_accelerator_a(X86 *c) {
+    uint32_t hwnd = arg(c, 0), table = arg(c, 1), msg = arg(c, 2);
+    auto it = accelerators.find(table);
+    if (!msg || it == accelerators.end() || !gm_valid(msg, 28) || !find_window(hwnd)) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t message = rd32(msg + 4);
+    if (message != 0x0100 && message != 0x0104) { // WM_KEYDOWN / WM_SYSKEYDOWN
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t vk = rd32(msg + 8);
+    const std::vector<uint8_t> &bytes = it->second;
+    for (size_t i = 0; i + 6 <= bytes.size(); i += 6) {
+        uint16_t key = uint16_t(bytes[i + 1] | (bytes[i + 2] << 8));
+        uint16_t command = uint16_t(bytes[i + 3] | (bytes[i + 4] << 8));
+        if ((bytes[i] & 0x01) && key == vk) {
+            host_dispatch_to_wndproc(c, hwnd, 0x0111 /* WM_COMMAND */, command, 1);
+            set_eax(c, 1);
+            return;
+        }
+    }
+    set_eax(c, 0);
 }
 // System brushes are stable cached handles, also accepting COLOR_* + 1 as
 // FillRect does. Window DC presentation remains with the GDI surface layer.
@@ -1359,6 +1478,37 @@ void icon_info(X86 *c) {
     set_eax(c, 1);
 }
 
+void get_menu_string_w(X86 *c) {
+    menu_string(c, false);
+}
+void get_menu_string_a(X86 *c) {
+    menu_string(c, true);
+}
+void get_menu_info_w(X86 *c) {
+    get_menu_info(c, false);
+}
+void get_menu_info_a(X86 *c) {
+    get_menu_info(c, true);
+}
+void set_menu_info_w(X86 *c) {
+    set_menu_info(c, false);
+}
+void set_menu_info_a(X86 *c) {
+    set_menu_info(c, true);
+}
+void insert_menu_w(X86 *c) {
+    insert_menu(c, false);
+}
+void insert_menu_a(X86 *c) {
+    insert_menu(c, true);
+}
+void insert_menu_info_w(X86 *c) {
+    insert_menu_info(c, false);
+}
+void insert_menu_info_a(X86 *c) {
+    insert_menu_info(c, true);
+}
+
 const ImportShim shims[] = {
 #define U(name, n, fn) {"USER32.dll", name, n, fn}
     U("SetTimer", 4, set_timer),
@@ -1438,11 +1588,22 @@ const ImportShim shims[] = {
     U("DrawMenuBar", 1, yes),
     U("TrackPopupMenu", 7, zero),
     U("EndMenu", 0, yes),
-    U("GetMenuStringW", 5, menu_string),
-    U("GetMenuItemInfoW", 4, get_menu_info),
-    U("SetMenuItemInfoW", 4, set_menu_info),
-    U("InsertMenuW", 5, insert_menu),
-    U("InsertMenuItemW", 4, insert_menu_info),
+    U("GetMenuStringW", 5, get_menu_string_w),
+    U("GetMenuStringA", 5, get_menu_string_a),
+    U("GetMenuItemInfoW", 4, get_menu_info_w),
+    U("GetMenuItemInfoA", 4, get_menu_info_a),
+    U("SetMenuItemInfoW", 4, set_menu_info_w),
+    U("SetMenuItemInfoA", 4, set_menu_info_a),
+    U("InsertMenuW", 5, insert_menu_w),
+    U("InsertMenuA", 5, insert_menu_a),
+    U("InsertMenuItemW", 4, insert_menu_info_w),
+    U("InsertMenuItemA", 4, insert_menu_info_a),
+    U("AppendMenuA", 4, append_menu_a),
+    U("ModifyMenuA", 5, modify_menu_a),
+    U("SetMenuItemBitmaps", 5, set_menu_item_bitmaps),
+    U("LoadMenuA", 2, load_menu_a),
+    U("LoadAcceleratorsA", 2, load_accelerators_a),
+    U("TranslateAcceleratorA", 3, translate_accelerator_a),
     U("GetScrollPos", 2, win32_get_scroll_pos),
     U("SetScrollPos", 4, win32_set_scroll_pos),
     U("GetScrollRange", 4, win32_get_scroll_range),
@@ -1460,6 +1621,7 @@ const ImportShim shims[] = {
     U("RegisterClipboardFormatW", 1, register_clipboard),
     U("RegisterWindowMessageW", 1, register_message),
     U("SetWindowsHookExW", 4, set_hook),
+    U("SetWindowsHookExA", 4, set_hook),
     U("UnhookWindowsHookEx", 1, unhook),
     U("CallNextHookEx", 4, zero),
     U("CreateAcceleratorTableW", 2, create_accelerator),

@@ -759,6 +759,39 @@ void g_SetBkMode(X86 *c) {
     dc.bk_mode = arg(c, 1);
     set_eax(c, prev);
 }
+void g_GetBkMode(X86 *c) {
+    auto *found = dc_of(arg(c, 0));
+    set_eax(c, found ? uint32_t(found->bk_mode) : 0);
+}
+// CreatePen(iStyle, cWidth, color) is CreatePenIndirect's three scalars: a pen
+// object in the same representation, with the COLORREF stored unconverted.
+void g_CreatePen(X86 *c) {
+    Object o;
+    o.kind = Object::Pen;
+    o.style = arg(c, 0);
+    o.width = int32_t(arg(c, 1));
+    o.color = arg(c, 2);
+    set_eax(c, make_object(o));
+}
+// A mapping mode only decides how logical coordinates reach device space. The
+// runtime models origin translation, so the mode is remembered and reported
+// back; MM_TEXT (1) remains the effective behaviour.
+void g_SetMapMode(X86 *c) {
+    auto *found = dc_of(arg(c, 0));
+    if (!found) {
+        set_eax(c, 0);
+        return;
+    }
+    int prev = found->map_mode;
+    found->map_mode = int(arg(c, 1));
+    set_eax(c, uint32_t(prev));
+}
+// CreateICA asks for an information context, which is a DC used only for
+// measurements. A fresh memory DC serves; the driver, device and DEVMODE
+// arguments are not consulted.
+void g_CreateICA(X86 *c) {
+    set_eax(c, gdi_new_dc());
+}
 
 const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "CreateFontA", 14, nullptr},
@@ -787,6 +820,10 @@ const ImportShim g_gdi32_shims[] = {
     {"GDI32.dll", "SetTextColor", 2, g_SetTextColor},
     {"GDI32.dll", "SetBkColor", 2, g_SetBkColor},
     {"GDI32.dll", "SetBkMode", 2, g_SetBkMode},
+    {"GDI32.dll", "GetBkMode", 1, g_GetBkMode},
+    {"GDI32.dll", "CreatePen", 3, g_CreatePen},
+    {"GDI32.dll", "SetMapMode", 2, g_SetMapMode},
+    {"GDI32.dll", "CreateICA", 4, g_CreateICA},
 };
 const size_t g_gdi32_shim_count = sizeof(g_gdi32_shims) / sizeof(g_gdi32_shims[0]);
 

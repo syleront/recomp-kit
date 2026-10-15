@@ -7,10 +7,13 @@
 #include "user32_internal.h"
 #include "gdi_image.h"
 #include "win32.h"
+#include "resources.h"
 #include "../platform/os.h"
 #include "memory.h"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <deque>
 #include <map>
 #include <string>
@@ -1687,6 +1690,620 @@ void u_MapVirtualKeyA(X86 *c) {
     set_eax(c, map_virtual_key(arg(c, 0), arg(c, 1)));
 }
 
+// ---------------------------------------------------------------------------
+// Rectangles: the three pure-integer helpers the game drives its layout with.
+// Point arguments (PtInRect's POINT) arrive as two dwords, as stdcall passes
+// an 8-byte aggregate.
+// ---------------------------------------------------------------------------
+bool as_rect(uint32_t p, int32_t r[4]) {
+    if (!p || !gm_valid(p, 16))
+        return false;
+    for (int i = 0; i < 4; ++i)
+        r[i] = int32_t(rd32(p + 4 * (uint32_t)i));
+    return true;
+}
+void u_InflateRect(X86 *c) {
+    uint32_t p = arg(c, 0);
+    int32_t r[4];
+    if (!as_rect(p, r)) {
+        set_eax(c, 0);
+        return;
+    }
+    int32_t dx = int32_t(arg(c, 1)), dy = int32_t(arg(c, 2));
+    wr32(p + 0, uint32_t(r[0] - dx));
+    wr32(p + 4, uint32_t(r[1] - dy));
+    wr32(p + 8, uint32_t(r[2] + dx));
+    wr32(p + 12, uint32_t(r[3] + dy));
+    set_eax(c, 1);
+}
+void u_OffsetRect(X86 *c) {
+    uint32_t p = arg(c, 0);
+    int32_t r[4];
+    if (!as_rect(p, r)) {
+        set_eax(c, 0);
+        return;
+    }
+    int32_t dx = int32_t(arg(c, 1)), dy = int32_t(arg(c, 2));
+    wr32(p + 0, uint32_t(r[0] + dx));
+    wr32(p + 4, uint32_t(r[1] + dy));
+    wr32(p + 8, uint32_t(r[2] + dx));
+    wr32(p + 12, uint32_t(r[3] + dy));
+    set_eax(c, 1);
+}
+void u_PtInRect(X86 *c) {
+    int32_t r[4];
+    if (!as_rect(arg(c, 0), r)) {
+        set_eax(c, 0);
+        return;
+    }
+    int32_t x = int32_t(arg(c, 1)), y = int32_t(arg(c, 2));
+    set_eax(c, x >= r[0] && x < r[2] && y >= r[1] && y < r[3]);
+}
+// InvertRect XORs every pixel of the rectangle's RGB. Only the intersection
+// with the DC's drawable size is touched; out-of-range rectangles are clipped.
+void u_InvertRect(X86 *c) {
+    uint32_t dc = arg(c, 0), rp = arg(c, 1);
+    int32_t r[4];
+    int dw = 0, dh = 0;
+    if (!gdi::dc_size(dc, &dw, &dh) || !as_rect(rp, r)) {
+        set_eax(c, 0);
+        return;
+    }
+    int32_t l = std::max<int32_t>(0, r[0]), t = std::max<int32_t>(0, r[1]);
+    int32_t rr = std::min<int32_t>(dw, r[2]), b = std::min<int32_t>(dh, r[3]);
+    for (int32_t y = t; y < b; ++y)
+        for (int32_t x = l; x < rr; ++x) {
+            uint32_t p;
+            if (gdi::read_pixel(dc, x, y, &p))
+                gdi::write_pixel(dc, x, y, p ^ 0x00ffffffu);
+        }
+    set_eax(c, l < rr && t < b);
+}
+
+// ---------------------------------------------------------------------------
+// Windows: the handful of entry points the game uses to place its frame.
+// ---------------------------------------------------------------------------
+// MoveWindow keeps its stacking (SWP_NOZORDER) and repaints the whole client
+// when asked, which for this runtime is the update flag BeginPaint answers.
+void u_MoveWindow(X86 *c) {
+    Window *w = find_window(arg(c, 0));
+    if (!w) {
+        set_last_error(1400); // ERROR_INVALID_WINDOW_HANDLE
+        set_eax(c, 0);
+        return;
+    }
+    bool repaint = arg(c, 5) != 0;
+    set_window_pos(c, w, 0, int32_t(arg(c, 1)), int32_t(arg(c, 2)), int32_t(arg(c, 3)),
+                   int32_t(arg(c, 4)), 0x0004 /* SWP_NOZORDER */);
+    if (repaint)
+        if (Window *after = find_window(arg(c, 0)))
+            after->update_pending = true;
+    set_eax(c, 1);
+}
+// BringWindowToTop raises the window within its own popup group, as Windows
+// does; it does not activate it.
+void u_BringWindowToTop(X86 *c) {
+    Window *w = find_window(arg(c, 0));
+    if (w)
+        reorder_window(w->hwnd, 0);
+    set_eax(c, w != nullptr);
+}
+void u_GetWindowTextLengthA(X86 *c) {
+    set_eax(c, deliver_message(c, arg(c, 0), 0x000e /* WM_GETTEXTLENGTH */, 0, 0, false));
+}
+// ScrollWindowEx scrolls a client rectangle. The runtime keeps no stored
+// pixels to blit, so the window is invalidated and repainted whole: the caller
+// sees a SIMPLEREGION and the paint handler draws the new offset.
+void u_ScrollWindowEx(X86 *c) {
+    Window *w = find_window(arg(c, 0));
+    if (!w) {
+        set_eax(c, 0);
+        return;
+    }
+    w->update_pending = true;
+    // The whole client is repainted, so the reported update rectangle is it.
+    if (uint32_t update = arg(c, 6))
+        if (gm_valid(update, 16)) {
+            wr32(update + 0, 0);
+            wr32(update + 4, 0);
+            wr32(update + 8, uint32_t(w->w));
+            wr32(update + 12, uint32_t(w->h));
+        }
+    set_eax(c, 2); // SIMPLEREGION
+}
+void u_CallWindowProcA(X86 *c) {
+    set_eax(c, guest_call(c, arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4)));
+}
+// DrawState renders a control-like glyph through a callback. The game uses it
+// for its disabled/checked menu marks; there is no glyph to draw here, so the
+// call succeeds without painting.
+void u_DrawStateA(X86 *c) {
+    log_once("DrawStateA", "DrawStateA: glyph not drawn; reporting success");
+    set_eax(c, 1);
+}
+// WinHelp opens the old WinHelp engine, which does not exist here. Reporting
+// success lets a caller that bails out on failure carry on.
+void u_WinHelpA(X86 *c) {
+    log_once("WinHelpA", "WinHelpA: help is unavailable; reporting success");
+    set_eax(c, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Dialogs and their controls.
+// ---------------------------------------------------------------------------
+// The runtime models a dialog as an ordinary window whose WNDPROC is the
+// caller's DLGPROC, with one child window per control in the template. There
+// is no non-client frame and no z-order between controls beyond the template
+// order. Standard control messages are answered by control_proc; anything the
+// game subclasses must handle itself.
+uint32_t dlg_item(uint32_t parent, uint32_t id) {
+    if (!find_window(parent))
+        return 0;
+    for (const auto &kv : windows())
+        if (kv.second.parent == parent && kv.second.id == id && !kv.second.owner)
+            return kv.first;
+    return 0;
+}
+void u_GetDlgItem(X86 *c) {
+    set_eax(c, dlg_item(arg(c, 0), arg(c, 1)));
+}
+void u_SendDlgItemMessageA(X86 *c) {
+    uint32_t child = dlg_item(arg(c, 0), arg(c, 1));
+    if (!child) {
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, deliver_message(c, child, arg(c, 2), arg(c, 3), arg(c, 4), false));
+}
+void u_GetDlgItemTextA(X86 *c) {
+    uint32_t child = dlg_item(arg(c, 0), arg(c, 1));
+    if (!child) {
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, deliver_message(c, child, 0x000d /* WM_GETTEXT */, arg(c, 3), arg(c, 2), false));
+}
+void u_SetDlgItemInt(X86 *c) {
+    uint32_t child = dlg_item(arg(c, 0), arg(c, 1));
+    if (!child) {
+        set_eax(c, 0);
+        return;
+    }
+    char buf[32];
+    if (arg(c, 3))
+        snprintf(buf, sizeof buf, "%d", int32_t(arg(c, 2)));
+    else
+        snprintf(buf, sizeof buf, "%u", arg(c, 2));
+    uint32_t tmp = heap_alloc(32, true);
+    if (!tmp) {
+        set_eax(c, 0);
+        return;
+    }
+    gm_put_str(tmp, buf, 32);
+    uint32_t result = deliver_message(c, child, 0x000c /* WM_SETTEXT */, 0, tmp, false);
+    heap_free(tmp);
+    set_eax(c, result);
+}
+void u_GetDlgItemInt(X86 *c) {
+    uint32_t child = dlg_item(arg(c, 0), arg(c, 1)), translated = arg(c, 2);
+    if (!child) {
+        if (translated && gm_valid(translated, 4))
+            wr32(translated, 0);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t buf = heap_alloc(64, true);
+    if (!buf) {
+        if (translated && gm_valid(translated, 4))
+            wr32(translated, 0);
+        set_eax(c, 0);
+        return;
+    }
+    deliver_message(c, child, 0x000d, 64, buf, false);
+    std::string s = gm_str(buf);
+    heap_free(buf);
+    size_t i = 0;
+    while (i < s.size() && isspace((unsigned char)s[i]))
+        ++i;
+    bool neg = false;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+')) {
+        neg = s[i] == '-';
+        ++i;
+    }
+    uint64_t value = 0;
+    bool any = false, ok = true;
+    for (; i < s.size() && isdigit((unsigned char)s[i]); ++i) {
+        any = true;
+        value = value * 10 + uint64_t(s[i] - '0');
+        if (value > 0xffffffffull) {
+            ok = false;
+            break;
+        }
+    }
+    ok = ok && any;
+    if (translated && gm_valid(translated, 4))
+        wr32(translated, ok ? 1 : 0);
+    if (!ok) {
+        set_eax(c, 0);
+        return;
+    }
+    if (arg(c, 3))
+        set_eax(c, uint32_t(int32_t(neg ? -int64_t(value) : int64_t(value))));
+    else
+        set_eax(c, uint32_t(value));
+}
+void u_CheckDlgButton(X86 *c) {
+    uint32_t child = dlg_item(arg(c, 0), arg(c, 1));
+    if (child)
+        deliver_message(c, child, 0x00f1 /* BM_SETCHECK */, arg(c, 2), 0, false);
+    set_eax(c, child != 0);
+}
+void u_IsDlgButtonChecked(X86 *c) {
+    uint32_t child = dlg_item(arg(c, 0), arg(c, 1));
+    if (!child) {
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, deliver_message(c, child, 0x00f0 /* BM_GETCHECK */, 0, 0, false));
+}
+// Maps dialog units to pixels with the fixed 8x16 system font the runtime
+// measures everything with: baseunitX is 8, baseunitY is 16.
+void u_MapDialogRect(X86 *c) {
+    uint32_t hwnd = arg(c, 0), p = arg(c, 1);
+    int32_t r[4];
+    if (!find_window(hwnd) || !as_rect(p, r)) {
+        set_eax(c, 0);
+        return;
+    }
+    wr32(p + 0, uint32_t((r[0] * 8) / 4));
+    wr32(p + 4, uint32_t((r[1] * 16) / 8));
+    wr32(p + 8, uint32_t((r[2] * 8) / 4));
+    wr32(p + 12, uint32_t((r[3] * 16) / 8));
+    set_eax(c, 1);
+}
+
+// A modal dialog is identified by the window that is running it; EndDialog
+// records its result and clears the running flag the loop below watches. Both
+// maps are keyed by the dialog's handle.
+std::map<uint32_t, bool> dialog_running;
+std::map<uint32_t, int32_t> dialog_results;
+void u_EndDialog(X86 *c) {
+    uint32_t hwnd = arg(c, 0);
+    if (!find_window(hwnd)) {
+        set_eax(c, 0);
+        return;
+    }
+    dialog_results[hwnd] = int32_t(arg(c, 1));
+    if (dialog_running.count(hwnd))
+        dialog_running[hwnd] = false; // the modal loop tears the window down
+    else
+        destroy_window(c, hwnd); // a modeless caller destroys its own
+    set_eax(c, 1);
+}
+
+// Control windows answer the button-state and text messages the dialog helper
+// imports generate; everything else falls through to DefWindowProc.
+void control_proc(X86 *c) {
+    uint32_t hwnd = arg(c, 0), msg = arg(c, 1);
+    Window *w = find_window(hwnd);
+    switch (msg) {
+    case 0x00f1: // BM_SETCHECK
+        if (w)
+            w->userdata = arg(c, 2);
+        set_eax(c, 0);
+        return;
+    case 0x00f0: // BM_GETCHECK
+        set_eax(c, w ? w->userdata : 0);
+        return;
+    case 0x00f2: // BM_GETSTATE
+        set_eax(c, 0);
+        return;
+    default:
+        def_window_proc(c, w && w->unicode);
+    }
+}
+uint32_t control_proc_addr() {
+    static uint32_t addr = 0;
+    if (!addr)
+        addr = imports_alloc_trampoline("USER32.dll", "DIALOG control procedure", control_proc, 4);
+    return addr;
+}
+// Register the dialog class and the controls a template names. The kit only
+// ships STATIC; the rest are inert windows that still route messages.
+void ensure_dialog_classes() {
+    ensure_system_classes();
+    for (const char *name : {"button", "edit", "combobox", "listbox", "scrollbar"}) {
+        if (classes().count(name))
+            continue;
+        WndClass wc;
+        wc.style = 0x4008; // CS_PARENTDC | CS_DBLCLKS
+        wc.wndproc = control_proc_addr();
+        wc.name = name;
+        wc.atom = 0xc000 + uint32_t(classes().size());
+        classes()[name] = wc;
+        classes()["#atom" + std::to_string(wc.atom)] = wc;
+    }
+    if (!classes().count("#32770")) {
+        WndClass wc;
+        wc.style = 0x0008; // CS_DBLCLKS
+        wc.name = "Dialog";
+        wc.atom = 0xc000 + uint32_t(classes().size());
+        classes()["#32770"] = wc;
+        classes()["#atom" + std::to_string(wc.atom)] = wc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DLGTEMPLATE decoding. Both the classic and the extended (DLGTEMPLATEEX)
+// layouts are read; the menu field is ignored because an owned dialog menu is
+// not modelled. Every length-prefixed string is bounded by the resource size.
+// ---------------------------------------------------------------------------
+struct DlgItemTemplate {
+    uint32_t style = 0, exstyle = 0, id = 0;
+    int16_t x = 0, y = 0, cx = 0, cy = 0;
+    std::string cls, text;
+    bool cls_ordinal = false;
+    uint32_t cls_id = 0;
+};
+struct DlgTemplate {
+    uint32_t style = 0, exstyle = 0;
+    int16_t x = 0, y = 0, cx = 0, cy = 0;
+    std::string menu, cls, title, font;
+    uint16_t pointsize = 0, weight = 0;
+    uint8_t italic = 0, charset = 0;
+    std::vector<DlgItemTemplate> items;
+};
+// A template string: 0x0000 none, 0xffff ordinal, otherwise UTF-16 NUL-ended.
+uint32_t tmpl_string(uint32_t p, uint32_t end, std::string *out, bool *ordinal, uint32_t *ord) {
+    if (p + 2 > end)
+        return 0;
+    uint16_t first = rd16(p);
+    if (first == 0)
+        return p + 2;
+    if (first == 0xffff) {
+        if (p + 4 > end)
+            return 0;
+        if (ordinal)
+            *ordinal = true;
+        if (ord)
+            *ord = rd16(p + 2);
+        return p + 4;
+    }
+    if (out)
+        *out = gm_wstr(p, (end - p) / 2);
+    uint32_t q = p;
+    while (q + 2 <= end && rd16(q))
+        q += 2;
+    return q + 2 <= end ? q + 2 : end;
+}
+bool parse_dlg_item(uint32_t p, uint32_t end, bool extended, DlgItemTemplate *it, uint32_t *next) {
+    if (p + (extended ? 24u : 18u) > end)
+        return false;
+    if (extended) {
+        it->exstyle = rd32(p + 4);
+        it->style = rd32(p + 8);
+        it->x = int16_t(rd16(p + 12));
+        it->y = int16_t(rd16(p + 14));
+        it->cx = int16_t(rd16(p + 16));
+        it->cy = int16_t(rd16(p + 18));
+        it->id = rd32(p + 20);
+        p += 24;
+    } else {
+        it->style = rd32(p);
+        it->exstyle = rd32(p + 4);
+        it->x = int16_t(rd16(p + 8));
+        it->y = int16_t(rd16(p + 10));
+        it->cx = int16_t(rd16(p + 12));
+        it->cy = int16_t(rd16(p + 14));
+        it->id = rd16(p + 16);
+        p += 18;
+    }
+    bool ordinal = false;
+    uint32_t ord = 0;
+    p = tmpl_string(p, end, &it->cls, &ordinal, &ord);
+    it->cls_ordinal = ordinal;
+    it->cls_id = ord;
+    if (!p)
+        return false;
+    p = tmpl_string(p, end, &it->text, nullptr, nullptr);
+    if (!p || p + 2 > end)
+        return false;
+    uint32_t extra = rd16(p);
+    p += 2;
+    if (extra) {
+        if (p + extra > end)
+            return false;
+        p += extra;
+    }
+    *next = p;
+    return true;
+}
+bool parse_dlg_template(uint32_t p, uint32_t size, DlgTemplate *t) {
+    uint32_t end = p + size;
+    bool extended = size >= 4 && rd16(p) == 1 && rd16(p + 2) == 0xffff;
+    uint32_t q;
+    uint16_t count = 0;
+    if (extended) {
+        if (size < 26)
+            return false;
+        t->exstyle = rd32(p + 4);
+        t->style = rd32(p + 8);
+        count = rd16(p + 12);
+        t->x = int16_t(rd16(p + 14));
+        t->y = int16_t(rd16(p + 16));
+        t->cx = int16_t(rd16(p + 18));
+        t->cy = int16_t(rd16(p + 20));
+        q = tmpl_string(p + 22, end, &t->menu, nullptr, nullptr);
+    } else {
+        if (size < 18)
+            return false;
+        t->style = rd32(p);
+        t->exstyle = rd32(p + 4);
+        count = rd16(p + 8);
+        t->x = int16_t(rd16(p + 10));
+        t->y = int16_t(rd16(p + 12));
+        t->cx = int16_t(rd16(p + 14));
+        t->cy = int16_t(rd16(p + 16));
+        q = tmpl_string(p + 18, end, &t->menu, nullptr, nullptr);
+    }
+    if (!q)
+        return false;
+    q = tmpl_string(q, end, &t->cls, nullptr, nullptr);
+    if (!q)
+        return false;
+    q = tmpl_string(q, end, &t->title, nullptr, nullptr);
+    if (!q)
+        return false;
+    if (t->style & 0x40) { // DS_SETFONT / DS_SHELLFONT
+        if (q + 6 > end)
+            return false;
+        t->pointsize = rd16(q);
+        t->weight = rd16(q + 2);
+        t->italic = rd8(q + 4);
+        t->charset = rd8(q + 5);
+        q = tmpl_string(q + 6, end, &t->font, nullptr, nullptr);
+        if (!q)
+            return false;
+    }
+    for (uint16_t i = 0; i < count; ++i) {
+        DlgItemTemplate item;
+        if (!parse_dlg_item(q, end, extended, &item, &q))
+            return false;
+        t->items.push_back(item);
+    }
+    return true;
+}
+std::string dlg_control_class(const DlgItemTemplate &it) {
+    if (it.cls_ordinal) {
+        switch (it.cls_id) {
+        case 0x80:
+            return "button";
+        case 0x81:
+            return "edit";
+        case 0x82:
+            return "static";
+        case 0x83:
+            return "listbox";
+        case 0x84:
+            return "scrollbar";
+        case 0x85:
+            return "combobox";
+        default:
+            break;
+        }
+    }
+    return it.cls.empty() ? "static" : user32::lower(it.cls);
+}
+uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it) {
+    uint32_t hwnd = g_next_hwnd;
+    g_next_hwnd += 4;
+    Window w;
+    w.hwnd = hwnd;
+    w.wndproc = control_proc_addr();
+    w.style = it.style;
+    w.exstyle = it.exstyle;
+    w.x = it.x;
+    w.y = it.y;
+    w.w = it.cx;
+    w.h = it.cy;
+    w.cls = dlg_control_class(it);
+    w.title_utf8 = it.text;
+    w.parent = parent;
+    w.id = it.id;
+    w.thread = guest_current_thread_id();
+    w.visible = true;
+    w.shown = true;
+    windows()[hwnd] = w;
+    window_created(hwnd);
+    return hwnd;
+}
+// DialogBoxParamA reads the template from hInstance, builds the window and its
+// controls, sends WM_INITDIALOG and pumps until EndDialog. Returns -1 when the
+// template cannot be read or nobody can answer the dialog.
+void u_DialogBoxParamA(X86 *c) {
+    uint32_t hinst = arg(c, 0), name = arg(c, 1), parent = arg(c, 2), proc = arg(c, 3),
+             init = arg(c, 4);
+    if (!proc) {
+        set_eax(c, 0xffffffffu);
+        return;
+    }
+    std::string why;
+    uint32_t entry = resource_find_in(hinst, 5 /* RT_DIALOG */, name, true, &why);
+    uint32_t size = 0, p = entry ? resource_data(entry, &size, &why) : 0;
+    DlgTemplate t;
+    if (!p || !parse_dlg_template(p, size, &t)) {
+        log_once("DialogBoxParamA-template",
+                 "DialogBoxParamA: dialog template %u could not be read (%s)", name, why.c_str());
+        set_eax(c, 0xffffffffu);
+        return;
+    }
+    ensure_dialog_classes();
+    uint32_t hwnd = g_next_hwnd;
+    g_next_hwnd += 4;
+    Window w;
+    w.hwnd = hwnd;
+    w.wndproc = proc;
+    w.style = t.style;
+    w.exstyle = t.exstyle;
+    w.x = t.x;
+    w.y = t.y;
+    w.w = t.cx;
+    w.h = t.cy;
+    w.cls = "#32770";
+    w.title_utf8 = t.title;
+    w.parent = parent;
+    w.thread = guest_current_thread_id();
+    w.hinstance = hinst;
+    w.visible = true;
+    w.shown = true;
+    windows()[hwnd] = w;
+    window_created(hwnd);
+    for (const DlgItemTemplate &item : t.items)
+        dlg_create_child(hwnd, item);
+    dialog_running[hwnd] = true;
+    host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, init, 0);
+    while (dialog_running.count(hwnd) && dialog_running[hwnd]) {
+        host_pump_timers(c);
+        pump_window_timers();
+        pump_mouse_input(c);
+        gdi_present_windows();
+        bool dispatched = false;
+        auto &q = queue();
+        for (auto it = q.begin(); it != q.end();) {
+            Msg m = *it;
+            it = q.erase(it);
+            if (m.message == 0x0012) { // WM_QUIT ends the dialog
+                dialog_running[hwnd] = false;
+                break;
+            }
+            last_message = m;
+            uint32_t target = find_window(m.hwnd) ? m.hwnd : hwnd;
+            host_dispatch_to_wndproc(c, target, m.message, m.wparam, m.lparam);
+            dispatched = true;
+            if (!dialog_running.count(hwnd) || !dialog_running[hwnd])
+                break;
+        }
+        if (!dialog_running.count(hwnd) || !dialog_running[hwnd])
+            break;
+        if (dispatched)
+            continue;
+        if (!g_message_waiter) {
+            log_once("DialogBoxParamA-nohost",
+                     "DialogBoxParamA: nothing is queued and there is no host to wait on");
+            break;
+        }
+        g_message_waiter();
+        if (!host_guest_yield())
+            guest_sleep_ms(1);
+    }
+    int32_t result = dialog_results.count(hwnd) ? dialog_results[hwnd] : 0;
+    dialog_results.erase(hwnd);
+    dialog_running.erase(hwnd);
+    if (find_window(hwnd))
+        destroy_window(c, hwnd);
+    set_eax(c, uint32_t(result));
+}
+
 const ImportShim g_user32_shims[] = {
     {"USER32.dll", "RegisterClassA", 1, u_RegisterClassA},
     {"USER32.dll", "UnregisterClassA", 2, u_UnregisterClassA},
@@ -1776,5 +2393,27 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "CloseClipboard", 0, u_CloseClipboard},
     {"USER32.dll", "IsClipboardFormatAvailable", 1, u_IsClipboardFormatAvailable},
     {"USER32.dll", "GetClipboardData", 1, u_GetClipboardData},
+    // Rectangles, window placement and dialogs the game's UI needs.
+    {"USER32.dll", "InflateRect", 3, u_InflateRect},
+    {"USER32.dll", "OffsetRect", 3, u_OffsetRect},
+    {"USER32.dll", "PtInRect", 3, u_PtInRect},
+    {"USER32.dll", "InvertRect", 2, u_InvertRect},
+    {"USER32.dll", "MoveWindow", 6, u_MoveWindow},
+    {"USER32.dll", "BringWindowToTop", 1, u_BringWindowToTop},
+    {"USER32.dll", "GetWindowTextLengthA", 1, u_GetWindowTextLengthA},
+    {"USER32.dll", "ScrollWindowEx", 8, u_ScrollWindowEx},
+    {"USER32.dll", "CallWindowProcA", 5, u_CallWindowProcA},
+    {"USER32.dll", "DrawStateA", 10, u_DrawStateA},
+    {"USER32.dll", "WinHelpA", 4, u_WinHelpA},
+    {"USER32.dll", "GetDlgItem", 2, u_GetDlgItem},
+    {"USER32.dll", "GetDlgItemTextA", 4, u_GetDlgItemTextA},
+    {"USER32.dll", "SetDlgItemInt", 4, u_SetDlgItemInt},
+    {"USER32.dll", "GetDlgItemInt", 4, u_GetDlgItemInt},
+    {"USER32.dll", "SendDlgItemMessageA", 5, u_SendDlgItemMessageA},
+    {"USER32.dll", "CheckDlgButton", 3, u_CheckDlgButton},
+    {"USER32.dll", "IsDlgButtonChecked", 2, u_IsDlgButtonChecked},
+    {"USER32.dll", "EndDialog", 2, u_EndDialog},
+    {"USER32.dll", "DialogBoxParamA", 5, u_DialogBoxParamA},
+    {"USER32.dll", "MapDialogRect", 2, u_MapDialogRect},
 };
 const size_t g_user32_shim_count = sizeof(g_user32_shims) / sizeof(g_user32_shims[0]);

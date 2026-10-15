@@ -271,6 +271,51 @@ void load_bitmap(X86 *c) {
     GdiImage image;
     set_eax(c, p && gdi_decode_image(p, bytes, &image) ? gdi_image_bitmap(image) : 0);
 }
+// The A loaders resolve through hInstance: the game keeps its strings and
+// bitmaps in resource-only DLLs that LoadLibrary maps, and only the module
+// handle says which file to read. The payload is the same as the W form, with
+// the string block converted from UTF-16 to bytes.
+void load_string_a(X86 *c) {
+    uint32_t module = arg(c, 0), id = arg(c, 1) & 0xffff, out = arg(c, 2), cap = arg(c, 3);
+    std::string why;
+    uint32_t entry = resource_find_in(module, 6, (id >> 4) + 1, true, &why);
+    uint32_t bytes = 0, p = entry ? resource_data(entry, &bytes, &why) : 0, end = p + bytes;
+    for (uint32_t i = 0; p && i < 16; ++i) {
+        if (end - p < 2)
+            break;
+        uint32_t n = rd16(p);
+        p += 2;
+        if (n > (end - p) / 2)
+            break;
+        if (i == (id & 15)) {
+            if (!out)
+                break;
+            std::string text = gm_wstr(p, n);
+            if (cap)
+                set_eax(c, gm_put_str(out, text.c_str(), cap));
+            else {
+                if (gm_valid(out, 4)) {
+                    wr32(out, p);
+                    set_eax(c, n);
+                    break;
+                }
+                set_eax(c, 0);
+            }
+            return;
+        }
+        p += n * 2;
+    }
+    if (out && cap && gm_valid(out, 1))
+        wr8(out, 0);
+    set_eax(c, 0);
+}
+void load_bitmap_a(X86 *c) {
+    std::string why;
+    uint32_t entry = resource_find_in(arg(c, 0), 2, arg(c, 1), true, &why);
+    uint32_t bytes = 0, p = entry ? resource_data(entry, &bytes, &why) : 0;
+    GdiImage image;
+    set_eax(c, p && gdi_decode_image(p, bytes, &image) ? gdi_image_bitmap(image) : 0);
+}
 void load_icon(X86 *c) {
     if (!arg(c, 0)) {
         alias_ansi(c, "LoadIconA");
@@ -307,6 +352,23 @@ void draw_text_ex(X86 *c) {
     if (p && gm_valid(p, 20) && rd32(p) == 20)
         wr32(p + 16, wide_units(gm_wstr(arg(c, 1), arg(c, 2) == 0xffffffffu ? 0x8000 : arg(c, 2))));
     draw_text(c);
+}
+// DrawTextA widens the byte string into a temporary guest buffer so the one
+// text renderer (with its font, clipping and DT_CALCRECT handling) serves both.
+void draw_text_a(X86 *c) {
+    uint32_t dc = arg(c, 0), text = arg(c, 1), count = arg(c, 2), rect = arg(c, 3),
+             flags = arg(c, 4);
+    std::string s = count == 0xffffffffu ? gm_str(text) : gm_str(text, count);
+    uint32_t cap = uint32_t(s.size()) + 1;
+    uint32_t buf = heap_alloc(cap * 2, true);
+    if (!buf) {
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t units = gm_put_wstr(buf, s, cap);
+    uint32_t result = gdi::draw_text(dc, buf, units, rect, flags);
+    heap_free(buf);
+    set_eax(c, result);
 }
 uint16_t case_unit(uint16_t ch, bool upper) {
     if (upper) {
@@ -523,10 +585,14 @@ const ImportShim shims[] = {
     W("FindWindowW", 2, find_w),
     W("FindWindowExW", 4, find_ex_w),
     W("LoadBitmapW", 2, load_bitmap),
+    W("LoadBitmapA", 2, load_bitmap_a),
     W("LoadIconW", 2, load_icon),
     W("LoadStringW", 4, load_string),
+    W("LoadStringA", 4, load_string_a),
     W("DrawTextW", 5, draw_text),
+    W("DrawTextA", 5, draw_text_a),
     W("DrawTextExW", 6, draw_text_ex),
+    W("SetClassLongA", 3, set_class_long),
     W("CharUpperW", 1, upper),
     W("CharLowerW", 1, lower),
     W("CharUpperBuffW", 2, upper_buff),
