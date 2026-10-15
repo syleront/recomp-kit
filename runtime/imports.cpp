@@ -584,6 +584,7 @@ void imports_init() {
     oleaut32_register();
     misc_dlls_register();
     msvcrt_register();
+    msvcirt_register();
     comctl32_register();
     media_foundation_register();
     imports_register(g_user32_shims, g_user32_shim_count);
