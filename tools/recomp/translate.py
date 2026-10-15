@@ -4258,6 +4258,7 @@ def main():
     interior_entries = [0]
     initterm_found = [0]
     immediate_entries = [0]
+    seh_found = [0]
     initterm_tables = []
     rejected = set()
     tr = Translator(image, all_addrs, args)
@@ -5021,6 +5022,31 @@ def main():
                 if resolve(t, listed, why="initterm"):
                     changed = True
                     initterm_found[0] += 1
+            # A catch funclet ends by handing its continuation to the EH
+            # runtime in EAX: `MOV EAX,<continuation>; RET`.  The program
+            # loads that immediate and returns to it, so the address is code
+            # by construction even though nothing calls it with a CALL and it
+            # need not be aligned or preceded by padding.  Taken exactly like
+            # an __initterm entry - before the general immediate scan, through
+            # resolve, with a structural provenance - so no alignment, string
+            # or shape heuristic gets a say.
+            for fn in parsed:
+                for i, ins in enumerate(fn.insns):
+                    if ins.mnem != "MOV" or not fn.contiguous[i]:
+                        continue
+                    if i + 1 >= len(fn.insns) or not fn.insns[i + 1].mnem.startswith("RET"):
+                        continue
+                    try:
+                        dst = parse_operand(ins.ops[0])
+                        src = parse_operand(ins.ops[-1])
+                    except (TranslateError, IndexError):
+                        continue
+                    if (dst.kind == "reg" and dst.reg == R_EAX and dst.size == 32
+                            and src.kind == "imm" and image.is_exec(src.imm)):
+                        hook_evidence[src.imm].add("seh")
+                        if resolve(src.imm, listed, why="seh"):
+                            changed = True
+                            seh_found[0] += 1
             # Addresses inside a decoded jump table are table storage, not
             # code: 0x4422c0 is 16-aligned and follows a RET, so it passes
             # every static signal there is.
@@ -5141,7 +5167,8 @@ def main():
                     changed = True
                     interior_entries[0] += 1
             discovered_by_scan[0] = (len(all_addrs) - before - interior_entries[0]
-                                     - initterm_found[0] - immediate_entries[0])
+                                     - initterm_found[0] - immediate_entries[0]
+                                     - seh_found[0])
             if not changed:
                 converged = True
                 break
@@ -6168,6 +6195,7 @@ void recomp_unknown_jump(X86 *c, uint32_t target)
                                     for a, b, c in initterm_tables],
                 "initterm_entries": initterm_found[0],
                 "entry_points_from_immediates": immediate_entries[0],
+                "seh_continuation_entries": seh_found[0],
                 "alternate_entries_from_data_pointers": interior_entries[0],
                 "data_pointer_candidates_rejected": len(rejected),
                 "blocks_withdrawn": [["%08x" % a, why, "%08x" % t]
