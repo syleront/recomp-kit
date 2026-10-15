@@ -883,7 +883,7 @@ void k_FreeResource(X86 *c) {
 void k_EnumResourceNamesW(X86 *c) {
     uint32_t module = arg(c, 0), type = arg(c, 1), callback = arg(c, 2), param = arg(c, 3);
     std::vector<ResourceName> names;
-    if (!callback || !resource_module(module) || !resource_names(type, &names)) {
+    if (!callback || !resource_module(module) || !resource_names(type, &names, nullptr, module)) {
         set_last_error(1814);
         set_eax(c, 0);
         return;

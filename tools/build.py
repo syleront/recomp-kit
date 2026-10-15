@@ -364,6 +364,8 @@ def run_translator(stage, game_dir, build_root, allow_table_gaps=None, aux_modul
             module += ["--allow-table-gaps", allow_table_gaps]
         if allow_unmodelled:
             module += ["--allow-unmodelled", allow_unmodelled]
+        if discovered:
+            module += ["--discovered", str(discovered)]
         subprocess.run(module, cwd=ROOT, check=True)
 
 

@@ -23,6 +23,47 @@ const DataModule *data_module_containing(uint32_t a) {
     return nullptr;
 }
 
+// The PE image backing a module handle: the executable, a resource-only data
+// module, or a translated auxiliary module (a loader module). The auxiliary
+// modules carry their own .rsrc (an .env/.toy/.cat has every sprite, sound and
+// string the game reads back through FindResource/LoadString), so a resource
+// handle is only meaningful once these are recognised too. Returns false and
+// leaves base/size untouched for a handle naming no live image.
+bool module_image(uint32_t module, uint32_t *base, uint32_t *size) {
+    if (!module || module == loader_image_base()) {
+        uint32_t b = loader_image_base();
+        if (!b)
+            return false;
+        *base = b;
+        *size = loader_image_size();
+        return true;
+    }
+    if (const DataModule *m = data_module_containing(module))
+        if (m->base == module) {
+            *base = m->base;
+            *size = m->size;
+            return true;
+        }
+    if (const LoaderModule *m = loader_module_containing(module))
+        if (m->base == module) {
+            *base = m->base;
+            *size = m->size;
+            return true;
+        }
+    return false;
+}
+
+// The module handle of the live image whose bytes contain `addr`, or 0 (the
+// executable) when none does. resource_data uses it to pick the image a
+// resource data entry lives in without needing the handle.
+uint32_t module_image_containing(uint32_t addr) {
+    if (const DataModule *m = data_module_containing(addr))
+        return m->base;
+    if (const LoaderModule *m = loader_module_containing(addr))
+        return m->base;
+    return 0;
+}
+
 bool fail(std::string *why, const char *message) {
     if (why)
         *why = message;
@@ -45,15 +86,11 @@ struct Directory {
         return offset <= size && bytes <= size - offset;
     }
     bool open(uint32_t module = 0) {
-        image = loader_image_base();
-        image_size = loader_image_size();
-        if (module && module != image) {
-            const DataModule *m = data_module_containing(module);
-            if (!m || m->base != module)
-                return fail(why, "not a loaded resource module");
-            image = m->base;
-            image_size = m->size;
-        }
+        uint32_t base = 0, bytes = 0;
+        if (!module_image(module, &base, &bytes))
+            return fail(why, "not a loaded resource module");
+        image = base;
+        image_size = bytes;
         if (!image || !gm_valid(image, image_size) || image_size < 64 || rd16(image) != 0x5a4d)
             return fail(why, "no loaded PE image");
         uint32_t nt = rd32(image + 0x3c);
@@ -199,15 +236,12 @@ uint32_t resource_data(uint32_t entry, uint32_t *size, std::string *why) {
     if (size)
         *size = 0;
     Directory dir(why);
-    const DataModule *m = data_module_containing(entry);
-    return dir.open(m ? m->base : 0) ? dir.data(entry, size) : 0;
+    return dir.open(module_image_containing(entry)) ? dir.data(entry, size) : 0;
 }
 
 bool resource_is_module(uint32_t module) {
-    if (!module || module == loader_image_base())
-        return true;
-    const DataModule *m = data_module_containing(module);
-    return m && m->base == module;
+    uint32_t base = 0, size = 0;
+    return module_image(module, &base, &size);
 }
 
 bool resource_module_add_ref(uint32_t module) {
