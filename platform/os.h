@@ -129,6 +129,10 @@ int os_exe_path(char *buf, size_t cap); // 0 or -1; NUL-terminated
 // where the platform has no equivalent yet.
 typedef void (*OsFaultFn)(const char *what);
 int os_install_fault_handlers(OsFaultFn fn);
+// The faulting address (si_addr / ExceptionAddress) of the signal that is
+// being handled, or 0 when the platform did not report one. Valid only inside
+// the handler; async-signal-safe.
+uint64_t os_fault_address(void);
 // For use inside a fault handler: a raw write to the error stream and an
 // immediate process exit, neither of which touches stdio or runs destructors.
 void os_write_stderr_raw(const char *s, size_t n);

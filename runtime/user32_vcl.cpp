@@ -736,6 +736,11 @@ void sys_color(X86 *c) {
 struct MenuItem {
     uint32_t type = 0, state = 0, id = 0, submenu = 0, checked = 0, unchecked = 0, data = 0,
              bitmap = 0;
+    // dwTypeData when the item is MFT_OWNERDRAW. It is a *different* field
+    // from dwItemData (MIIM_DATA): Petz 5 stores a vector index in dwItemData
+    // and an icon/draw value in dwTypeData on the same item, so conflating
+    // them returned a stack pointer where the game expected an index.
+    uint32_t type_data = 0;
     std::string text;
 };
 struct Menu {
@@ -926,8 +931,15 @@ bool read_menu_info(uint32_t p, MenuItem *item, bool ansi = false) {
     if ((mask & 0x40) || ((mask & 0x10) && !(item->type & 0x904)))
         item->text = ansi ? gm_str(rd32(p + 36)) : gm_wstr(rd32(p + 36));
     if (mask & 0x10) {
-        if (item->type & 0x100)
-            item->data = rd32(p + 36);
+        if (item->type & 0x100) {
+            item->type_data = rd32(p + 36);
+            // An owner-draw item whose creator gave no separate MIIM_DATA is
+            // the AppendMenu/InsertMenu shape: the same 32-bit value is the
+            // item data. Only when dwItemData was supplied explicitly does it
+            // win, which is what Petz 5's MENUITEMINFO does.
+            if (!(mask & 32))
+                item->data = item->type_data;
+        }
         if (item->type & 4)
             item->bitmap = rd32(p + 36);
     }
@@ -964,7 +976,7 @@ void get_menu_info(X86 *c, bool ansi) {
     }
     if (mask & 0x10) {
         if (m->type & 0x100)
-            wr32(p + 36, m->data);
+            wr32(p + 36, m->type_data);
         if (m->type & 4)
             wr32(p + 36, m->bitmap);
     }
@@ -1029,9 +1041,10 @@ MenuItem item_from_flags(uint32_t flags, uint32_t id_or_submenu, uint32_t item_v
         item.submenu = id_or_submenu;
     else
         item.id = id_or_submenu;
-    if (flags & 0x100)
-        item.data = item_value;
-    else if (flags & 4)
+    if (flags & 0x100) {
+        item.data = item_value;      // dwItemData
+        item.type_data = item_value; // dwTypeData, the MFT_OWNERDRAW value
+    } else if (flags & 4)
         item.bitmap = item_value;
     else if (!(flags & 0x800))
         item.text = ansi ? gm_str(item_value) : gm_wstr(item_value);

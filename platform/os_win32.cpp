@@ -496,9 +496,14 @@ int os_exe_path(char *buf, size_t cap) {
 // executable's base (so a linker map resolves it), the top of the stack as
 // candidate return addresses, and the registered callback for the guest EIP.
 static OsFaultFn g_fault_fn;
+static uint64_t g_fault_addr = 0;
 static LONG WINAPI fault_filter(EXCEPTION_POINTERS *info) {
     char line[256];
     const EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
+        g_fault_addr = (uint64_t)rec->ExceptionInformation[1];
+    else
+        g_fault_addr = (uint64_t)(uintptr_t)rec->ExceptionAddress;
     const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
     const uintptr_t at = (uintptr_t)rec->ExceptionAddress;
     int n = snprintf(line, sizeof line,
@@ -528,6 +533,9 @@ int os_install_fault_handlers(OsFaultFn fn) {
     g_fault_fn = fn;
     SetUnhandledExceptionFilter(fault_filter);
     return 1;
+}
+uint64_t os_fault_address(void) {
+    return g_fault_addr;
 }
 void os_write_stderr_raw(const char *s, size_t n) {
     DWORD written = 0;

@@ -4931,16 +4931,25 @@ void k_WinExec(X86 *c) {
 
 // ---------------------------------------------------------------------------
 // Directory change notifications. A real host has no inotify-style seam, so the
-// wait handle is a dummy the guest can hold: the first call allocates it, every
-// subsequent FindNext reports a change (TRUE) and FindClose gives it up.
+// handle is an event that stays unsignalled: a wait on it blocks, exactly as it
+// does on Windows until a change actually happens, and the guest's watcher
+// thread parks instead of being told about a change on every single wait. (An
+// always-available dummy makes the watcher post its WM_USER_DIRCHANGE in a tight
+// loop, so the main thread re-runs the whole directory rescan forever and never
+// reaches a frame.) FindNextChangeNotification re-arms, i.e. leaves it
+// unsignalled; FindClose gives it up.
 // ---------------------------------------------------------------------------
 void k_FindFirstChangeNotificationA(X86 *c) {
-    uint32_t h = handle_new(H_NONE);
-    LOGV("FindFirstChangeNotificationA(\"%s\", %u, %08x) -> %08x (dummy)", gm_str(arg(c, 0)).c_str(),
-         arg(c, 1), arg(c, 2), h);
+    uint32_t h = handle_new(H_EVENT);
+    LOGV("FindFirstChangeNotificationA(\"%s\", %u, %08x) -> %08x (event, never signalled)",
+         gm_str(arg(c, 0)).c_str(), arg(c, 1), arg(c, 2), h);
     set_eax(c, h);
 }
 void k_FindNextChangeNotification(X86 *c) {
+    // Re-arm: unsignalled until a change arrives, and none does.
+    HObj *o = handle_any(arg(c, 0));
+    if (o && o->kind == H_EVENT)
+        o->signalled = false;
     set_eax(c, 1);
 }
 void k_FindCloseChangeNotification(X86 *c) {

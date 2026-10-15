@@ -380,6 +380,16 @@ void sig_write_hex8(uint32_t v) {
     sig_write(buf);
 }
 
+void sig_write_hex64(uint64_t v) {
+    char buf[17];
+    for (int i = 15; i >= 0; --i) {
+        buf[i] = "0123456789abcdef"[v & 0xf];
+        v >>= 4;
+    }
+    buf[16] = 0;
+    sig_write(buf);
+}
+
 void sig_write_u32(uint32_t v) {
     char buf[11];
     int i = 10;
@@ -407,6 +417,27 @@ void fault_handler(const char *name) {
     sig_write_hex8(c->r[R_ESP]);
     sig_write(" EBP=");
     sig_write_hex8(c->r[R_EBP]);
+    sig_write(" FAULT=");
+    sig_write_hex64(os_fault_address());
+    sig_write("\n");
+    // The general registers at the fault. Generated code keeps the guest
+    // register file in `c`, and every instruction writes it back before the
+    // next memory access, so the faulting instruction's inputs are visible
+    // here even though the host register that carried the address is not.
+    sig_write("[host] EAX=");
+    sig_write_hex8(c->r[R_EAX]);
+    sig_write(" EBX=");
+    sig_write_hex8(c->r[R_EBX]);
+    sig_write(" ECX=");
+    sig_write_hex8(c->r[R_ECX]);
+    sig_write(" EDX=");
+    sig_write_hex8(c->r[R_EDX]);
+    sig_write(" ESI=");
+    sig_write_hex8(c->r[R_ESI]);
+    sig_write(" EDI=");
+    sig_write_hex8(c->r[R_EDI]);
+    sig_write(" EFX=");
+    sig_write_hex8(x86_get_eflags(c));
     sig_write("\n");
     if (c->r[R_ESP] < STACK_LIMIT || c->r[R_ESP] >= STACK_TOP)
         sig_write("[host] the guest stack pointer is outside the main stack: it "
