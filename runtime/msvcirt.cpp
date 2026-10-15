@@ -1366,6 +1366,7 @@ void ms_ifstream_open_ctor(X86 *c) {
     int mode = (int32_t)arg(c, 1);
     int prot = (int32_t)arg(c, 2);
     int virt_init = (int32_t)arg(c, 3);
+    ensure_tables(); // g_t.filebuf must exist before the filebuf vptr is set
     uint32_t fb = heap_alloc(FB_SIZE, true);
     st_active_ctor(fb, g_t.filebuf, 0, 0);
     wi(fb + SB_UNBUFFERED, 0);
@@ -1383,6 +1384,7 @@ void ms_ofstream_open_ctor(X86 *c) {
     int mode = (int32_t)arg(c, 1);
     int prot = (int32_t)arg(c, 2);
     int virt_init = (int32_t)arg(c, 3);
+    ensure_tables(); // g_t.filebuf must exist before the filebuf vptr is set
     uint32_t fb = heap_alloc(FB_SIZE, true);
     st_active_ctor(fb, g_t.filebuf, 0, 0);
     wi(fb + SB_UNBUFFERED, 0);
@@ -1640,15 +1642,19 @@ void ms_istream_read_str(X86 *c) {
     uint32_t str = arg(c, 0);
     int count = 0;
     if (istream_ipfx(c, obj, 0)) {
-        int ch;
         uint32_t width = (uint32_t)gi(io + IOS_WIDTH);
-        for (ch = sb_sgetc(c, sb); (uint32_t)count < width - 1 && ch != VEOF && !isspace(ch);
-             ch = sb_snextc(c, sb)) {
-            wr8(str + (uint32_t)count, (uint8_t)ch);
-            ++count;
+        // A null destination is legal: skip the read (Wine never dereferences
+        // str) but keep the fail/eof state update below.
+        if (str) {
+            int ch;
+            for (ch = sb_sgetc(c, sb); (uint32_t)count < width - 1 && ch != VEOF && !isspace(ch);
+                 ch = sb_snextc(c, sb)) {
+                wr8(str + (uint32_t)count, (uint8_t)ch);
+                ++count;
+            }
+            if (ch == VEOF)
+                ios_orstate(io, ST_EOF);
         }
-        if (ch == VEOF)
-            ios_orstate(io, ST_EOF);
         if (!count)
             ios_orstate(io, ST_FAIL);
         else
@@ -1779,53 +1785,106 @@ void ms_mtunlock(X86 *) {}
 // Internal vector-deleting destructors (registered so guest vtables can point
 // at a trampoline for them). ECX is the ios sub-object for the class families
 // whose vfptr lives in the virtual base, the streambuf itself otherwise.
+// Array delete (`flags & 2`) follows Wine: the element count is stored in the
+// dword before the first object (`this[-1]`), each element is destroyed in
+// turn, and the whole block (starting at `this-4`) is freed when `flags & 1`.
 void vt_streambuf_vec_dtor(X86 *c) {
     uint32_t s = c->r[R_ECX];
     uint32_t flags = arg(c, 0);
-    streambuf_dtor_impl(s);
-    if (flags & 1)
-        heap_free(s);
+    if (flags & 2) {
+        int32_t count = gi(s - 4);
+        for (int32_t i = count - 1; i >= 0; --i)
+            streambuf_dtor_impl(s + (uint32_t)i * SB_SIZE);
+        if (flags & 1)
+            heap_free(s - 4);
+    } else {
+        streambuf_dtor_impl(s);
+        if (flags & 1)
+            heap_free(s);
+    }
     set_eax(c, s);
 }
 void vt_filebuf_vec_dtor(X86 *c) {
     uint32_t fb = c->r[R_ECX];
     uint32_t flags = arg(c, 0);
-    vt_filebuf_vec_dtor_h(c, fb, flags);
-    if (flags & 1)
-        heap_free(fb);
+    if (flags & 2) {
+        int32_t count = gi(fb - 4);
+        for (int32_t i = count - 1; i >= 0; --i)
+            vt_filebuf_vec_dtor_h(c, fb + (uint32_t)i * FB_SIZE, 0);
+        if (flags & 1)
+            heap_free(fb - 4);
+    } else {
+        vt_filebuf_vec_dtor_h(c, fb, flags);
+        if (flags & 1)
+            heap_free(fb);
+    }
     set_eax(c, fb);
 }
 void vt_strstreambuf_vec_dtor(X86 *c) {
     uint32_t s = c->r[R_ECX];
     uint32_t flags = arg(c, 0);
-    strstreambuf_dtor_impl(s);
-    if (flags & 1)
-        heap_free(s);
+    if (flags & 2) {
+        int32_t count = gi(s - 4);
+        for (int32_t i = count - 1; i >= 0; --i)
+            strstreambuf_dtor_impl(s + (uint32_t)i * SS_SIZE);
+        if (flags & 1)
+            heap_free(s - 4);
+    } else {
+        strstreambuf_dtor_impl(s);
+        if (flags & 1)
+            heap_free(s);
+    }
     set_eax(c, s);
 }
 void vt_ios_vec_dtor(X86 *c) {
     uint32_t io = c->r[R_ECX];
     uint32_t flags = arg(c, 0);
-    ios_dtor_impl(c, io);
-    if (flags & 1)
-        heap_free(io);
+    if (flags & 2) {
+        int32_t count = gi(io - 4);
+        for (int32_t i = count - 1; i >= 0; --i)
+            ios_dtor_impl(c, io + (uint32_t)i * IOS_SIZE);
+        if (flags & 1)
+            heap_free(io - 4);
+    } else {
+        ios_dtor_impl(c, io);
+        if (flags & 1)
+            heap_free(io);
+    }
     set_eax(c, io);
 }
 void vt_ostream_vec_dtor(X86 *c) {
     uint32_t io = c->r[R_ECX];
     uint32_t flags = arg(c, 0);
-    ostream_vbase_dtor_impl(c, io - OST_IOS);
-    if (flags & 1)
-        heap_free(io - OST_IOS);
-    set_eax(c, io - OST_IOS);
+    uint32_t obj = io - OST_IOS;
+    if (flags & 2) {
+        int32_t count = gi(obj - 4);
+        for (int32_t i = count - 1; i >= 0; --i)
+            ostream_vbase_dtor_impl(c, obj + (uint32_t)i * (OST_IOS + IOS_SIZE));
+        if (flags & 1)
+            heap_free(obj - 4);
+    } else {
+        ostream_vbase_dtor_impl(c, obj);
+        if (flags & 1)
+            heap_free(obj);
+    }
+    set_eax(c, obj);
 }
 void vt_istream_vec_dtor(X86 *c) {
     uint32_t io = c->r[R_ECX];
     uint32_t flags = arg(c, 0);
-    istream_vbase_dtor_impl(c, io - IST_IOS);
-    if (flags & 1)
-        heap_free(io - IST_IOS);
-    set_eax(c, io - IST_IOS);
+    uint32_t obj = io - IST_IOS;
+    if (flags & 2) {
+        int32_t count = gi(obj - 4);
+        for (int32_t i = count - 1; i >= 0; --i)
+            istream_vbase_dtor_impl(c, obj + (uint32_t)i * (IST_IOS + IOS_SIZE));
+        if (flags & 1)
+            heap_free(obj - 4);
+    } else {
+        istream_vbase_dtor_impl(c, obj);
+        if (flags & 1)
+            heap_free(obj);
+    }
+    set_eax(c, obj);
 }
 void vt_streambuf_sync(X86 *c) {
     set_eax(c, (uint32_t)vt_streambuf_sync_h(c, c->r[R_ECX]));

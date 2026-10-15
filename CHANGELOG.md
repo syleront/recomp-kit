@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Serve `GetDLLVersion` for content modules a title maps as data (the
+  `.toy`/`.cat`/`.clo`/`.dog`/`.env` and `Resource/*.dll` files): a non-zero
+  pointer is synthesized so a `LoadLibrary`/`GetProcAddress` version check no
+  longer throws, while every other content export still reports "not found".
+
+- Add MSVCIRT (Visual C++ 6 `<iostream.h>`/`<strstream.h>`/`<fstream.h>`)
+  native shims with guest vtables, restoring the remaining USER32/GDI32 and
+  KERNEL32/comdlg32/ADVAPI32/SHELL32/WINMM/MSACM32/RPCRT4 imports a Win32
+  title needs.
+
 - Allow native game adapters to place their own cursors at absolute touch
   positions in logical game pixels. Placement can discard pending DirectInput
   X/Y movement without losing button, wheel or keyboard input.

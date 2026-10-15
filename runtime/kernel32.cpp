@@ -1241,6 +1241,21 @@ void k_FreeLibrary(X86 *c) {
     set_eax(c, 1);
 }
 
+// Synthetic DLL name under which the content-module export shims are
+// registered. It never appears in a LoadLibrary call, so it is only reachable
+// through the interim GetProcAddress path below.
+static const char *kContentModuleDll = "<internal>";
+
+// Interim GetDLLVersion for a content module. The .toy/.cat/.clo/.dog/.env
+// modules and Resource/*.dll are real PE images with their own export table;
+// resource_map_module maps them as data and the runtime does not execute their
+// x86 yet (that is a separate task). The game only null-checks this pointer
+// (LoadAndCheckLibrary @0x479470) and never calls it, so any non-zero value
+// satisfies it. The real body would return &g_Version.
+void k_content_GetDLLVersion(X86 *c) {
+    set_eax(c, 1);
+}
+
 void k_GetProcAddress(X86 *c) {
     uint32_t hmod = arg(c, 0);
     uint32_t name = arg(c, 1);
@@ -1263,6 +1278,23 @@ void k_GetProcAddress(X86 *c) {
             dll = kv.first;
             break;
         }
+    // INTERIM: a module mapped by resource_map_module (a content PE carrying
+    // its own code and export table). Answer from a name table rather than the
+    // image's .edata so nothing executes. Only GetDLLVersion is synthesized;
+    // GetSprite/GetLoadInfo/GetFilmstrip return 0, which the game handles by
+    // freeing the module and moving on (no throw).
+    if (!dll.empty() && resource_is_module(hmod)) {
+        if (proc == "GetDLLVersion") {
+            set_eax(c, imports_resolve(kContentModuleDll, "content_GetDLLVersion"));
+            return;
+        }
+        log_once(("gpa-content:" + dll + "!" + proc).c_str(),
+                 "GetProcAddress(%s, \"%s\") -> 0 (content module export not available)",
+                 dll.c_str(), proc.c_str());
+        set_last_error(127); // ERROR_PROC_NOT_FOUND
+        set_eax(c, 0);
+        return;
+    }
     uint32_t a = dll.empty() ? 0 : imports_resolve(dll.c_str(), proc.c_str());
     if (!a) {
         log_once(("gpa:" + dll + "!" + proc).c_str(),
@@ -5280,5 +5312,9 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetPrivateProfileStringA", 6, k_GetPrivateProfileStringA},
     {"KERNEL32.dll", "GetPrivateProfileIntA", 4, k_GetPrivateProfileIntA},
     {"KERNEL32.dll", "WritePrivateProfileStringA", 4, k_WritePrivateProfileStringA},
+
+    // Interim content-module export shims, reached only from the
+    // resource-module branch of k_GetProcAddress (see kContentModuleDll).
+    {"<internal>", "content_GetDLLVersion", 0, k_content_GetDLLVersion},
 };
 const size_t g_kernel32_shim_count = sizeof(g_kernel32_shims) / sizeof(g_kernel32_shims[0]);
