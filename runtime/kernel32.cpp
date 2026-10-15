@@ -17,6 +17,7 @@
 #include "win32.h"
 #include "native_seam.h"
 #include "loader.h"
+#include "resources.h"
 
 #include <errno.h>
 #include "../platform/os.h"
@@ -1178,6 +1179,19 @@ void load_library_named(X86 *c, const std::string &module_name) {
         return;
     }
     if (!runtime_serves_module(name)) {
+        // A DLL shipped with the program and present in its installation:
+        // map it as resource data. Programs load resource-only DLLs this way
+        // (Petz's Resource\*.dll); code in them never runs.
+        std::string host = win32_host_path(module_name, false);
+        OsStat st;
+        if (!host.empty() && os_stat(host.c_str(), &st) == 0 && st.is_regular) {
+            if (uint32_t base = resource_map_module(host)) {
+                modules()[name] = base;
+                LOGW("LoadLibrary(\"%s\") -> resource module %08x", module_name.c_str(), base);
+                set_eax(c, base);
+                return;
+            }
+        }
         log_once(("loadlib:" + name).c_str(),
                  "LoadLibrary(\"%s\"): no shims for that module, reporting it as missing",
                  name.c_str());
@@ -1198,6 +1212,10 @@ void k_LoadLibraryA(X86 *c) {
 
 void k_LoadLibraryW(X86 *c) {
     load_library_named(c, gm_wstr(arg(c, 0)));
+}
+
+void k_LoadLibraryExA(X86 *c) {
+    load_library_named(c, gm_str(arg(c, 0)));
 }
 
 void k_LoadLibraryExW(X86 *c) {
@@ -4785,6 +4803,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "GetModuleHandleA", 1, k_GetModuleHandleA},
     {"KERNEL32.dll", "GetModuleHandleW", 1, k_GetModuleHandleW},
     {"KERNEL32.dll", "LoadLibraryA", 1, k_LoadLibraryA},
+    {"KERNEL32.dll", "LoadLibraryExA", 3, k_LoadLibraryExA},
     {"KERNEL32.dll", "LoadLibraryW", 1, k_LoadLibraryW},
     {"KERNEL32.dll", "LoadLibraryExW", 3, k_LoadLibraryExW},
     {"KERNEL32.dll", "FreeLibrary", 1, k_FreeLibrary},

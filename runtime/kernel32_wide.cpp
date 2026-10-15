@@ -833,7 +833,7 @@ void k_WaitForMultipleObjectsEx(X86 *c) {
 }
 
 bool resource_module(uint32_t module) {
-    if (!module || module == loader_image_base())
+    if (resource_is_module(module))
         return true;
     set_last_error(1812);
     return false;
@@ -844,10 +844,23 @@ void k_FindResourceW(X86 *c) {
         return;
     }
     std::string why;
-    uint32_t entry = resource_find(arg(c, 2), arg(c, 1), &why);
+    uint32_t entry = resource_find_in(arg(c, 0), arg(c, 2), arg(c, 1), false, &why);
     if (!entry) {
         set_last_error(1814);
         LOGV("FindResourceW: %s", why.c_str());
+    }
+    set_eax(c, entry);
+}
+void k_FindResourceA(X86 *c) {
+    if (!resource_module(arg(c, 0))) {
+        set_eax(c, 0);
+        return;
+    }
+    std::string why;
+    uint32_t entry = resource_find_in(arg(c, 0), arg(c, 2), arg(c, 1), true, &why);
+    if (!entry) {
+        set_last_error(1814);
+        LOGV("FindResourceA: %s", why.c_str());
     }
     set_eax(c, entry);
 }
@@ -901,6 +914,7 @@ void k_EnumResourceNamesW(X86 *c) {
 
 static const ImportShim g_kernel32_wide[] = {
     {"KERNEL32.dll", "FindResourceW", 3, k_FindResourceW},
+    {"KERNEL32.dll", "FindResourceA", 3, k_FindResourceA},
     {"KERNEL32.dll", "LoadResource", 2, k_LoadResource},
     {"KERNEL32.dll", "LockResource", 1, k_LockResource},
     {"KERNEL32.dll", "SizeofResource", 2, k_SizeofResource},

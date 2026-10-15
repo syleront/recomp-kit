@@ -15,9 +15,19 @@ struct ResourceName {
 // first language and return its IMAGE_RESOURCE_DATA_ENTRY address, or zero.
 uint32_t resource_find(uint32_t type_id_or_name, uint32_t name_id_or_name,
                        std::string *why = nullptr);
+// The same for a module handle (0 or the image base for the executable, or a
+// resource-only DLL from resource_map_module); `ansi` reads string names as
+// ANSI rather than UTF-16.
+uint32_t resource_find_in(uint32_t module, uint32_t type_id_or_name, uint32_t name_id_or_name,
+                          bool ansi, std::string *why = nullptr);
+// Map a resource-only DLL from the host file system as data in the guest heap
+// and return its base (its HMODULE), or 0.
+uint32_t resource_map_module(const std::string &host_path);
+// True for 0, the executable's base and any mapped resource-only DLL.
+bool resource_is_module(uint32_t module);
 // Validate a data-entry handle and return its image-backed payload and size.
 uint32_t resource_data(uint32_t entry, uint32_t *size, std::string *why = nullptr);
 // Snapshot the names before guest callbacks run; no references into the directory
 // or temporary guest buffers escape this reader. False explains failure in why.
 bool resource_names(uint32_t type_id_or_name, std::vector<ResourceName> *names,
-                    std::string *why = nullptr);
+                    std::string *why = nullptr, uint32_t module = 0);

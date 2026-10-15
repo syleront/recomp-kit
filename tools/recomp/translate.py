@@ -1207,6 +1207,12 @@ class Image(object):
                     step = True
             if indirect_call and step:
                 walkers.add(fn.addr)
+            # A program linked against the shared CRT calls MSVCRT's
+            # _initterm through a one-instruction import thunk.
+            if len(fn.insns) == 1 and fn.insns[0].mnem == "JMP" and fn.insns[0].ops:
+                m = re.match(r"dword ptr \[0x([0-9a-fA-F]+)\]$", fn.insns[0].ops[0])
+                if m and getattr(self, "iat_names", {}).get(int(m.group(1), 16)) == "_initterm":
+                    walkers.add(fn.addr)
         if not walkers:
             return [], set()
 
@@ -1649,11 +1655,81 @@ def seh_frame_sites(fn, image=None):
                     break
         except TranslateError:
             continue
+    for i in range(3, len(fn.insns)):
+        if i in sites:
+            continue
+        try:
+            site = msvc_frame_site(fn, i)
+        except TranslateError:
+            continue
+        if site is not None:
+            sites[i] = site
     return sites
 
 
+def msvc_frame_site(fn, i):
+    """MSVC's spelling of the frame idiom: the old head is loaded into a register,
+    pushed, and published, with unrelated instructions scheduled in between.
+
+        PUSH -1 ; PUSH handler ; MOV EAX,FS:[0] ; PUSH EAX ; MOV FS:[0],ESP
+
+    The scheduler may move the load ahead of the two PUSHes or put a MOV/LEA
+    between the register PUSH and the store. Prove the shape on a contiguous
+    straight-line window: the stored ESP is the one right after `PUSH reg`,
+    and reg still holds the FS:[0] load. Returns the handler immediate."""
+    mov = fn.insns[i]
+    if mov.mnem != "MOV" or len(mov.ops) != 2:
+        return None
+    dst, src = [parse_operand(o) for o in mov.ops]
+    if (not seh_chain_operand(dst) or src.kind != "reg" or src.reg != R_ESP
+            or src.size != 32):
+        return None
+    targets = None
+    push_at = reg = load_at = None
+    for j in range(i - 1, max(-1, i - 9), -1):
+        if not fn.contiguous[j]:
+            return None
+        if targets is None:
+            targets = {Translator.branch_target(ins) for ins in fn.insns
+                       if ins.mnem in JCC or ins.mnem == "JMP"}
+        if fn.insns[j + 1].addr in targets:
+            return None
+        ins = fn.insns[j]
+        if ins.mnem in ("CALL", "RET", "JMP") or ins.mnem in JCC:
+            return None
+        ops = [parse_operand(o) for o in ins.ops] if ins.ops else []
+        if push_at is None:
+            if ins.mnem == "PUSH" and ops and ops[0].kind == "reg" and ops[0].size == 32:
+                push_at, reg = j, ops[0].reg
+                continue
+            if ins.mnem in ("PUSH", "POP", "PUSHAD", "POPAD", "PUSHFD", "POPFD", "ENTER",
+                            "LEAVE") or Translator.writes_reg32(ins, R_ESP):
+                return None
+            continue
+        if load_at is None:
+            if (ins.mnem == "MOV" and len(ops) == 2 and ops[0].kind == "reg"
+                    and ops[0].reg == reg and ops[0].size == 32
+                    and ops[1].kind == "mem" and ops[1].seg == "FS" and ops[1].base is None
+                    and ops[1].index is None and ops[1].disp == 0):
+                load_at = j
+                break
+            if Translator.writes_reg32(ins, reg):
+                return None
+    if load_at is None:
+        return None
+    # The handler is the nearest pushed immediate before the register PUSH.
+    for j in range(push_at - 1, max(-1, push_at - 6), -1):
+        ins = fn.insns[j]
+        if ins.mnem == "PUSH" and ins.ops:
+            imm = parse_operand(ins.ops[0])
+            if imm.kind == "imm" and imm.imm & 0xffffffff not in (0xffffffff, 0xfffffffe):
+                return imm.imm & 0xffffffff
+    return None
+
+
 NORETURN_IMPORTS = frozenset(("RaiseException", "ExitProcess", "TerminateProcess",
-                              "ExitThread", "FatalAppExitA", "FatalExit"))
+                              "ExitThread", "FatalAppExitA", "FatalExit",
+                              "_CxxThrowException", "exit", "_exit", "?terminate@@YAXXZ"))
 
 
 def noreturn_callees_from(parsed, iat_names, image=None):

@@ -317,6 +317,14 @@ uint32_t recomp_seh_pending_target(void) {
     return state.g_seh_pending_target;
 }
 
+// A native frame handler (MSVC's) unwinds, then runs guest catch code that
+// may make computed jumps of its own before it transfers to the continuation.
+// It clears the target RtlUnwind left and re-arms it just before intercepting.
+void recomp_seh_set_pending(X86 *c, uint32_t registration) {
+    state.g_seh_pending_target = registration;
+    state.pending_cpu = registration ? c : nullptr;
+}
+
 // Called only for computed jumps, before even an existing dispatch-table hit.
 // The dispatcher keeps its own ESP; the pending registration identifies env.
 void recomp_seh_intercept(X86 *c, uint32_t target) {

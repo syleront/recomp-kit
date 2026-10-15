@@ -19,6 +19,7 @@ jmp_buf *recomp_seh_frame_adopt(X86 *c);
 void recomp_seh_frame_leave(X86 *c);
 void recomp_seh_land(X86 *c);
 uint32_t recomp_seh_pending_target(void);
+void recomp_seh_set_pending(X86 *c, uint32_t registration);
 void recomp_seh_intercept(X86 *c, uint32_t target);
 /* Verbose-only, bounded validation. Logs the first failure and last good point. */
 void recomp_seh_validate_chain(X86 *c, const char *phase, const char *detail);
