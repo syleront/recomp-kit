@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Recover auxiliary-module entry points structurally when translating a module
+  (`translate.py --module`): a relocated dword landing in a code section and a
+  `FF 25 <IAT slot>` import thunk are admitted as structural entries, so a
+  module that is only reachable from the main image (through its vtables or by
+  a call the module's own listing never sees) no longer needs hand-carried
+  discovery addresses. The executable translation is unchanged.
+- Register KERNEL32 `DisableThreadLibraryCalls` (one stdcall argument, returns
+  TRUE), called by content modules that link the shared CRT's DllMain.
+
 - Serve `GetDLLVersion` for content modules a title maps as data (the
   `.toy`/`.cat`/`.clo`/`.dog`/`.env` and `Resource/*.dll` files): a non-zero
   pointer is synthesized so a `LoadLibrary`/`GetProcAddress` version check no

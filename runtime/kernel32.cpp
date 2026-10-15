@@ -1141,6 +1141,14 @@ void k_GetModuleHandleW(X86 *c) {
     get_module_handle_named(c, gm_wstr(p));
 }
 
+// The guest opt-out from per-thread DLL notifications (DLL_THREAD_ATTACH and
+// DLL_THREAD_DETACH). There is one cooperative guest thread here, so there is
+// nothing to disable; the call succeeds and reports so. It is reached by every
+// content module that links the shared CRT's DllMain.
+void k_DisableThreadLibraryCalls(X86 *c) {
+    set_eax(c, 1);
+}
+
 // A module handle is only handed out for a DLL the runtime has shims for.
 // Anything else fails the way a missing DLL does, so the guest takes its own
 // "feature unavailable" path instead of calling into nothing.
@@ -5201,6 +5209,7 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "LoadLibraryW", 1, k_LoadLibraryW},
     {"KERNEL32.dll", "LoadLibraryExW", 3, k_LoadLibraryExW},
     {"KERNEL32.dll", "FreeLibrary", 1, k_FreeLibrary},
+    {"KERNEL32.dll", "DisableThreadLibraryCalls", 1, k_DisableThreadLibraryCalls},
     {"KERNEL32.dll", "GetProcAddress", 2, k_GetProcAddress},
     {"KERNEL32.dll", "GetCommandLineA", 0, k_GetCommandLineA},
     {"KERNEL32.dll", "GetEnvironmentStrings", 0, k_GetEnvironmentStrings},

@@ -181,7 +181,17 @@ def visual_animation_read(addr, body):
 #: own dispatch goes nowhere may be withdrawn, and every withdrawal is
 #: reported with its provenance and the target that failed, so a real callback
 #: with an unresolvable callee is visible rather than silently dropped.
-STRUCTURAL_PROVENANCE = ("table", "initterm", "config", "seh")
+#:
+#: A relocation ("reloc") is used only when translating an auxiliary content
+#: module.  A base relocation there is the linker's record of a pointer, and
+#: the module's small fixed set of pointer words is dominated by vtable slots
+#: and function-pointer tables rather than by the string literals and GUIDs a
+#: Delphi image keeps in .text; the executables keep the weaker "data" rank
+#: because their .text pointers are as often literals as code.  Even so a
+#: relocated target is only admitted after the interior-byte and jump-table
+#: case checks in the module scan, and a body that dispatches nowhere is still
+#: dropped by `dangling_targets` only if it was not thus named.
+STRUCTURAL_PROVENANCE = ("table", "initterm", "config", "seh", "reloc")
 
 #: The subset of the above that the program itself will call by address: a
 #: jump-table slot, an __initterm entry, and a configured entry point.  These
@@ -840,11 +850,19 @@ class Image(object):
         #: so that what a compiler put after a throw, such as a switch table,
         #: is not decoded as code.
         self.iat_names = {}
+        #: Every import address table slot, named or by ordinal.  An
+        #: auxiliary module imports most of its runtime from the executable by
+        #: ordinal (pefile reports those DLLs as b'*invalid*' with no name), so
+        #: the names are incomplete but the slot addresses are not; the
+        #: import-thunk scan (import_thunk_sites) uses the set to recognise
+        #: `JMP dword ptr [<IAT slot>]` stubs wherever they sit.
+        self.iat_slots = set()
         try:
             pe.parse_data_directories(directories=[
                 pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
             for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
                 for imp in entry.imports:
+                    self.iat_slots.add(imp.address)
                     if imp.name:
                         self.iat_names[imp.address] = imp.name.decode("ascii", "replace")
         except Exception:                 # a malformed table only loses names
@@ -914,6 +932,34 @@ class Image(object):
                 va = int.from_bytes(self.data[site:site + 4], "little")
                 out.setdefault(va, self.base + site)
             off += blk
+        return out
+
+    def import_thunk_sites(self):
+        """Addresses of `JMP dword ptr [<IAT slot>]` import thunks.
+
+        A module importing from another image (the executable, here) gets a
+        one-instruction stub per import in its own .text; the caller reaches
+        it by a direct CALL and, being a jump through an unlisted slot, Ghidra
+        never lists it as a function and nothing in the module's own data
+        names it.  The slot is the evidence: `FF 25 disp32` is the only
+        encoding of `JMP dword ptr [disp32]`, so a byte pair `FF 25` whose
+        four-byte displacement is an import address table slot is an import
+        thunk by construction.  The IAT-slot test is what keeps a stray
+        `FF 25` inside another instruction's bytes out.
+        """
+        out = set()
+        if not self.iat_slots:
+            return out
+        for lo, hi, _ in self.exec_ranges:
+            blob = self.data[lo - self.base:hi - self.base]
+            at = blob.find(b"\xff\x25")
+            while at >= 0:
+                if at + 6 > len(blob):
+                    break
+                imm = int.from_bytes(blob[at + 2:at + 6], "little")
+                if imm in self.iat_slots:
+                    out.add(lo + at)
+                at = blob.find(b"\xff\x25", at + 1)
         return out
 
     def is_exec(self, va):
@@ -5078,11 +5124,40 @@ def main():
             # interior-byte coverage can suppress a later equal-rank entry.
             starts, interior = image.code_pointers(
                 set(owner), interior_bytes=interior_bytes, exclude=tr.table_ranges)
-            reloc_candidates = {t for t, slot in relocated.items()
-                                if image.is_exec(t)
-                                and not any(lo <= t < hi or lo <= slot < hi
-                                            for lo, hi in tr.table_ranges)
-                                and (t in owner or image.plausible_immediate_target(t))}
+            # An auxiliary content module has two structural sources of code
+            # its own listing cannot carry: a relocated dword whose value
+            # points into a code section, and an import thunk.  The module's
+            # pointer words are its vtables and function-pointer tables, so a
+            # relocation into its .text names code far more often than the
+            # string literals and GUIDs a Delphi image keeps among its code;
+            # its import thunks are called from the executable, which the
+            # module's isolated listing never sees.  Both are admitted as
+            # structural entries (see STRUCTURAL_PROVENANCE): no padding,
+            # alignment or shape test gets a say, and the withdraw pass may
+            # not drop them.  What is still excluded is a target that lands
+            # inside an already-decoded instruction, or names a jump-table
+            # case of a listed function - neither is a place execution starts.
+            if AUX_MODULE is not None:
+                jtable_cases = {t for _ts in tr.jumptables.values() for t in _ts}
+                reloc_candidates = {
+                    t for t, slot in relocated.items()
+                    if image.is_exec(t)
+                    and not any(lo <= t < hi or lo <= slot < hi
+                                for lo, hi in tr.table_ranges)
+                    and t not in jtable_cases
+                    and not interior_bytes[t - image.base]}
+                # The IAT-slot test already makes a thunk unambiguous, so the
+                # interior-byte exclusion does not apply to it: a stale
+                # interior mark from a since-retired speculative body would
+                # otherwise hide the thunk (the mark is not an instruction
+                # boundary, and the thunk will displace that body anyway).
+                reloc_candidates |= image.import_thunk_sites()
+            else:
+                reloc_candidates = {t for t, slot in relocated.items()
+                                    if image.is_exec(t)
+                                    and not any(lo <= t < hi or lo <= slot < hi
+                                                for lo, hi in tr.table_ranges)
+                                    and (t in owner or image.plausible_immediate_target(t))}
             immediate_candidates = {t for t in immediates
                                     if not any(lo <= t < hi for lo, hi in tr.table_ranges)
                                     and (t in owner or image.plausible_immediate_target(t))}
@@ -5138,7 +5213,12 @@ def main():
             # Establish stronger owners before processing their weaker aliases.
             for t in sorted(reloc_candidates):
                 hook_evidence[t].add("reloc")
-                changed |= resolve(t, owner, why="data")
+                # In a module the relocation is structural (see
+                # STRUCTURAL_PROVENANCE); in the executable it stays the
+                # weaker "data" rank because its .text pointers are as often
+                # literals as callbacks.
+                changed |= resolve(t, owner,
+                                   why="reloc" if AUX_MODULE is not None else "data")
             for t in sorted(pointer_callees):
                 changed |= resolve(t, owner)
             for t in sorted(immediate_candidates):
