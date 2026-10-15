@@ -140,6 +140,41 @@ def load_controls(controls, touch, source):
     return controls
 
 
+def merge_aux_fragment(cfg, game, game_dir, source):
+    """Merge the optional [modules] aux_file fragment into the config.
+
+    tomllib has no include directive, and a game with hundreds of generated
+    auxiliary modules cannot paste their [modules.aux.*] tables into game.toml.
+    [modules] aux_file names a TOML fragment, a path relative to game.toml,
+    whose tables are merged here before validation: its [game] guest_size fills
+    in the arena (an explicit value in game.toml wins) and its tables join the
+    game's own [modules.aux]. Absent by default; named but missing is an error.
+    A key defined in both files is an error, so a stale fragment can neither
+    silently override nor be silently overridden."""
+    aux_file = cfg.get("modules", {}).get("aux_file")
+    if aux_file is None:
+        return
+    if not isinstance(aux_file, str):
+        raise ValueError("%s: [modules] aux_file must be a string, not %r" % (source, aux_file))
+    path = game_dir / aux_file
+    if not path.is_file():
+        raise ValueError("%s: [modules] aux_file names no file: %s" % (source, path))
+    with path.open("rb") as fh:
+        fragment = tomllib.load(fh)
+    fragment_aux = fragment.get("modules", {}).get("aux", {})
+    if not isinstance(fragment_aux, dict):
+        raise ValueError("%s: [modules.aux] must be a table, not %r" % (path, fragment_aux))
+    fragment_size = fragment.get("game", {}).get("guest_size")
+    if fragment_size is not None:
+        game.setdefault("guest_size", int(fragment_size))
+    dest = cfg.setdefault("modules", {}).setdefault("aux", {})
+    for key, entry in fragment_aux.items():
+        if key in dest:
+            raise ValueError("%s: [modules.aux.%s] is defined in both %s and %s"
+                             % (source, key, source.name, path.name))
+        dest[key] = entry
+
+
 def load(game_dir):
     """Return the parsed config with `globals` merged in and `dir`/`source` recorded."""
     game_dir = Path(game_dir)
@@ -150,6 +185,7 @@ def load(game_dir):
     missing = [key for key in REQUIRED_GAME_KEYS if key not in game]
     if missing:
         raise ValueError("%s: missing [game] keys: %s" % (source, ", ".join(missing)))
+    merge_aux_fragment(cfg, game, game_dir, source)
     game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)))
     windows_version(game.setdefault("windows_version", "4.10"))
     translate = cfg.setdefault("translate", {})

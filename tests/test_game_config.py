@@ -208,6 +208,66 @@ class LoadTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 game_config.load(game)   # a module needs an arena that reaches it: checked at load
 
+    def test_aux_file_fragment_include(self):
+        """[modules] aux_file names a TOML fragment (a path relative to
+        game.toml) whose [modules.aux.*] tables and [game] guest_size are
+        merged before validation, so a game with hundreds of generated modules
+        can keep game.toml hand-written. tomllib has no include directive.
+        Absent by default; named but missing is an error, as is a key defined
+        in both files; an explicit guest_size in game.toml wins."""
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp) / "g"
+            game.mkdir()
+            stub = (ROOT / "games/stub/game.toml").read_text()
+            text = stub.replace("[controls]", '[modules]\naux_file = "build/content/modules.toml"\n\n[controls]', 1)
+            (game / "globals.toml").write_text((ROOT / "games/stub/globals.toml").read_text())
+            (game / "game.toml").write_text(text)
+
+            # No aux_file at all is the common case and needs no fragment.
+            self.assertEqual(game_config.load(ROOT / "games/stub")["aux_modules"], [])
+
+            # Named but absent is an error; it must not silently load nothing.
+            with self.assertRaisesRegex(ValueError, "aux_file names no file"):
+                game_config.load(game)
+
+            fragment = game / "build/content/modules.toml"
+            fragment.parent.mkdir(parents=True)
+            fragment.write_text(
+                "[game]\nguest_size = 0x10100000\n\n"
+                '[modules.aux.bone_toy]\nname = "Bone.toy"\npath = "original/Bone.toy"\n'
+                'sha256 = "%s"\nbase = 0x10000000\nsize = 0x11000\n' % ("cd" * 32))
+            cfg = game_config.load(game)
+            self.assertEqual(cfg["game"]["guest_size"], 0x10100000)
+            self.assertEqual(len(cfg["aux_modules"]), 1)
+            mod = cfg["aux_modules"][0]
+            self.assertEqual(mod["key"], "bone_toy")
+            self.assertEqual(mod["name"], "Bone.toy")
+            self.assertEqual(mod["path"], (game / "original/Bone.toy").resolve())
+            self.assertEqual((mod["base"], mod["size"]), (0x10000000, 0x11000))
+            self.assertIn("#define RECOMP_GUEST_SIZE 0x10100000u", gen_game_config.render_header(cfg))
+            self.assertIn("#define RECOMP_AUX_MODULE_COUNT 1", gen_game_config.render_header(cfg))
+
+            # An explicit guest_size in game.toml is a deliberate override of the
+            # generated fragment's value (it must still reach every module).
+            (game / "game.toml").write_text(
+                text.replace("guest_root = ", "guest_size = 0x10200000\nguest_root = ", 1))
+            self.assertEqual(game_config.load(game)["game"]["guest_size"], 0x10200000)
+
+            # A key in both files is ambiguous, so it is refused rather than
+            # letting either copy silently win.
+            (game / "game.toml").write_text(text + "\n[modules.aux.bone_toy]\n"
+                                             'name = "Bone.toy"\npath = "original/Bone.toy"\n'
+                                             'sha256 = "%s"\nbase = 0x10000000\nsize = 0x11000\n'
+                                             % ("cd" * 32))
+            with self.assertRaisesRegex(ValueError, "defined in both"):
+                game_config.load(game)
+
+            # A non-string aux_file is a config error, not a Path TypeError.
+            (game / "game.toml").write_text(text.replace('aux_file = "build/content/modules.toml"',
+                                                         "aux_file = 7"))
+            with self.assertRaisesRegex(ValueError, "aux_file must be a string"):
+                game_config.load(game)
+
     def test_controls_section(self):
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp)
