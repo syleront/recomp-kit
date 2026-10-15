@@ -14,6 +14,78 @@
 #include <map>
 #include <cctype>
 
+// INI files are read through the overlay and rewritten through its write tier.
+// Preserve unrelated lines, comments and existing UTF-16LE encoding. Shared
+// with the ANSI shims through kernel32_internal.h.
+std::string ini_trim(std::string s) {
+    size_t first = s.find_first_not_of(" \t\r\n"), last = s.find_last_not_of(" \t\r\n");
+    return first == std::string::npos ? "" : s.substr(first, last - first + 1);
+}
+bool ini_name_equal(const std::string &a, const std::string &b) {
+    return os_strcasecmp(a.c_str(), b.c_str()) == 0;
+}
+bool ini_read(const std::string &name, ProfileFile &ini) {
+    std::string path = win32_host_path_op(name, WIN32_FILE_READ);
+    if (path.empty())
+        return true; // A missing INI starts empty.
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    std::string text;
+    char chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, f)))
+        text.append(chunk, n);
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok)
+        return false;
+    if (text.size() >= 2 && (uint8_t)text[0] == 0xff && (uint8_t)text[1] == 0xfe) {
+        ini.utf16 = true;
+        if (text.size() > GUEST_SIZE)
+            return false;
+        uint32_t tmp = heap_alloc((uint32_t)text.size() + 2, true);
+        if (!tmp)
+            return false;
+        memcpy(g_mem + tmp, text.data() + 2, text.size() - 2);
+        text = gm_wstr(tmp, text.size() / 2);
+        heap_free(tmp);
+    } else if (text.compare(0, 3, "\xef\xbb\xbf") == 0)
+        text.erase(0, 3);
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        std::string line = text.substr(start, end == std::string::npos ? end : end - start);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        ini.lines.push_back(line);
+        if (end == std::string::npos)
+            break;
+        start = end + 1;
+    }
+    return true;
+}
+// Return a section heading or a key/value pair without interpreting comments.
+bool ini_section(const std::string &line, std::string &section) {
+    std::string s = ini_trim(line);
+    if (s.size() < 2 || s.front() != '[' || s.back() != ']')
+        return false;
+    section = ini_trim(s.substr(1, s.size() - 2));
+    return true;
+}
+bool ini_key(const std::string &line, std::string &key, std::string &value) {
+    std::string s = ini_trim(line);
+    size_t eq = s.find('=');
+    if (s.empty() || s.front() == ';' || s.front() == '#' || eq == std::string::npos)
+        return false;
+    key = ini_trim(s.substr(0, eq));
+    value = ini_trim(s.substr(eq + 1));
+    if (value.size() >= 2 && (value.front() == '"' || value.front() == '\'') &&
+        value.back() == value.front())
+        value = value.substr(1, value.size() - 2);
+    return !key.empty();
+}
+
 namespace {
 // gm_wstr produces valid UTF-8. Count UTF-16 units, including surrogate pairs.
 uint32_t wide_units(const std::string &s) {
@@ -121,100 +193,26 @@ void k_QueryDosDeviceW(X86 *c) {
     set_eax(c, need);
 }
 
-// INI files are read through the overlay and rewritten through its write tier.
-// Preserve unrelated lines, comments and existing UTF-16LE encoding.
-struct ProfileFile {
-    std::vector<std::string> lines;
-    bool utf16 = false;
-};
-std::string trim(std::string s) {
-    size_t first = s.find_first_not_of(" \t\r\n"), last = s.find_last_not_of(" \t\r\n");
-    return first == std::string::npos ? "" : s.substr(first, last - first + 1);
-}
-bool equal_name(const std::string &a, const std::string &b) {
-    return os_strcasecmp(a.c_str(), b.c_str()) == 0;
-}
-bool profile_read(const std::string &name, ProfileFile &ini) {
-    std::string path = win32_host_path_op(name, WIN32_FILE_READ);
-    if (path.empty())
-        return true; // A missing INI starts empty.
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f)
-        return false;
-    std::string text;
-    char chunk[4096];
-    size_t n;
-    while ((n = fread(chunk, 1, sizeof chunk, f)))
-        text.append(chunk, n);
-    bool ok = !ferror(f);
-    fclose(f);
-    if (!ok)
-        return false;
-    if (text.size() >= 2 && (uint8_t)text[0] == 0xff && (uint8_t)text[1] == 0xfe) {
-        ini.utf16 = true;
-        if (text.size() > GUEST_SIZE)
-            return false;
-        uint32_t tmp = heap_alloc((uint32_t)text.size() + 2, true);
-        if (!tmp)
-            return false;
-        memcpy(g_mem + tmp, text.data() + 2, text.size() - 2);
-        text = gm_wstr(tmp, text.size() / 2);
-        heap_free(tmp);
-    } else if (text.compare(0, 3, "\xef\xbb\xbf") == 0)
-        text.erase(0, 3);
-    size_t start = 0;
-    while (start < text.size()) {
-        size_t end = text.find('\n', start);
-        std::string line = text.substr(start, end == std::string::npos ? end : end - start);
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        ini.lines.push_back(line);
-        if (end == std::string::npos)
-            break;
-        start = end + 1;
-    }
-    return true;
-}
-// Return a section heading or a key/value pair without interpreting comments.
-bool profile_section(const std::string &line, std::string &section) {
-    std::string s = trim(line);
-    if (s.size() < 2 || s.front() != '[' || s.back() != ']')
-        return false;
-    section = trim(s.substr(1, s.size() - 2));
-    return true;
-}
-bool profile_key(const std::string &line, std::string &key, std::string &value) {
-    std::string s = trim(line);
-    size_t eq = s.find('=');
-    if (s.empty() || s.front() == ';' || s.front() == '#' || eq == std::string::npos)
-        return false;
-    key = trim(s.substr(0, eq));
-    value = trim(s.substr(eq + 1));
-    if (value.size() >= 2 && (value.front() == '"' || value.front() == '\'') &&
-        value.back() == value.front())
-        value = value.substr(1, value.size() - 2);
-    return !key.empty();
-}
 void k_GetPrivateProfileStringW(X86 *c) {
     std::string section = gm_wstr(arg(c, 0)), key = gm_wstr(arg(c, 1));
     uint32_t out = arg(c, 3), cap = arg(c, 4);
     ProfileFile ini;
-    if (!profile_read(gm_wstr(arg(c, 5)), ini)) {
+    if (!ini_read(gm_wstr(arg(c, 5)), ini)) {
         set_last_error(5);
         set_eax(c, 0);
         return;
     }
     bool multi = !arg(c, 0) || !arg(c, 1);
-    std::string result = trim(gm_wstr(arg(c, 2))), current, k, value;
+    std::string result = ini_trim(gm_wstr(arg(c, 2))), current, k, value;
     std::vector<std::string> names;
     for (const std::string &line : ini.lines) {
-        if (profile_section(line, current)) {
+        if (ini_section(line, current)) {
             if (!arg(c, 0))
                 names.push_back(current);
-        } else if (equal_name(current, section) && profile_key(line, k, value)) {
+        } else if (ini_name_equal(current, section) && ini_key(line, k, value)) {
             if (!arg(c, 1))
                 names.push_back(k);
-            else if (equal_name(k, key)) {
+            else if (ini_name_equal(k, key)) {
                 result = value;
                 break;
             }
@@ -258,7 +256,7 @@ void k_WritePrivateProfileStringW(X86 *c) {
     } // cache flush
     ProfileFile ini;
     std::string name = gm_wstr(arg(c, 3));
-    if (name.empty() || !profile_read(name, ini)) {
+    if (name.empty() || !ini_read(name, ini)) {
         set_last_error(5);
         set_eax(c, 0);
         return;
@@ -268,15 +266,15 @@ void k_WritePrivateProfileStringW(X86 *c) {
     std::vector<std::string> lines;
     bool inside = false, found_section = false, found_key = false;
     for (const auto &line : ini.lines) {
-        if (profile_section(line, current)) {
+        if (ini_section(line, current)) {
             if (inside && !found_key && arg(c, 1) && arg(c, 2)) {
                 lines.push_back(replacement);
                 found_key = true;
             }
-            inside = equal_name(current, section);
+            inside = ini_name_equal(current, section);
             if (inside)
                 found_section = true;
-        } else if (inside && profile_key(line, k, value) && equal_name(k, key)) {
+        } else if (inside && ini_key(line, k, value) && ini_name_equal(k, key)) {
             if (!found_key && arg(c, 2))
                 lines.push_back(replacement);
             found_key = true;

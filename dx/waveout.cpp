@@ -4,6 +4,8 @@
 #include "dx.h"
 #include "host_api.h"
 #include "../runtime/imports.h"
+#include "../runtime/win32.h"
+#include "../platform/os.h"
 #include <algorithm>
 #include <cmath>
 #include <deque>
@@ -369,6 +371,133 @@ void set_volume(X86 *c) {
 void num_devices(X86 *c) {
     set_eax(c, 1);
 }
+
+// ---------------------------------------------------------------------------
+// PlaySound. Petz 5 uses it as a stop switch (PlaySound(NULL, NULL, ...) in
+// CWave::MMPlay); a real PCM WAV from memory or a file is played on a channel
+// of its own as well, so a sound that does arrive is audible. SND_RESOURCE and
+// SND_ALIAS have no seam here and report failure rather than silence.
+// ---------------------------------------------------------------------------
+int g_ps_channel = -1;
+bool g_ps_playing = false;
+std::vector<uint8_t> g_ps_pcm;
+
+uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+// A PCM WAV in host or guest memory: (offset, bytes, rate, channels, bits).
+bool parse_wave(const uint8_t *p, size_t n, uint32_t &pcm_off, uint32_t &pcm_bytes, uint32_t &rate,
+                uint16_t &channels, uint16_t &bits) {
+    if (n < 12 || memcmp(p, "RIFF", 4) != 0 || memcmp(p + 8, "WAVE", 4) != 0)
+        return false;
+    bool have_fmt = false;
+    size_t at = 12;
+    while (n - at >= 8) {
+        uint32_t size = le32(p + at + 4);
+        size_t data = at + 8, avail = n - data;
+        if (memcmp(p + at, "fmt ", 4) == 0) {
+            if (size < 16 || size > avail || (p[data] | (p[data + 1] << 8)) != 1)
+                return false;
+            channels = (uint16_t)(p[data + 2] | (p[data + 3] << 8));
+            rate = le32(p + data + 4);
+            bits = (uint16_t)(p[data + 14] | (p[data + 15] << 8));
+            if ((channels != 1 && channels != 2) || !rate || (bits != 8 && bits != 16))
+                return false;
+            have_fmt = true;
+        } else if (memcmp(p + at, "data", 4) == 0 && have_fmt) {
+            pcm_off = (uint32_t)data;
+            pcm_bytes = (uint32_t)std::min<size_t>(size, avail);
+            return pcm_bytes != 0;
+        }
+        size_t padded = size + (size & 1u);
+        if (padded > avail)
+            return false;
+        at = data + padded;
+    }
+    return false;
+}
+bool play_wav(const uint8_t *wav, size_t bytes, bool loop) {
+    uint32_t off = 0, len = 0, rate = 0;
+    uint16_t channels = 0, bits = 0;
+    if (!parse_wave(wav, bytes, off, len, rate, channels, bits))
+        return false;
+    if (g_ps_channel < 0)
+        g_ps_channel = dx_alloc_audio_channel();
+    if (g_ps_channel < 0)
+        return false;
+    host_audio_stop(g_ps_channel);
+    g_ps_pcm.assign(wav + off, wav + off + len);
+    HostAudioPlay p{};
+    p.channel = g_ps_channel;
+    p.pcm = g_ps_pcm.data();
+    p.bytes = (uint32_t)g_ps_pcm.size();
+    p.sample_rate = rate;
+    p.channels = channels;
+    p.bits = bits;
+    p.loop = loop;
+    host_audio_play(&p);
+    g_ps_playing = true;
+    return true;
+}
+std::vector<uint8_t> read_whole_file(const std::string &guest) {
+    std::vector<uint8_t> bytes;
+    std::string path = win32_host_path_op(guest, WIN32_FILE_READ);
+    if (path.empty())
+        return bytes;
+    int fd = os_fd_open(path.c_str(), OS_O_RDONLY);
+    if (fd < 0)
+        return bytes;
+    OsStat st{};
+    if (os_fd_stat(fd, &st) != 0 || !st.is_regular || !st.size || st.size > INT32_MAX) {
+        os_fd_close(fd);
+        return bytes;
+    }
+    bytes.resize((size_t)st.size);
+    size_t got = 0;
+    while (got < bytes.size()) {
+        int64_t n = os_fd_read(fd, bytes.data() + got, bytes.size() - got);
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+    }
+    os_fd_close(fd);
+    if (got != bytes.size())
+        bytes.clear();
+    return bytes;
+}
+void stop_sound() {
+    if (g_ps_channel >= 0)
+        host_audio_stop(g_ps_channel);
+    g_ps_playing = false;
+}
+// SND_ASYNC 1 | SND_NODEFAULT 2 | SND_MEMORY 4 | SND_LOOP 8 | SND_NOSTOP 16 |
+// SND_PURGE 64 | SND_ALIAS 0x10000 | SND_FILENAME 0x20000.
+void playsound(X86 *c) {
+    uint32_t name = arg(c, 0), flags = arg(c, 2);
+    if (!name || (flags & 0x40)) { // NULL or SND_PURGE: stop
+        stop_sound();
+        set_eax(c, 1);
+        return;
+    }
+    if ((flags & 0x10) && g_ps_playing) { // SND_NOSTOP
+        set_eax(c, 0);
+        return;
+    }
+    bool loop = (flags & 0x8) != 0, ok = false;
+    if (flags & 0x4) { // SND_MEMORY: the pointer is the WAV image itself
+        if (gm_valid(name, 12))
+            ok = play_wav(g_mem + name, (size_t)(GUEST_SIZE - name), loop);
+    } else if (flags & 0x40004) { // SND_RESOURCE: no resource sound seam
+        LOGW("PlaySoundA: SND_RESOURCE id %u is not supported", name);
+    } else { // a file name
+        std::string guest = gm_str(name, 260);
+        std::vector<uint8_t> bytes = read_whole_file(guest);
+        ok = !bytes.empty() && play_wav(bytes.data(), bytes.size(), loop);
+    }
+    LOGV("PlaySoundA(\"%s\", flags %#x) -> %d", flags & 0x4 ? "<memory>" : "<file>", flags, ok);
+    set_eax(c, ok ? 1u : 0u);
+}
+
 #define W(name, n, fn)                                                                             \
     {"WINMM.dll", #name, n, fn}, {                                                                 \
         "_INMM.dll", #name, n, fn                                                                  \
@@ -379,7 +508,8 @@ const ImportShim shims[] = {
     W(waveOutWrite, 3, write_wave),      W(waveOutPause, 1, pause_wave),
     W(waveOutRestart, 1, restart),       W(waveOutReset, 1, reset_wave),
     W(waveOutGetPosition, 3, position),  W(waveOutSetVolume, 2, set_volume),
-    W(waveOutGetNumDevs, 0, num_devices)};
+    W(waveOutGetNumDevs, 0, num_devices),
+    {"WINMM.dll", "PlaySoundA", 3, playsound}};
 } // namespace
 void waveout_register() {
     imports_register(shims, std::size(shims));

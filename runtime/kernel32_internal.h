@@ -2,6 +2,7 @@
 #pragma once
 #include "imports.h"
 #include <string>
+#include <vector>
 
 void kernel32_wide_register();
 void create_file_named(X86 *c, const std::string &name);
@@ -19,6 +20,19 @@ void disk_free_space(X86 *c);
 void drive_type_named(X86 *c, const std::string &root);
 void logical_drive_strings(X86 *c, bool wide);
 void get_file_attributes_ex_named(X86 *c, const std::string &name);
+
+// Private-profile (INI) files. The parser is encoding-agnostic and shared by
+// the ANSI and UTF-16 shims: lines are UTF-8, section and key names compare
+// case-insensitively, and a UTF-16LE file is converted to UTF-8 on read.
+struct ProfileFile {
+    std::vector<std::string> lines;
+    bool utf16 = false;
+};
+std::string ini_trim(std::string s);
+bool ini_name_equal(const std::string &a, const std::string &b);
+bool ini_read(const std::string &name, ProfileFile &ini);
+bool ini_section(const std::string &line, std::string &section);
+bool ini_key(const std::string &line, std::string &key, std::string &value);
 
 void create_event_named(X86 *c, const std::string &name);
 void create_mutex_named(X86 *c, const std::string &name);

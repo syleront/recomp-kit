@@ -862,8 +862,8 @@ void a_RegQueryInfoKeyW(X86 *c) {
         wr64(arg(c, 11), 0);
     set_eax(c, hr);
 }
-void a_RegDeleteKeyW(X86 *c) {
-    std::string path = key_path(arg(c, 0), gm_wstr(arg(c, 1)));
+void reg_delete_key(X86 *c, const std::string &name) {
+    std::string path = key_path(arg(c, 0), name);
     if (path.empty()) {
         set_eax(c, 6);
         return;
@@ -879,19 +879,31 @@ void a_RegDeleteKeyW(X86 *c) {
     g_registry_dirty = true;
     set_eax(c, 0);
 }
-void a_RegDeleteValueW(X86 *c) {
+void a_RegDeleteKeyA(X86 *c) {
+    reg_delete_key(c, gm_str(arg(c, 1), 512));
+}
+void a_RegDeleteKeyW(X86 *c) {
+    reg_delete_key(c, gm_wstr(arg(c, 1)));
+}
+void reg_delete_value(X86 *c, const std::string &name) {
     std::string path = key_path(arg(c, 0), "");
     if (path.empty()) {
         set_eax(c, 6);
         return;
     }
     auto it = regstore().find(path);
-    if (it == regstore().end() || !it->second.erase(gm_wstr(arg(c, 1)))) {
+    if (it == regstore().end() || !it->second.erase(name)) {
         set_eax(c, 2);
         return;
     }
     g_registry_dirty = true;
     set_eax(c, 0);
+}
+void a_RegDeleteValueA(X86 *c) {
+    reg_delete_value(c, gm_str(arg(c, 1), 256));
+}
+void a_RegDeleteValueW(X86 *c) {
+    reg_delete_value(c, gm_wstr(arg(c, 1)));
 }
 void a_RegFlushKey(X86 *c) {
     if (key_path(arg(c, 0), "").empty()) {
@@ -955,6 +967,83 @@ void s_ShellExecuteA(X86 *c) {
     LOGW("ShellExecuteA(\"%s\", \"%s\"): nothing is launched from the runtime",
          gm_str(arg(c, 1), 64).c_str(), gm_str(arg(c, 2), 260).c_str());
     set_eax(c, 2); // ERROR_FILE_NOT_FOUND: the shell did not start anything
+}
+
+// CommandLineToArgvW has no host equivalent, so the documented MSVC parser runs
+// here: whitespace separates arguments, 2n backslashes before a quote collapse
+// to n backslashes and leave the quote as a delimiter, and 2n+1 leave the quote
+// literal. The result is one LocalAlloc block - a NULL-terminated pointer array
+// followed by the UTF-16 arguments - which the caller frees with LocalFree.
+void s_CommandLineToArgvW(X86 *c) {
+    std::string line = gm_wstr(arg(c, 0));
+    uint32_t pnum = arg(c, 1);
+    std::vector<std::string> args; // UTF-8, one per argument
+    size_t i = 0;
+    while (i < line.size()) {
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t'))
+            ++i;
+        if (i >= line.size())
+            break;
+        std::string arg;
+        bool in_quotes = false;
+        while (i < line.size()) {
+            char ch = line[i];
+            if (ch == '\\') {
+                size_t n = 0;
+                while (i + n < line.size() && line[i + n] == '\\')
+                    ++n;
+                if (i + n < line.size() && line[i + n] == '"') {
+                    arg.append(n / 2, '\\');
+                    i += n;
+                    if (n & 1) { // the quote is literal
+                        arg += '"';
+                        ++i;
+                    } // otherwise the quote is left to toggle the quote state
+                } else {
+                    arg.append(n, '\\');
+                    i += n;
+                }
+                continue;
+            }
+            if (ch == '"') {
+                if (in_quotes && i + 1 < line.size() && line[i + 1] == '"') {
+                    arg += '"'; // a doubled quote inside quotes is literal
+                    i += 2;
+                } else {
+                    in_quotes = !in_quotes;
+                    ++i;
+                }
+                continue;
+            }
+            if (!in_quotes && (ch == ' ' || ch == '\t'))
+                break;
+            arg += ch;
+            ++i;
+        }
+        args.push_back(std::move(arg));
+    }
+    if (args.empty())
+        args.emplace_back(); // an empty command line yields one empty argument
+    uint64_t need = (uint64_t)(args.size() + 1) * 4;
+    for (const auto &a : args)
+        need += ((uint64_t)reg_units(a) + 1) * 2;
+    uint32_t block = need <= GUEST_SIZE ? heap_alloc((uint32_t)need, true) : 0;
+    if (!block) {
+        if (pnum && gm_valid(pnum, 4))
+            wr32(pnum, 0);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t cursor = block + (uint32_t)(args.size() + 1) * 4;
+    for (size_t j = 0; j < args.size(); ++j) {
+        wr32(block + (uint32_t)j * 4, cursor);
+        uint32_t n = gm_put_wstr(cursor, args[j], reg_units(args[j]) + 1);
+        cursor += (n + 1) * 2;
+    }
+    wr32(block + (uint32_t)args.size() * 4, 0);
+    if (pnum && gm_valid(pnum, 4))
+        wr32(pnum, (uint32_t)args.size());
+    set_eax(c, block);
 }
 
 void o_CoInitialize(X86 *c) {
@@ -2008,6 +2097,8 @@ const ImportShim g_misc_shims[] = {
     {"ADVAPI32.dll", "RegCloseKey", 1, a_RegCloseKey},
     {"ADVAPI32.dll", "RegQueryValueExA", 6, a_RegQueryValueExA},
     {"ADVAPI32.dll", "RegSetValueExA", 6, a_RegSetValueExA},
+    {"ADVAPI32.dll", "RegDeleteKeyA", 2, a_RegDeleteKeyA},
+    {"ADVAPI32.dll", "RegDeleteValueA", 2, a_RegDeleteValueA},
     {"ADVAPI32.dll", "RegOpenKeyExW", 5, a_RegOpenKeyExW},
     {"ADVAPI32.dll", "RegCreateKeyExW", 9, a_RegCreateKeyExW},
     {"ADVAPI32.dll", "RegQueryValueExW", 6, a_RegQueryValueExW},
@@ -2030,6 +2121,7 @@ const ImportShim g_misc_shims[] = {
     // SHELL32
     {"SHELL32.dll", "ShellExecuteA", 6, s_ShellExecuteA},
     {"SHELL32.dll", "SHGetSpecialFolderPathA", 4, s_SHGetSpecialFolderPathA},
+    {"SHELL32.dll", "CommandLineToArgvW", 2, s_CommandLineToArgvW},
     {"SHFOLDER.dll", "SHGetFolderPathA", 5, s_SHGetFolderPathA},
     // ole32
     {"ole32.dll", "CoInitialize", 1, o_CoInitialize},
