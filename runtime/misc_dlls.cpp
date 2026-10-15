@@ -5,6 +5,7 @@
 #include "../platform/os.h"
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <vector>
 
 namespace {
@@ -208,6 +209,355 @@ void folder_path(X86 *c) {
     gm_put_wstr(out, shell_folder_guest_path(5, (csidl & 0x8000) != 0), 260);
     set_eax(c, 0);
 }
+// ---------------------------------------------------------------------------
+// comdlg32: common file dialogs. A native picker is out of scope, so every
+// entry reports "the user cancelled": FALSE with CommDlgExtendedError() == 0
+// (no error, which is exactly what a cancel leaves behind), and logs the title
+// and file so a run shows what was asked for.
+// ---------------------------------------------------------------------------
+uint32_t g_commdlg_error = 0;
+void common_dialog(X86 *c, bool save) {
+    uint32_t ofn = arg(c, 0);
+    std::string title, file;
+    if (ofn && gm_valid(ofn, 60)) {
+        uint32_t t = rd32(ofn + 48), f = rd32(ofn + 28);
+        if (t)
+            title = gm_str(t, 260);
+        if (f)
+            file = gm_str(f, 260);
+    }
+    LOGW("%s(\"%s\", file \"%s\"): no native dialog, reporting cancel",
+         save ? "GetSaveFileNameA" : "GetOpenFileNameA", title.c_str(), file.c_str());
+    g_commdlg_error = 0;
+    set_eax(c, 0); // FALSE
+}
+void cd_GetOpenFileNameA(X86 *c) {
+    common_dialog(c, false);
+}
+void cd_GetSaveFileNameA(X86 *c) {
+    common_dialog(c, true);
+}
+void cd_ExtendedError(X86 *c) {
+    set_eax(c, g_commdlg_error);
+}
+
+// ---------------------------------------------------------------------------
+// RPCRT4: GUID generation and comparison. UuidCreate fills a version-4 UUID
+// from a process-local xorshift seeded from the wall clock and the monotonic
+// clock; UuidEqual is a byte comparison that always reports RPC_S_OK.
+// ---------------------------------------------------------------------------
+uint32_t g_uuid_rng = 0;
+uint32_t uuid_rng_next() {
+    if (!g_uuid_rng)
+        g_uuid_rng = (uint32_t)os_wall_time_us() ^ (uint32_t)(os_monotonic_ns() >> 4) ^ 0x9e3779b9u;
+    uint32_t x = g_uuid_rng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_uuid_rng = x;
+    return x;
+}
+void r_UuidCreate(X86 *c) {
+    uint32_t out = arg(c, 0);
+    if (out && gm_valid(out, 16)) {
+        for (int i = 0; i < 4; ++i)
+            wr32(out + i * 4, uuid_rng_next());
+        wr8(out + 6, (uint8_t)((rd8(out + 6) & 0x0f) | 0x40)); // version 4
+        wr8(out + 8, (uint8_t)((rd8(out + 8) & 0x3f) | 0x80)); // RFC 4122 variant
+    }
+    set_eax(c, 0); // RPC_S_OK
+}
+void r_UuidEqual(X86 *c) {
+    uint32_t a = arg(c, 0), b = arg(c, 1), status = arg(c, 2);
+    bool valid = a && b && gm_valid(a, 16) && gm_valid(b, 16);
+    bool equal = valid && memcmp(g_mem + a, g_mem + b, 16) == 0;
+    if (status && gm_valid(status, 4))
+        wr32(status, 0); // RPC_S_OK
+    set_eax(c, equal ? 1u : 0u);
+}
+
+// ---------------------------------------------------------------------------
+// MSACM32: audio compression manager. Petz 5 stores its wave effects as mono
+// IMA ADPCM (WAVE_FORMAT_IMA_ADPCM, format tag 0x11, 4 bits) and converts them
+// to PCM once at load through CWave::ConvertToPCM; nothing else in the game
+// uses ACM. The streams below therefore implement exactly that conversion:
+// IMA ADPCM (or plain PCM) in, 8- or 16-bit PCM out, at the same rate and
+// channel count. Any other codec pair is refused with ACMERR_NOTPOSSIBLE so the
+// caller takes its documented failure path rather than playing garbage.
+// ---------------------------------------------------------------------------
+const int k_ima_index[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
+const int k_ima_step[89] = {
+    7,     8,     9,     10,    11,    12,    13,    14,    16,    17,    19,    21,    23,
+    25,    28,    31,    34,    37,    41,    45,    50,    55,    60,    66,    73,    80,
+    88,    97,    107,   118,   130,   143,   157,   173,   190,   209,   230,   253,   279,
+    307,   337,   371,   408,   449,   494,   544,   598,   658,   724,   796,   876,   963,
+    1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,  2272,  2499,  2749,  3024,  3327,
+    3660,  4026,  4428,  4871,  5358,  5894,  6484,  7132,  7845,  8630,  9493,  10442, 11487,
+    12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
+
+struct AcmFormat {
+    uint32_t tag = 0, channels = 0, rate = 0, align = 0, bits = 0, samples = 0;
+};
+struct AcmStream {
+    AcmFormat src, dst;
+};
+
+std::map<uint32_t, AcmStream> g_acm;
+uint32_t g_next_acm = 0x41434d01;
+
+// WAVEFORMATEX: tag(2) channels(2) rate(4) avgBytes(4) align(2) bits(2) cbSize(2)
+// and, when cbSize >= 2, the codec's samples-per-block at +18.
+bool acm_read_format(uint32_t p, AcmFormat &f) {
+    if (!p || !gm_valid(p, 18))
+        return false;
+    f.tag = rd16(p);
+    f.channels = rd16(p + 2);
+    f.rate = rd32(p + 4);
+    f.align = rd16(p + 12);
+    f.bits = rd16(p + 14);
+    f.samples = rd16(p + 16) >= 2 && gm_valid(p, 20) ? rd16(p + 18) : 0;
+    return f.channels == 1 || f.channels == 2;
+}
+bool acm_supported(const AcmStream &s) {
+    if (s.dst.tag != 1 || (s.dst.bits != 8 && s.dst.bits != 16) || !s.dst.rate)
+        return false;
+    if (s.src.tag == 1)
+        return s.src.channels == s.dst.channels && s.src.rate == s.dst.rate &&
+               s.src.bits == s.dst.bits;
+    return s.src.tag == 0x11 && s.src.bits == 4 && s.src.channels == s.dst.channels &&
+           s.src.rate == s.dst.rate && s.src.align >= 4u * s.src.channels;
+}
+uint32_t acm_samples_per_block(const AcmFormat &src) {
+    if (src.samples)
+        return src.samples;
+    uint32_t align = src.align ? src.align : 512;
+    uint32_t channels = src.channels ? src.channels : 1;
+    if (align <= 4 * channels)
+        return 1;
+    return (align - 4 * channels) * 2 / channels + 1;
+}
+// One 4-bit IMA nibble at shift 3: the Microsoft reference arithmetic, the same
+// expression FFmpeg's adpcm_ima_expand_nibble uses, so a block decoded here
+// matches what dx/waveout.cpp's AV_CODEC_ID_ADPCM_IMA_WAV decoder produces.
+int ima_nibble(int nibble, int &predictor, int &index) {
+    int step = k_ima_step[index];
+    int delta = nibble & 7;
+    int diff = ((2 * delta + 1) * step) >> 3;
+    predictor += (nibble & 8) ? -diff : diff;
+    predictor = std::clamp(predictor, -32768, 32767);
+    index = std::clamp(index + k_ima_index[nibble], 0, 88);
+    return predictor;
+}
+void ima_emit(std::vector<uint8_t> &out, int sample, uint32_t bits) {
+    if (bits == 8)
+        out.push_back((uint8_t)((sample >> 8) + 128)); // 8-bit PCM is unsigned
+    else {
+        out.push_back((uint8_t)(sample & 0xff));
+        out.push_back((uint8_t)((sample >> 8) & 0xff));
+    }
+}
+void acm_decode(const AcmStream &s, uint32_t src, uint32_t src_bytes, uint32_t dst,
+                uint32_t dst_bytes, uint32_t &src_used, uint32_t &dst_used) {
+    src_used = dst_used = 0;
+    if (s.src.tag == 1) { // PCM: the same samples, byte for byte
+        uint32_t n = std::min(src_bytes, dst_bytes);
+        if (n)
+            memcpy(g_mem + dst, g_mem + src, n);
+        src_used = n;
+        dst_used = n;
+        return;
+    }
+    uint32_t channels = s.src.channels;
+    uint32_t align = s.src.align;
+    uint32_t blocks = align ? src_bytes / align : 0;
+    if (!blocks)
+        return;
+    uint32_t spb = acm_samples_per_block(s.src); // samples per channel per block
+    if (!spb)
+        return;
+    // After the 4-byte-per-channel headers, the block is groups of 4 bytes per
+    // channel in channel order: within one group each byte is two samples, low
+    // nibble then high, and the decoded sample count per channel per block is
+    // (align - 4*channels) * 8 / (4*channels) + 1 - exactly what
+    // acm_samples_per_block reports.
+    uint32_t groups = align > 4 * channels ? (align - 4 * channels) / (4 * channels) : 0;
+    std::vector<uint8_t> pcm;
+    pcm.reserve((size_t)blocks * spb * channels * (s.dst.bits / 8));
+    std::vector<int16_t> plane((size_t)channels * spb);
+    for (uint32_t b = 0; b < blocks; ++b) {
+        const uint8_t *p = g_mem + src + b * align;
+        int predictor[2] = {0, 0}, index[2] = {0, 0};
+        for (uint32_t ch = 0; ch < channels; ++ch) {
+            predictor[ch] = (int16_t)(p[ch * 4] | (p[ch * 4 + 1] << 8));
+            index[ch] = std::clamp((int)(int16_t)(p[ch * 4 + 2] | (p[ch * 4 + 3] << 8)), 0, 88);
+            plane[(size_t)ch * spb] = (int16_t)predictor[ch]; // the header sample
+        }
+        uint32_t at = 4 * channels;
+        for (uint32_t group = 0; group < groups; ++group) {
+            for (uint32_t ch = 0; ch < channels; ++ch) {
+                for (uint32_t m = 0; m < 8; m += 2) {
+                    uint8_t byte = p[at++];
+                    uint32_t base = 1 + group * 8 + m;
+                    if (base < spb)
+                        plane[(size_t)ch * spb + base] =
+                            (int16_t)ima_nibble(byte & 0x0f, predictor[ch], index[ch]);
+                    else
+                        ima_nibble(byte & 0x0f, predictor[ch], index[ch]);
+                    if (base + 1 < spb)
+                        plane[(size_t)ch * spb + base + 1] =
+                            (int16_t)ima_nibble(byte >> 4, predictor[ch], index[ch]);
+                    else
+                        ima_nibble(byte >> 4, predictor[ch], index[ch]);
+                }
+            }
+        }
+        for (uint32_t i = 0; i < spb; ++i)
+            for (uint32_t ch = 0; ch < channels; ++ch)
+                ima_emit(pcm, plane[(size_t)ch * spb + i], s.dst.bits);
+    }
+    uint32_t n = (uint32_t)std::min<size_t>(pcm.size(), dst_bytes);
+    if (n)
+        memcpy(g_mem + dst, pcm.data(), n);
+    src_used = blocks * align;
+    dst_used = n;
+}
+
+void acm_Metrics(X86 *c) {
+    uint32_t metric = arg(c, 1), out = arg(c, 2);
+    uint32_t value = metric == 0x32   ? 20   // ACM_METRIC_MAX_SIZE_FORMAT: WAVEFORMATEX + cbSize
+                     : metric == 0x33 ? 8    // ACM_METRIC_MAX_SIZE_FILTER: WAVEFILTER base
+                                      : 0;
+    if (out && gm_valid(out, 4))
+        wr32(out, value);
+    // Every metric the game asks for (0x32) is answered; anything else is a
+    // codec-enumeration query this one-codec implementation does not serve.
+    set_eax(c, metric == 0x32 || metric == 0x33 ? 0u : 8u); // 8 = MMSYSERR_NOTSUPPORTED
+}
+void acm_FormatSuggest(X86 *c) {
+    uint32_t src = arg(c, 1), dst = arg(c, 2), cb = arg(c, 3);
+    AcmFormat sf, df;
+    if (!acm_read_format(src, sf) || !dst || !gm_valid(dst, 18) || cb < 18 ||
+        !acm_read_format(dst, df)) {
+        set_eax(c, 11); // MMSYSERR_INVALPARAM
+        return;
+    }
+    if (df.tag == 0)
+        df.tag = 1;
+    if (!df.channels)
+        df.channels = 1;
+    if (!df.bits)
+        df.bits = 16;
+    if (!df.align)
+        df.align = df.channels * df.bits / 8;
+    AcmStream s;
+    s.src = sf;
+    s.dst = df;
+    if (df.tag != 1 || !acm_supported(s)) {
+        set_eax(c, 512); // ACMERR_NOTPOSSIBLE
+        return;
+    }
+    wr16(dst, (uint16_t)df.tag);
+    wr16(dst + 2, (uint16_t)df.channels);
+    wr16(dst + 12, (uint16_t)df.align);
+    wr16(dst + 14, (uint16_t)df.bits);
+    set_eax(c, 0);
+}
+void acm_StreamOpen(X86 *c) {
+    uint32_t phas = arg(c, 0), src = arg(c, 2), dst = arg(c, 3), filter = arg(c, 4);
+    if (phas && gm_valid(phas, 4))
+        wr32(phas, 0);
+    AcmStream s;
+    if (filter || !phas || !gm_valid(phas, 4) || !acm_read_format(src, s.src) ||
+        !acm_read_format(dst, s.dst) || !acm_supported(s)) {
+        set_eax(c, 512); // ACMERR_NOTPOSSIBLE
+        return;
+    }
+    uint32_t handle = g_next_acm++;
+    g_acm[handle] = s;
+    wr32(phas, handle);
+    set_eax(c, 0);
+}
+void acm_StreamSize(X86 *c) {
+    uint32_t handle = arg(c, 0), cb = arg(c, 1), out = arg(c, 2), mode = arg(c, 3) & 0xf;
+    auto it = g_acm.find(handle);
+    if (it == g_acm.end()) {
+        set_eax(c, 5); // MMSYSERR_INVALIDHANDLE
+        return;
+    }
+    if (!out || !gm_valid(out, 4)) {
+        set_eax(c, 11);
+        return;
+    }
+    const AcmStream &s = it->second;
+    uint32_t result = cb;
+    if (s.src.tag == 0x11) {
+        uint32_t bytes_per_sample = s.dst.bits / 8;
+        uint32_t block_out = acm_samples_per_block(s.src) * s.dst.channels * bytes_per_sample;
+        if (mode == 1) { // ACM_STREAMSIZEF_DESTINATION
+            uint32_t blocks = block_out ? (cb + block_out - 1) / block_out : 0;
+            result = blocks * s.src.align;
+        } else if (block_out) { // ACM_STREAMSIZEF_SOURCE
+            uint32_t blocks = (cb + s.src.align - 1) / s.src.align;
+            result = blocks * block_out;
+        }
+    }
+    wr32(out, result);
+    set_eax(c, 0);
+}
+void acm_PrepareHeader(X86 *c) {
+    uint32_t handle = arg(c, 0), pah = arg(c, 1);
+    if (g_acm.find(handle) == g_acm.end()) {
+        set_eax(c, 5);
+        return;
+    }
+    if (!pah || !gm_valid(pah, 84) || rd32(pah) < 84) {
+        set_eax(c, 11);
+        return;
+    }
+    wr32(pah + 4, rd32(pah + 4) | 0x00020000u); // ACMSTREAMHEADER_STATUSF_PREPARED
+    set_eax(c, 0);
+}
+void acm_Convert(X86 *c) {
+    uint32_t handle = arg(c, 0), pah = arg(c, 1);
+    auto it = g_acm.find(handle);
+    if (it == g_acm.end()) {
+        set_eax(c, 5);
+        return;
+    }
+    if (!pah || !gm_valid(pah, 64)) {
+        set_eax(c, 11);
+        return;
+    }
+    uint32_t pb_src = rd32(pah + 12), cb_src = rd32(pah + 16);
+    uint32_t pb_dst = rd32(pah + 28), cb_dst = rd32(pah + 32);
+    if ((pb_src && !gm_valid(pb_src, cb_src)) || (pb_dst && !gm_valid(pb_dst, cb_dst))) {
+        set_eax(c, 11);
+        return;
+    }
+    uint32_t src_used = 0, dst_used = 0;
+    acm_decode(it->second, pb_src, cb_src, pb_dst, cb_dst, src_used, dst_used);
+    wr32(pah + 20, src_used); // cbSrcLengthUsed
+    wr32(pah + 36, dst_used); // cbDstLengthUsed
+    wr32(pah + 4, rd32(pah + 4) | 0x00010000u); // ACMSTREAMHEADER_STATUSF_DONE
+    set_eax(c, 0);
+}
+void acm_UnprepareHeader(X86 *c) {
+    uint32_t handle = arg(c, 0), pah = arg(c, 1);
+    if (g_acm.find(handle) == g_acm.end()) {
+        set_eax(c, 5);
+        return;
+    }
+    if (!pah || !gm_valid(pah, 64)) {
+        set_eax(c, 11);
+        return;
+    }
+    wr32(pah + 4, rd32(pah + 4) & ~(0x00010000u | 0x00020000u));
+    set_eax(c, 0);
+}
+void acm_StreamClose(X86 *c) {
+    set_eax(c, g_acm.erase(arg(c, 0)) ? 0u : 5u);
+}
+
 const ImportShim shims[] = {
     {"DWMAPI.dll", "DwmIsCompositionEnabled", 1, composition_enabled},
     {"DWMAPI.dll", "DwmExtendFrameIntoClientArea", 2, buffered_paint_unavailable},
@@ -285,6 +635,23 @@ const ImportShim shims[] = {
     {"SHELL32.dll", "SHAppBarMessage", 2, zero},
     {"SHELL32.dll", "ShellExecuteW", 6, zero},
     {"URLMON.dll", "URLDownloadToFileW", 5, nullptr},
+    // comdlg32: no native picker; a cancel is reported.
+    {"comdlg32.dll", "GetOpenFileNameA", 1, cd_GetOpenFileNameA},
+    {"comdlg32.dll", "GetSaveFileNameA", 1, cd_GetSaveFileNameA},
+    {"comdlg32.dll", "CommDlgExtendedError", 0, cd_ExtendedError},
+    // RPCRT4: GUID generation and comparison.
+    {"RPCRT4.dll", "UuidCreate", 1, r_UuidCreate},
+    {"RPCRT4.dll", "UuidEqual", 3, r_UuidEqual},
+    // MSACM32: IMA ADPCM (and PCM) to PCM, the one conversion this game asks
+    // for. Unsupported codec pairs fail with ACMERR_NOTPOSSIBLE (512).
+    {"MSACM32.dll", "acmMetrics", 3, acm_Metrics},
+    {"MSACM32.dll", "acmFormatSuggest", 5, acm_FormatSuggest},
+    {"MSACM32.dll", "acmStreamOpen", 8, acm_StreamOpen},
+    {"MSACM32.dll", "acmStreamSize", 4, acm_StreamSize},
+    {"MSACM32.dll", "acmStreamPrepareHeader", 3, acm_PrepareHeader},
+    {"MSACM32.dll", "acmStreamConvert", 3, acm_Convert},
+    {"MSACM32.dll", "acmStreamUnprepareHeader", 3, acm_UnprepareHeader},
+    {"MSACM32.dll", "acmStreamClose", 2, acm_StreamClose},
 };
 } // namespace
 void misc_dlls_register() {

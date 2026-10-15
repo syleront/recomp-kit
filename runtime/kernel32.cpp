@@ -4749,6 +4749,311 @@ void k_SleepEx(X86 *c) {
     set_eax(c, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Global memory heap flags/query. The kit's Global* model is the guest heap
+// itself (kernel32.cpp's k_GlobalAlloc): a handle and its pointer are the same
+// value, so GlobalHandle answers with the pointer and GlobalFlags observes no
+// flags a caller could act on.
+// ---------------------------------------------------------------------------
+void k_GlobalFlags(X86 *c) {
+    set_eax(c, 0); // GMEM_FIXED: no allocatable flags are reported
+}
+void k_GlobalSize(X86 *c) {
+    uint32_t size = heap_size(arg(c, 0));
+    set_eax(c, size == 0xffffffffu ? 0 : size);
+}
+void k_GlobalHandle(X86 *c) {
+    uint32_t p = arg(c, 0);
+    set_eax(c, heap_owns(p) ? p : 0);
+}
+
+// The short path only differs from the long one on a system with 8.3 names;
+// this guest root has none, so the documented contract - copy the path and
+// report the length the caller needs - is the whole behaviour.
+void k_GetShortPathNameA(X86 *c) {
+    std::string path = gm_str(arg(c, 0));
+    uint32_t out = arg(c, 1), cap = arg(c, 2);
+    uint32_t need = (uint32_t)path.size() + 1;
+    if (!out || cap < need) {
+        set_eax(c, need);
+        return;
+    }
+    set_eax(c, gm_put_str(out, path.c_str(), cap));
+}
+
+// FROM_SYSTEM only: without a message table there is no per-format text, so
+// every id becomes a generic "Error <id>". ALLOCATE_BUFFER hands the caller a
+// heap block of its own, which must be released with LocalFree.
+void k_FormatMessageA(X86 *c) {
+    uint32_t flags = arg(c, 0), out = arg(c, 4), cap = arg(c, 5);
+    if (!(flags & 0x1000) || (flags & (0x400 | 0x800)) || !out) {
+        set_last_error(87);
+        set_eax(c, 0);
+        return;
+    }
+    std::string text = "Error " + std::to_string(arg(c, 2));
+    uint32_t need = (uint32_t)text.size() + 1;
+    if (flags & 0x100) { // FORMAT_MESSAGE_ALLOCATE_BUFFER
+        cap = std::max(cap, need);
+        if (cap > GUEST_SIZE || !gm_valid(out, 4)) {
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t buffer = heap_alloc(cap, true);
+        if (!buffer) {
+            set_last_error(8);
+            set_eax(c, 0);
+            return;
+        }
+        wr32(out, buffer);
+        out = buffer;
+    } else if (cap < need || !gm_valid(out, need)) {
+        set_last_error(122);
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, gm_put_str(out, text.c_str(), cap));
+}
+
+// Nothing in the guest owns a device that accepts IOCTLs; failing explicitly
+// with ERROR_NOT_SUPPORTED is the truth rather than a fabricated success.
+void k_DeviceIoControl(X86 *c) {
+    uint32_t returned = arg(c, 6);
+    if (returned && gm_valid(returned, 4))
+        wr32(returned, 0);
+    set_last_error(50); // ERROR_NOT_SUPPORTED
+    set_eax(c, 0);
+}
+
+// A child process is not launched, so WinExec reports a generic failure
+// (a code below 32) rather than a fabricated instance handle.
+void k_WinExec(X86 *c) {
+    LOGW("WinExec(\"%s\", %u): no child process launched", gm_str(arg(c, 0)).c_str(), arg(c, 1));
+    set_eax(c, 31); // ERROR_GEN_FAILURE
+}
+
+// ---------------------------------------------------------------------------
+// Directory change notifications. A real host has no inotify-style seam, so the
+// wait handle is a dummy the guest can hold: the first call allocates it, every
+// subsequent FindNext reports a change (TRUE) and FindClose gives it up.
+// ---------------------------------------------------------------------------
+void k_FindFirstChangeNotificationA(X86 *c) {
+    uint32_t h = handle_new(H_NONE);
+    LOGV("FindFirstChangeNotificationA(\"%s\", %u, %08x) -> %08x (dummy)", gm_str(arg(c, 0)).c_str(),
+         arg(c, 1), arg(c, 2), h);
+    set_eax(c, h);
+}
+void k_FindNextChangeNotification(X86 *c) {
+    set_eax(c, 1);
+}
+void k_FindCloseChangeNotification(X86 *c) {
+    handles().erase(arg(c, 0));
+    set_eax(c, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Private-profile (INI) files, ANSI. The parser is the UTF-16 shim's, moved to
+// the A/W seam (kernel32_internal.h); this layer only decides how bytes become
+// guest strings and how results are written back.
+// ---------------------------------------------------------------------------
+// Only used by GetPrivateProfileIntA; a value that is not a number leaves the
+// caller's default in place, as it does on Windows.
+static int32_t ini_parse_int(const std::string &raw, int32_t fallback) {
+    std::string s = ini_trim(raw);
+    if (s.empty())
+        return fallback;
+    size_t i = 0;
+    bool neg = false;
+    if (s[i] == '+' || s[i] == '-') {
+        neg = s[i] == '-';
+        ++i;
+    }
+    int64_t value = 0;
+    bool any = false;
+    if (i + 1 < s.size() && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        i += 2;
+        for (; i < s.size(); ++i) {
+            int d = s[i] >= '0' && s[i] <= '9'   ? s[i] - '0'
+                    : s[i] >= 'a' && s[i] <= 'f' ? s[i] - 'a' + 10
+                    : s[i] >= 'A' && s[i] <= 'F' ? s[i] - 'A' + 10
+                                                 : -1;
+            if (d < 0)
+                return fallback;
+            value = (value << 4) | d;
+            any = true;
+        }
+    } else {
+        for (; i < s.size(); ++i) {
+            if (s[i] < '0' || s[i] > '9')
+                return fallback;
+            value = value * 10 + (s[i] - '0');
+            any = true;
+        }
+    }
+    if (!any)
+        return fallback;
+    if (neg)
+        value = -value;
+    if (value > 0x7fffffffll)
+        value = 0x7fffffffll;
+    if (value < -0x80000000ll)
+        value = -0x80000000ll;
+    return (int32_t)value;
+}
+
+// Section or key name NULL enumerates all of them, as a double-NUL-terminated
+// list; the byte count excludes the final NUL. A value read is the file's own
+// bytes (ANSI), returned through gm_put_str.
+void k_GetPrivateProfileStringA(X86 *c) {
+    std::string section = gm_str(arg(c, 0)), key = gm_str(arg(c, 1));
+    uint32_t out = arg(c, 3), cap = arg(c, 4);
+    ProfileFile ini;
+    if (!ini_read(gm_str(arg(c, 5)), ini)) {
+        set_last_error(5);
+        set_eax(c, 0);
+        return;
+    }
+    bool enumerate_sections = arg(c, 0) == 0, enumerate_keys = arg(c, 1) == 0;
+    bool multi = enumerate_sections || enumerate_keys;
+    std::string result = ini_trim(gm_str(arg(c, 2))), current, k, value;
+    std::vector<std::string> names;
+    for (const std::string &line : ini.lines) {
+        if (ini_section(line, current)) {
+            if (enumerate_sections)
+                names.push_back(current);
+        } else if (ini_name_equal(current, section) && ini_key(line, k, value)) {
+            if (enumerate_keys)
+                names.push_back(k);
+            else if (ini_name_equal(k, key)) {
+                result = value;
+                break;
+            }
+        }
+    }
+    if (!out || cap == 0) {
+        set_eax(c, 0);
+        return;
+    }
+    if (!multi) {
+        set_eax(c, gm_put_str(out, result.c_str(), cap));
+        return;
+    }
+    // MULTI_SZ: each name and its NUL, then one more NUL; the count excludes
+    // the final terminator, exactly as GetPrivateProfileString reports it.
+    uint32_t used = 0;
+    wr8(out, 0);
+    if (cap == 1) {
+        set_eax(c, 0);
+        return;
+    }
+    for (const auto &name : names) {
+        uint32_t need = (uint32_t)name.size() + 1;
+        if (need >= cap - used) {
+            gm_put_str(out + used, name.c_str(), cap - used - 1);
+            wr8(out + cap - 2, 0);
+            wr8(out + cap - 1, 0);
+            set_eax(c, cap - 2);
+            return;
+        }
+        used += gm_put_str(out + used, name.c_str(), cap - used) + 1;
+    }
+    wr8(out + used, 0);
+    if (used == 0)
+        wr8(out + 1, 0);
+    set_eax(c, used);
+}
+
+void k_GetPrivateProfileIntA(X86 *c) {
+    std::string section = gm_str(arg(c, 0)), key = gm_str(arg(c, 1));
+    int32_t fallback = (int32_t)arg(c, 2);
+    ProfileFile ini;
+    if (ini_read(gm_str(arg(c, 3)), ini)) {
+        std::string current, k, value;
+        for (const std::string &line : ini.lines) {
+            if (ini_section(line, current))
+                continue;
+            if (ini_name_equal(current, section) && ini_key(line, k, value) &&
+                ini_name_equal(k, key)) {
+                set_eax(c, (uint32_t)ini_parse_int(value, fallback));
+                return;
+            }
+        }
+    }
+    set_eax(c, (uint32_t)fallback);
+}
+
+void k_WritePrivateProfileStringA(X86 *c) {
+    if (!arg(c, 0)) { // NULL section flushes the (nonexistent) cache
+        set_eax(c, (!arg(c, 1) && !arg(c, 2)) ? 1u : 0u);
+        return;
+    }
+    ProfileFile ini;
+    std::string name = gm_str(arg(c, 3));
+    if (name.empty() || !ini_read(name, ini)) {
+        set_last_error(5);
+        set_eax(c, 0);
+        return;
+    }
+    std::string section = gm_str(arg(c, 0)), key = gm_str(arg(c, 1)), current, k, value;
+    std::string replacement = key + "=" + gm_str(arg(c, 2));
+    std::vector<std::string> lines;
+    bool inside = false, found_section = false, found_key = false;
+    for (const auto &line : ini.lines) {
+        if (ini_section(line, current)) {
+            if (inside && !found_key && arg(c, 1) && arg(c, 2)) {
+                lines.push_back(replacement);
+                found_key = true;
+            }
+            inside = ini_name_equal(current, section);
+            if (inside)
+                found_section = true;
+        } else if (inside && ini_key(line, k, value) && ini_name_equal(k, key)) {
+            if (!found_key && arg(c, 2))
+                lines.push_back(replacement);
+            found_key = true;
+            continue;
+        }
+        if (!(inside && !arg(c, 1))) // a NULL key deletes the whole section
+            lines.push_back(line);
+    }
+    if (!found_key && arg(c, 1) && arg(c, 2)) {
+        if (!found_section)
+            lines.push_back("[" + section + "]");
+        lines.push_back(replacement);
+    }
+    std::string text;
+    for (const auto &line : lines)
+        text += line + "\r\n";
+    // A file that was UTF-16LE stays UTF-16LE, so a later W read sees what it
+    // wrote; a new file is ANSI like the A function that made it.
+    if (ini.utf16) {
+        if (text.size() > GUEST_SIZE / 2 - 1) {
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t bufcap = (uint32_t)text.size() + 1, tmp = heap_alloc(bufcap * 2, true);
+        if (!tmp) {
+            set_eax(c, 0);
+            return;
+        }
+        uint32_t n = gm_put_wstr(tmp, text, bufcap);
+        text = std::string("\xff\xfe", 2) + std::string((char *)g_mem + tmp, n * 2);
+        heap_free(tmp);
+    }
+    std::string path = win32_host_path_op(name, WIN32_FILE_WRITE);
+    FILE *f = path.empty() ? nullptr : fopen(path.c_str(), "wb");
+    if (!f) {
+        set_last_error(5);
+        set_eax(c, 0);
+        return;
+    }
+    bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+    if (fclose(f) != 0)
+        ok = false;
+    win32_invalidate_dir_cache();
+    set_eax(c, ok ? 1u : 0u);
+}
+
 const ImportShim g_kernel32_shims[] = {
     // memory
     {"KERNEL32.dll", "HeapCreate", 3, k_HeapCreate},
@@ -4961,5 +5266,19 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "SetErrorMode", 1, k_SetErrorMode},
     {"KERNEL32.dll", "GetLogicalDrives", 0, k_GetLogicalDrives},
     {"KERNEL32.dll", "GetLocaleInfoW", 4, k_GetLocaleInfoW},
+    // Memory flags/query and the remaining KERNEL32 odds and ends.
+    {"KERNEL32.dll", "GlobalFlags", 1, k_GlobalFlags},
+    {"KERNEL32.dll", "GlobalSize", 1, k_GlobalSize},
+    {"KERNEL32.dll", "GlobalHandle", 1, k_GlobalHandle},
+    {"KERNEL32.dll", "GetShortPathNameA", 3, k_GetShortPathNameA},
+    {"KERNEL32.dll", "FormatMessageA", 7, k_FormatMessageA},
+    {"KERNEL32.dll", "DeviceIoControl", 8, k_DeviceIoControl},
+    {"KERNEL32.dll", "WinExec", 2, k_WinExec},
+    {"KERNEL32.dll", "FindFirstChangeNotificationA", 3, k_FindFirstChangeNotificationA},
+    {"KERNEL32.dll", "FindNextChangeNotification", 1, k_FindNextChangeNotification},
+    {"KERNEL32.dll", "FindCloseChangeNotification", 1, k_FindCloseChangeNotification},
+    {"KERNEL32.dll", "GetPrivateProfileStringA", 6, k_GetPrivateProfileStringA},
+    {"KERNEL32.dll", "GetPrivateProfileIntA", 4, k_GetPrivateProfileIntA},
+    {"KERNEL32.dll", "WritePrivateProfileStringA", 4, k_WritePrivateProfileStringA},
 };
 const size_t g_kernel32_shim_count = sizeof(g_kernel32_shims) / sizeof(g_kernel32_shims[0]);
