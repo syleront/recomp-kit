@@ -29,6 +29,7 @@
 #include <time.h>
 
 #include <map>
+#include <set>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -223,6 +224,12 @@ std::map<uint32_t, VmRegion> &vm_regions() {
 std::map<std::string, uint32_t> &modules() {
     static std::map<std::string, uint32_t> m;
     return m;
+}
+// Names whose data module was fully released by FreeLibrary. GetModuleHandle
+// must report these unloaded rather than remap them behind the guest's back.
+std::set<std::string> &freed_data_modules() {
+    static std::set<std::string> s;
+    return s;
 }
 uint32_t g_next_module = 0x60000000;
 
@@ -1104,6 +1111,13 @@ void get_module_handle_named(X86 *c, const std::string &module_name) {
         set_eax(c, it->second);
         return;
     }
+    // GetModuleHandle never loads: a module this runtime mapped and then
+    // released is unloaded, so report it absent instead of remapping it.
+    if (freed_data_modules().count(name)) {
+        set_last_error(126); // ERROR_MOD_NOT_FOUND
+        set_eax(c, 0);
+        return;
+    }
     // Registered DLLs are already available to static imports. Materialize
     // their pseudo handles through the same path as an explicit LoadLibrary.
     load_library_named(c, module_name);
@@ -1150,6 +1164,9 @@ void load_library_named(X86 *c, const std::string &module_name) {
     std::string name = library_name(module_name);
     auto it = modules().find(name);
     if (it != modules().end()) {
+        // A data module the guest already mapped acquires another reference;
+        // loader and pseudo modules have process lifetime and ignore this.
+        resource_module_add_ref(it->second);
         set_eax(c, it->second);
         return;
     }
@@ -1187,6 +1204,9 @@ void load_library_named(X86 *c, const std::string &module_name) {
         if (!host.empty() && os_stat(host.c_str(), &st) == 0 && st.is_regular) {
             if (uint32_t base = resource_map_module(host)) {
                 modules()[name] = base;
+                // Mapped again: any earlier release no longer marks it as
+                // unloaded, so GetModuleHandle resolves it from modules().
+                freed_data_modules().erase(name);
                 LOGW("LoadLibrary(\"%s\") -> resource module %08x", module_name.c_str(), base);
                 set_eax(c, base);
                 return;
@@ -1235,6 +1255,43 @@ void k_FreeLibrary(X86 *c) {
         if (--m->load_refs == 0) {
             call_dll_entry(c, *m, 0); // DLL_PROCESS_DETACH, before discarding globals
             m->attached = false;
+        }
+    } else {
+        // A module mapped by resource_map_module (a resource-only DLL or a
+        // content PE). Release one reference; the last one frees the guest
+        // image and withdraws the handle, as unloading the DLL would. This is
+        // what lets a content scan that loads and frees hundreds of files
+        // reclaim the arena instead of exhausting it.
+        bool freed = false;
+        if (resource_module_release(handle, &freed)) {
+            if (freed) {
+                for (auto it = modules().begin(); it != modules().end(); ++it) {
+                    if (it->second != handle)
+                        continue;
+                    LOGW("FreeLibrary(%08x): released data module \"%s\"", handle, it->first.c_str());
+                    freed_data_modules().insert(it->first);
+                    modules().erase(it);
+                    break;
+                }
+            }
+        } else {
+            // Not a data module this runtime mapped. A pseudo handle (a
+            // registered shim DLL with process lifetime) is still a live
+            // module and frees successfully; any other value was never mapped,
+            // so fail the way Win32 and the loader path above do rather than
+            // returning TRUE for a handle the runtime does not own.
+            bool known = false;
+            for (const auto &kv : modules()) {
+                if (kv.second == handle) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                set_last_error(ERROR_INVALID_HANDLE_);
+                set_eax(c, 0);
+                return;
+            }
         }
     }
     // Shim-only libraries have process lifetime and no guest entry point.

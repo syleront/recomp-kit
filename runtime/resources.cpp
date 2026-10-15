@@ -10,6 +10,7 @@ namespace {
 // code in them runs.
 struct DataModule {
     uint32_t base, size;
+    uint32_t refs; // LoadLibrary references; the image is freed at zero.
 };
 std::vector<DataModule> &data_modules() {
     static std::vector<DataModule> v;
@@ -209,6 +210,37 @@ bool resource_is_module(uint32_t module) {
     return m && m->base == module;
 }
 
+bool resource_module_add_ref(uint32_t module) {
+    for (DataModule &m : data_modules())
+        if (m.base == module) {
+            ++m.refs;
+            return true;
+        }
+    return false;
+}
+
+bool resource_module_release(uint32_t module, bool *freed) {
+    if (freed)
+        *freed = false;
+    std::vector<DataModule> &v = data_modules();
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i].base != module)
+            continue;
+        if (--v[i].refs)
+            return true;
+        // The last reference: return the image to the arena and forget it, so
+        // a module handle or a resource address into it stops resolving. A
+        // resource handle the guest kept is now dangling, which is exactly the
+        // Win32 contract for using a handle after FreeLibrary.
+        heap_free(v[i].base);
+        v.erase(v.begin() + (std::ptrdiff_t)i);
+        if (freed)
+            *freed = true;
+        return true;
+    }
+    return false;
+}
+
 uint32_t resource_map_module(const std::string &host_path) {
     FILE *f = fopen(host_path.c_str(), "rb");
     if (!f)
@@ -250,7 +282,7 @@ uint32_t resource_map_module(const std::string &host_path) {
             bytes = (uint32_t)(file.size() - ptr);
         memcpy(g_mem + base + va, file.data() + ptr, bytes);
     }
-    data_modules().push_back(DataModule{base, image_size});
+    data_modules().push_back(DataModule{base, image_size, 1});
     return base;
 }
 bool resource_names(uint32_t type_id_or_name, std::vector<ResourceName> *names, std::string *why,

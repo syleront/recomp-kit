@@ -6542,6 +6542,109 @@ static void test_auxiliary_modules() {
     }
 }
 
+// A resource-only DLL mapped by resource_map_module is refcounted by
+// LoadLibrary/FreeLibrary: the last release returns its image to the guest
+// heap, so a scan that loads and frees hundreds of content files reclaims the
+// arena instead of exhausting it. Freeing must also make GetModuleHandle report
+// the module unloaded, while a later load maps it again. The fixture is a
+// synthetic PE32 with one resource (type 10, name 101, language 0x409).
+static void test_data_module_lifetime() {
+    section("data module reference counting");
+    X86 c;
+    loader_init_context(&c);
+    if (win32_game_dir().empty()) {
+        ++g_skips;
+        printf("  [skip] no game directory for a synthetic data module\n");
+        return;
+    }
+    const char *name = "recomp-data-lifetime.toy";
+    std::string path = win32_game_dir() + "/" + name;
+    std::vector<uint8_t> pe(0x300, 0);
+    auto w16 = [&](size_t o, uint16_t v) {
+        pe[o] = (uint8_t)(v & 0xff);
+        pe[o + 1] = (uint8_t)(v >> 8);
+    };
+    auto w32 = [&](size_t o, uint32_t v) {
+        for (int k = 0; k < 4; ++k)
+            pe[o + k] = (uint8_t)(v >> (8 * k));
+    };
+    pe[0] = 'M';
+    pe[1] = 'Z';
+    const uint32_t nt = 0x80, opt = nt + 24, root = 0x200;
+    w32(0x3c, nt);
+    w32(nt, 0x00004550);
+    w16(nt + 6, 0);       // NumberOfSections
+    w16(nt + 20, 0xE0);   // SizeOfOptionalHeader
+    w16(opt, 0x10b);      // PE32
+    w32(opt + 56, 0x400); // SizeOfImage
+    w32(opt + 60, 0x300); // SizeOfHeaders: covers the resource directory
+    w32(opt + 92, 16);    // NumberOfRvaAndSizes
+    w32(opt + 112, root); // resource directory RVA (data directory 2)
+    w32(opt + 116, 0x100);
+    w16(root + 12, 0);
+    w16(root + 14, 1); // root: one ID entry
+    w32(root + 16, 10);
+    w32(root + 20, 0x80000040); // type 10 -> subdirectory 0x40
+    w16(root + 0x40 + 12, 0);
+    w16(root + 0x40 + 14, 1);
+    w32(root + 0x40 + 16, 101);
+    w32(root + 0x40 + 20, 0x80000060); // name 101 -> subdirectory 0x60
+    w16(root + 0x60 + 12, 0);
+    w16(root + 0x60 + 14, 1);
+    w32(root + 0x60 + 16, 0x409);
+    w32(root + 0x60 + 20, 0x80); // language -> data entry at 0x80
+    w32(root + 0x80, 0x300);
+    w32(root + 0x84, 8); // 8-byte payload at RVA 0x300
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!check(f != nullptr, "wrote a synthetic data module beside the game image")) {
+        return;
+    }
+    fwrite(pe.data(), 1, pe.size(), f);
+    fclose(f);
+    win32_set_file_ops(nullptr, nullptr);
+    win32_invalidate_dir_cache();
+
+    uint32_t s = 0x00300000;
+    gm_put_str(s, name, 64);
+    HeapStats before = heap_stats();
+    uint32_t h1 = call_import(&c, "KERNEL32.dll", "LoadLibraryA", {s});
+    check(h1 != 0 && resource_is_module(h1), "LoadLibrary maps the data module at %08x", h1);
+    uint64_t loaded_bytes = heap_stats().used_bytes;
+    check(loaded_bytes > before.used_bytes, "the mapped image is charged to the guest heap");
+    uint32_t entry = resource_find_in(h1, 10, 101, false);
+    check(entry != 0 && resource_data(entry, nullptr) != 0, "its resource resolves while mapped");
+
+    uint32_t h2 = call_import(&c, "KERNEL32.dll", "LoadLibraryA", {s});
+    check(h2 == h1, "a second load returns the same base %08x", h2);
+    check(heap_stats().used_bytes == loaded_bytes, "it does not remap the image");
+    check(call_import(&c, "KERNEL32.dll", "FreeLibrary", {h1}) == 1 && resource_is_module(h1) &&
+              heap_owns(h1),
+          "the first release keeps the module mapped");
+    check(call_import(&c, "KERNEL32.dll", "FreeLibrary", {h2}) == 1 && !resource_is_module(h1) &&
+              !heap_owns(h1),
+          "the last release frees the mapped image");
+    check(!resource_data(entry, nullptr), "a resource handle into the freed module fails cleanly");
+    check(heap_stats().used_bytes == before.used_bytes,
+          "the image is returned to the guest heap (%llu -> %llu bytes used)",
+          (unsigned long long)loaded_bytes, (unsigned long long)heap_stats().used_bytes);
+    check(call_import(&c, "KERNEL32.dll", "GetModuleHandleA", {s}) == 0,
+          "GetModuleHandle reports the freed module unloaded");
+    check(call_import(&c, "KERNEL32.dll", "FreeLibrary", {h1}) == 0 &&
+              call_import(&c, "KERNEL32.dll", "GetLastError", {}) == 6,
+          "a FreeLibrary after the final release fails with ERROR_INVALID_HANDLE");
+
+    uint32_t h3 = call_import(&c, "KERNEL32.dll", "LoadLibraryA", {s});
+    check(h3 != 0 && resource_is_module(h3), "a later load maps it again at %08x", h3);
+    check(call_import(&c, "KERNEL32.dll", "GetModuleHandleA", {s}) == h3,
+          "the reload clears it from the freed set, so GetModuleHandle finds it");
+    check(call_import(&c, "KERNEL32.dll", "FreeLibrary", {h3}) == 1 && !resource_is_module(h3) &&
+              heap_stats().used_bytes == before.used_bytes,
+          "and the reload can be freed again, returning the arena to its baseline");
+
+    os_unlink(path.c_str());
+    win32_invalidate_dir_cache();
+}
+
 static void test_delphi_dlls() {
     section("Delphi DLLs");
     X86 c;
@@ -6681,6 +6784,7 @@ int main(int argc, char **argv) {
     test_pe_exports();
     test_dll_lifetime();
     test_auxiliary_modules();
+    test_data_module_lifetime();
     test_resumable_stacks();
     if (argc == 2 && strcmp(argv[1], "--startup-contracts") == 0) {
         // A new port can validate mapping and registry contracts before its
