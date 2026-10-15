@@ -322,7 +322,8 @@ bool acm_supported(const AcmStream &s) {
     if (s.dst.tag != 1 || (s.dst.bits != 8 && s.dst.bits != 16) || !s.dst.rate)
         return false;
     if (s.src.tag == 1)
-        return s.src.channels == s.dst.channels && s.src.rate == s.dst.rate;
+        return s.src.channels == s.dst.channels && s.src.rate == s.dst.rate &&
+               s.src.bits == s.dst.bits;
     return s.src.tag == 0x11 && s.src.bits == 4 && s.src.channels == s.dst.channels &&
            s.src.rate == s.dst.rate && s.src.align >= 4u * s.src.channels;
 }
@@ -335,21 +336,16 @@ uint32_t acm_samples_per_block(const AcmFormat &src) {
         return 1;
     return (align - 4 * channels) * 2 / channels + 1;
 }
+// One 4-bit IMA nibble at shift 3: the Microsoft reference arithmetic, the same
+// expression FFmpeg's adpcm_ima_expand_nibble uses, so a block decoded here
+// matches what dx/waveout.cpp's AV_CODEC_ID_ADPCM_IMA_WAV decoder produces.
 int ima_nibble(int nibble, int &predictor, int &index) {
     int step = k_ima_step[index];
-    int diff = step >> 3;
-    if (nibble & 4)
-        diff += step;
-    if (nibble & 2)
-        diff += step >> 1;
-    if (nibble & 1)
-        diff += step >> 2;
-    if (nibble & 8)
-        diff = -diff;
-    predictor += diff;
+    int delta = nibble & 7;
+    int diff = ((2 * delta + 1) * step) >> 3;
+    predictor += (nibble & 8) ? -diff : diff;
     predictor = std::clamp(predictor, -32768, 32767);
-    index += k_ima_index[nibble];
-    index = std::clamp(index, 0, 88);
+    index = std::clamp(index + k_ima_index[nibble], 0, 88);
     return predictor;
 }
 void ima_emit(std::vector<uint8_t> &out, int sample, uint32_t bits) {
@@ -371,28 +367,53 @@ void acm_decode(const AcmStream &s, uint32_t src, uint32_t src_bytes, uint32_t d
         dst_used = n;
         return;
     }
+    uint32_t channels = s.src.channels;
     uint32_t align = s.src.align;
-    uint32_t header = 4 * s.src.channels;
     uint32_t blocks = align ? src_bytes / align : 0;
     if (!blocks)
         return;
+    uint32_t spb = acm_samples_per_block(s.src); // samples per channel per block
+    if (!spb)
+        return;
+    // After the 4-byte-per-channel headers, the block is groups of 4 bytes per
+    // channel in channel order: within one group each byte is two samples, low
+    // nibble then high, and the decoded sample count per channel per block is
+    // (align - 4*channels) * 8 / (4*channels) + 1 - exactly what
+    // acm_samples_per_block reports.
+    uint32_t groups = align > 4 * channels ? (align - 4 * channels) / (4 * channels) : 0;
     std::vector<uint8_t> pcm;
-    pcm.reserve((size_t)blocks * acm_samples_per_block(s.src) * s.dst.channels *
-                (s.dst.bits / 8));
+    pcm.reserve((size_t)blocks * spb * channels * (s.dst.bits / 8));
+    std::vector<int16_t> plane((size_t)channels * spb);
     for (uint32_t b = 0; b < blocks; ++b) {
         const uint8_t *p = g_mem + src + b * align;
-        int index[2] = {0, 0}, predictor[2] = {0, 0};
-        for (uint32_t ch = 0; ch < s.src.channels; ++ch) {
+        int predictor[2] = {0, 0}, index[2] = {0, 0};
+        for (uint32_t ch = 0; ch < channels; ++ch) {
             predictor[ch] = (int16_t)(p[ch * 4] | (p[ch * 4 + 1] << 8));
-            index[ch] = std::clamp((int)p[ch * 4 + 2], 0, 88);
-            ima_emit(pcm, predictor[ch], s.dst.bits);
+            index[ch] = std::clamp((int)(int16_t)(p[ch * 4 + 2] | (p[ch * 4 + 3] << 8)), 0, 88);
+            plane[(size_t)ch * spb] = (int16_t)predictor[ch]; // the header sample
         }
-        for (uint32_t i = header; i < align; ++i) {
-            uint8_t byte = p[i];
-            for (uint32_t ch = 0; ch < s.src.channels; ++ch)
-                ima_emit(pcm, ima_nibble(ch ? (byte & 15) : (byte >> 4), predictor[ch], index[ch]),
-                         s.dst.bits);
+        uint32_t at = 4 * channels;
+        for (uint32_t group = 0; group < groups; ++group) {
+            for (uint32_t ch = 0; ch < channels; ++ch) {
+                for (uint32_t m = 0; m < 8; m += 2) {
+                    uint8_t byte = p[at++];
+                    uint32_t base = 1 + group * 8 + m;
+                    if (base < spb)
+                        plane[(size_t)ch * spb + base] =
+                            (int16_t)ima_nibble(byte & 0x0f, predictor[ch], index[ch]);
+                    else
+                        ima_nibble(byte & 0x0f, predictor[ch], index[ch]);
+                    if (base + 1 < spb)
+                        plane[(size_t)ch * spb + base + 1] =
+                            (int16_t)ima_nibble(byte >> 4, predictor[ch], index[ch]);
+                    else
+                        ima_nibble(byte >> 4, predictor[ch], index[ch]);
+                }
+            }
         }
+        for (uint32_t i = 0; i < spb; ++i)
+            for (uint32_t ch = 0; ch < channels; ++ch)
+                ima_emit(pcm, plane[(size_t)ch * spb + i], s.dst.bits);
     }
     uint32_t n = (uint32_t)std::min<size_t>(pcm.size(), dst_bytes);
     if (n)
@@ -489,7 +510,7 @@ void acm_PrepareHeader(X86 *c) {
         set_eax(c, 5);
         return;
     }
-    if (!pah || !gm_valid(pah, 84) || rd32(pah) < 64) {
+    if (!pah || !gm_valid(pah, 84) || rd32(pah) < 84) {
         set_eax(c, 11);
         return;
     }

@@ -484,11 +484,11 @@ void playsound(X86 *c) {
         return;
     }
     bool loop = (flags & 0x8) != 0, ok = false;
-    if (flags & 0x4) { // SND_MEMORY: the pointer is the WAV image itself
+    if ((flags & 0x40004) == 0x40004) { // SND_RESOURCE: no resource sound seam
+        LOGW("PlaySoundA: SND_RESOURCE id %u is not supported", name);
+    } else if (flags & 0x4) { // SND_MEMORY: the pointer is the WAV image itself
         if (gm_valid(name, 12))
             ok = play_wav(g_mem + name, (size_t)(GUEST_SIZE - name), loop);
-    } else if (flags & 0x40004) { // SND_RESOURCE: no resource sound seam
-        LOGW("PlaySoundA: SND_RESOURCE id %u is not supported", name);
     } else { // a file name
         std::string guest = gm_str(name, 260);
         std::vector<uint8_t> bytes = read_whole_file(guest);
