@@ -72,6 +72,7 @@ void imports_init();
 void oleaut32_register();
 void misc_dlls_register();
 void msvcrt_register();
+void msvcirt_register();
 void comctl32_register();
 void media_foundation_register();
 
