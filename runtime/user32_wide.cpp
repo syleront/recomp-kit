@@ -291,15 +291,19 @@ void load_string_a(X86 *c) {
             if (!out)
                 break;
             std::string text = gm_wstr(p, n);
-            if (cap)
-                set_eax(c, gm_put_str(out, text.c_str(), cap));
-            else {
-                if (gm_valid(out, 4)) {
-                    wr32(out, p);
-                    set_eax(c, n);
-                    break;
+            if (cap) {
+                if (!gm_valid(out, cap)) {
+                    set_eax(c, 0);
+                    return;
                 }
-                set_eax(c, 0);
+                set_eax(c, gm_put_str(out, text.c_str(), cap));
+            } else {
+                if (!gm_valid(out, 4)) {
+                    set_eax(c, 0);
+                    return;
+                }
+                wr32(out, p);
+                set_eax(c, n);
             }
             return;
         }

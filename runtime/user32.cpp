@@ -2126,14 +2126,14 @@ bool parse_dlg_template(uint32_t p, uint32_t size, DlgTemplate *t) {
     if (extended) {
         if (size < 26)
             return false;
-        t->exstyle = rd32(p + 4);
-        t->style = rd32(p + 8);
-        count = rd16(p + 12);
-        t->x = int16_t(rd16(p + 14));
-        t->y = int16_t(rd16(p + 16));
-        t->cx = int16_t(rd16(p + 18));
-        t->cy = int16_t(rd16(p + 20));
-        q = tmpl_string(p + 22, end, &t->menu, nullptr, nullptr);
+        t->exstyle = rd32(p + 8);
+        t->style = rd32(p + 12);
+        count = rd16(p + 16);
+        t->x = int16_t(rd16(p + 18));
+        t->y = int16_t(rd16(p + 20));
+        t->cx = int16_t(rd16(p + 22));
+        t->cy = int16_t(rd16(p + 24));
+        q = tmpl_string(p + 26, end, &t->menu, nullptr, nullptr);
     } else {
         if (size < 18)
             return false;
