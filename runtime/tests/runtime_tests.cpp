@@ -2464,6 +2464,142 @@ static void test_dialog_frame_geometry(X86 *c) {
     call_import(c, "USER32.dll", "DestroyWindow", {plain});
 }
 
+// The interpreter is what runs code the translator never emitted; Petz 5's
+// warning dialog procedure (0x4014f0, only passed as a DialogProc) is one such
+// routine and needs SETcc, NOT and REPNE SCASB. Each is exercised on a tiny
+// routine written into guest memory, so the decoder and the executor are both
+// covered.
+static void test_interp_extra_ops(X86 *c) {
+    section("interpreter: SETcc, NOT and REPNE SCASB");
+    uint32_t code = scratch_block(64);
+    auto run_code = [&](const std::vector<uint8_t> &bytes) -> uint32_t {
+        memcpy(g_mem + code, bytes.data(), bytes.size());
+        uint32_t saved = c->r[R_ESP];
+        c->r[R_ESP] = saved - 4;
+        wr32(c->r[R_ESP], RECOMP_ENTRY_POINT);
+        int ran = interp_call(c, code);
+        uint32_t eax = c->r[R_EAX];
+        c->r[R_ESP] = saved;
+        check(ran != 0, "the routine was decoded and run");
+        return eax;
+    };
+    // xor eax,eax; mov ecx,0x1234; cmp ecx,imm32; sete al; ret
+    auto setcc = [&](uint32_t cmp_against) {
+        uint32_t loaded = 0x1234;
+        std::vector<uint8_t> b = {0x33, 0xc0, 0xb9, 0, 0,    0,    0,    0x81, 0xf9,
+                                  0,    0,    0,    0, 0x0f, 0x94, 0xc0, 0xc3};
+        memcpy(&b[3], &loaded, 4);
+        memcpy(&b[9], &cmp_against, 4);
+        return run_code(b);
+    };
+    check(setcc(0x1234) == 1, "SETcc stores 1 when the compare is equal");
+    check(setcc(0x99) == 0, "SETcc stores 0 when the compare is not equal");
+    // mov ecx,0; not ecx; mov eax,ecx; ret
+    check(run_code({0xb9, 0, 0, 0, 0, 0xf7, 0xd1, 0x89, 0xc8, 0xc3}) == 0xffffffffu,
+          "NOT complements the operand");
+    // mov edi,<str>; xor eax,eax; mov ecx,-1; repne scasb; not ecx; dec ecx;
+    // mov eax,ecx; ret  -> the C-string length.
+    uint32_t str = put_str("warning");
+    std::vector<uint8_t> scas = {0xbf, 0,    0,    0,    0,    0x33, 0xc0, 0xb9, 0xff, 0xff,
+                                 0xff, 0xff, 0xf2, 0xae, 0xf7, 0xd1, 0x49, 0x89, 0xc8, 0xc3};
+    memcpy(&scas[1], &str, 4);
+    check(run_code(scas) == 7, "REPNE SCASB + NOT + DEC measures a 7-character string");
+}
+
+// The Microsoft PCM converter on a stock Windows XP: a PCM stream converts to
+// PCM at any rate, bit depth and channel count. The shim used to refuse every
+// PCM -> PCM pair whose fields did not match exactly with ACMERR_NOTPOSSIBLE.
+static void test_acm_pcm_converter(X86 *c) {
+    section("MSACM32 PCM converter");
+    uint32_t src = scratch_block(20), dst = scratch_block(20), has = scratch_block(4),
+             out = scratch_block(4);
+    auto wf = [&](uint32_t p, uint16_t tag, uint16_t ch, uint32_t rate, uint16_t align,
+                  uint16_t bits) {
+        memset(g_mem + p, 0, 20);
+        wr16(p, tag);
+        wr16(p + 2, ch);
+        wr32(p + 4, rate);
+        wr32(p + 8, rate * ch * bits / 8);
+        wr16(p + 12, align);
+        wr16(p + 14, bits);
+    };
+    wf(src, 1, 1, 44100, 2, 16);
+    wf(dst, 1, 1, 22050, 2, 16);
+    check(call_import(c, "MSACM32.dll", "acmFormatSuggest", {0, src, dst, 18, 0xf0000}) == 0,
+          "PCM 44100 -> 22050 is suggestible");
+    check(rd32(dst + 4) == 22050, "the suggestion keeps the requested rate");
+    check(call_import(c, "MSACM32.dll", "acmStreamOpen", {has, 0, src, dst, 0, 0, 0, 0}) == 0,
+          "a PCM -> PCM resample stream opens");
+    uint32_t handle = rd32(has);
+    check(handle != 0, "acmStreamOpen writes a handle");
+    check(call_import(c, "MSACM32.dll", "acmStreamSize", {handle, 4000, out, 0}) == 0,
+          "acmStreamSize succeeds");
+    check(rd32(out) == 2000, "4000 source bytes become 2000 destination bytes");
+    // Convert four 16-bit frames at 44100 into two at 22050.
+    uint32_t pah = scratch_block(84), sb = scratch_block(16), db = scratch_block(16);
+    wr16(sb, 0x1000);
+    wr16(sb + 2, 0x2000);
+    wr16(sb + 4, 0x3000);
+    wr16(sb + 6, 0x4000);
+    wr32(pah, 84); // cbStruct
+    wr32(pah + 12, sb);
+    wr32(pah + 16, 8); // cbSrcLength
+    wr32(pah + 28, db);
+    wr32(pah + 32, 16); // cbDstLength
+    check(call_import(c, "MSACM32.dll", "acmStreamPrepareHeader", {handle, pah, 0}) == 0,
+          "the stream header prepares");
+    check(call_import(c, "MSACM32.dll", "acmStreamConvert", {handle, pah, 0}) == 0,
+          "the conversion runs");
+    check(rd32(pah + 20) == 8, "all 8 source bytes are consumed");
+    check(rd32(pah + 36) == 4, "4 destination bytes are written for the 22050 rate");
+    check(call_import(c, "MSACM32.dll", "acmStreamUnprepareHeader", {handle, pah, 0}) == 0,
+          "the header unprepares");
+    check(call_import(c, "MSACM32.dll", "acmStreamClose", {handle, 0}) == 0, "the stream closes");
+    // The metric a caller checks first is still answered.
+    check(call_import(c, "MSACM32.dll", "acmMetrics", {0, 0x32, out}) == 0 && rd32(out) == 20,
+          "ACM_METRIC_MAX_SIZE_FORMAT reports the WAVEFORMATEX size");
+}
+
+// A dialog's close box is WM_COMMAND IDCANCEL, and DefDlgProc follows it with
+// WM_CLOSE when the procedure leaves the dialog running. Petz 5's warning
+// procedure answers IDCANCEL with 0, so without the WM_CLOSE it never closes.
+static uint32_t g_cb_cmd = 0, g_cb_cmd_id = 0, g_cb_close = 0;
+static void closebox_dialog_proc(X86 *c) {
+    uint32_t msg = arg(c, 1);
+    if (msg == 0x0111) { // WM_COMMAND
+        ++g_cb_cmd;
+        g_cb_cmd_id = arg(c, 2) & 0xffffu;
+        set_eax(c, 1);
+        return;
+    }
+    if (msg == 0x0010) { // WM_CLOSE
+        ++g_cb_close;
+        set_eax(c, 1);
+        return;
+    }
+    set_eax(c, msg == 0x0081 ? 1 : 0);
+}
+static void test_dialog_close_box(X86 *c) {
+    section("USER32 dialog close box");
+    ensure_dialog_classes();
+    uint32_t proc =
+        imports_alloc_trampoline("test", "closebox_dialog_proc", closebox_dialog_proc, 4);
+    uint32_t title = put_str("Close Box Dialog");
+    uint32_t cls = put_str("#32770");
+    uint32_t hwnd =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, cls, title, 0x80000000u | 0x10000000u | 0x00c00000u | 0x00080000u, 10, 10,
+                     200, 150, 0, 0, 0, 0});
+    check(hwnd != 0, "create a captioned dialog with a close box");
+    call_import(c, "USER32.dll", "SetWindowLongA", {hwnd, uint32_t(-4), proc}); // GWL_WNDPROC
+    g_cb_cmd = g_cb_cmd_id = g_cb_close = 0;
+    check(close_box_request(c, hwnd), "close_box_request handled the dialog");
+    check(g_cb_cmd == 1 && g_cb_cmd_id == 2, "the close box sends WM_COMMAND IDCANCEL (id %u)",
+          g_cb_cmd_id);
+    check(g_cb_close == 1, "an unanswered IDCANCEL is followed by WM_CLOSE");
+    call_import(c, "USER32.dll", "DestroyWindow", {hwnd});
+}
+
 static void test_windows(X86 *c) {
     section("USER32 windows and messages");
     // The window procedure is a stand-in the test-only recomp_call can reach;
@@ -7155,6 +7291,9 @@ int main(int argc, char **argv) {
     test_listbox_ownerdraw_hit(c);
     test_dialog_dlu_mapping(c);
     test_dialog_frame_geometry(c);
+    test_dialog_close_box(c);
+    test_interp_extra_ops(c);
+    test_acm_pcm_converter(c);
     test_guest_thunks(c);
     test_callbacks(c);
     test_scheduling(c);

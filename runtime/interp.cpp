@@ -35,12 +35,22 @@ enum Op : uint8_t {
     // A JMP whose target is a translated entry: a tail call out of this
     // routine, which the address table places rather than this interpreter.
     JMPOUT,
+    // Byte-sized writes and the string scan a routine the translator missed
+    // still needs: Petz 5's warning dialog procedure (0x4014f0, only ever
+    // passed as a DLGPROC, so never emitted) uses SETcc to store a
+    // boolean, NOT to finish a length, and REPNE SCASB to measure a caption.
+    SETCC, // dst (r/m8) = condition(cond)
+    NOT,   // dst = ~dst, flags untouched
+    SCAS,  // REPNE/REPE SCASB AL, ES:[EDI]
 };
 
 // A register or memory operand. kind 0: none, 1: register, 2: memory,
-// 3: immediate.
+// 3: immediate. `size` is the operand width in bytes: 4 for the integer
+// subset's 32-bit forms, 1 for the 8-bit forms a byte-oriented routine uses
+// (SETcc, MOV AL/CL, TEST r/m8, the AL sub-family and SCASB).
 struct Operand {
     uint8_t kind = 0;
+    uint8_t size = 4;
     uint8_t reg = 0;
     int8_t base = -1, index = -1;
     uint8_t scale = 1;
@@ -59,6 +69,7 @@ struct Ins {
     uint32_t target_index = 0; // JMP, Jcc: `target`'s index in Routine::code
     bool indirect = false;
     uint16_t ret_pop = 0;
+    uint8_t rep = 0; // SCAS: 1 REPNE (F2), 2 REPE (F3)
 };
 
 // How far the decoder reads before it gives up looking for the last RET.
@@ -131,15 +142,17 @@ unsigned modrm(uint32_t p, Operand &rm, uint8_t &reg) {
     return n;
 }
 
-Operand reg_operand(uint8_t r) {
+Operand reg_operand(uint8_t r, uint8_t size = 4) {
     Operand o;
     o.kind = 1;
+    o.size = size;
     o.reg = r;
     return o;
 }
-Operand imm_operand(int32_t v) {
+Operand imm_operand(int32_t v, uint8_t size = 4) {
     Operand o;
     o.kind = 3;
+    o.size = size;
     o.disp = v;
     return o;
 }
@@ -209,15 +222,63 @@ bool decode(uint32_t a, Ins &in) {
         in.src = imm_operand((int32_t)rd32(p));
         p += 4;
         break;
-    case 0xf7: { // group 3, of which only TEST r/m32,imm32 is modelled
+    case 0xa8: // TEST AL,imm8
+        in.op = TEST;
+        in.dst = reg_operand(R_EAX, 1);
+        in.src = imm_operand(rd8(p), 1);
+        p += 1;
+        break;
+    case 0xa0:   // MOV AL,moffs8
+    case 0xa1:   // MOV EAX,moffs32
+    case 0xa2:   // MOV moffs8,AL
+    case 0xa3: { // MOV moffs32,EAX
+        const uint8_t size = (b == 0xa0 || b == 0xa2) ? 1 : 4;
+        Operand m;
+        m.kind = 2;
+        m.size = size;
+        m.disp = (int32_t)rd32(p);
+        p += 4;
+        Operand acc = reg_operand(R_EAX, size);
+        in.op = MOV;
+        bool store_to_mem = (b == 0xa2 || b == 0xa3);
+        in.dst = store_to_mem ? m : acc;
+        in.src = store_to_mem ? acc : m;
+        break;
+    }
+    case 0xf6: { // group 3, 8-bit: TEST r/m8,imm8
         Operand rm;
-        if (!(n = modrm(p, rm, reg)) || reg > 1)
+        if (!(n = modrm(p, rm, reg)) || reg != 0)
             return false;
         p += n;
+        rm.size = 1;
+        in.op = TEST;
+        in.dst = rm;
+        in.src = imm_operand(rd8(p), 1);
+        p += 1;
+        break;
+    }
+    case 0xf7: { // group 3: TEST r/m32,imm32 and NOT r/m32
+        Operand rm;
+        if (!(n = modrm(p, rm, reg)) || reg > 2)
+            return false;
+        p += n;
+        if (reg == 2) {
+            in.op = NOT;
+            in.dst = rm;
+            break;
+        }
         in.op = TEST;
         in.dst = rm;
         in.src = imm_operand((int32_t)rd32(p));
         p += 4;
+        break;
+    }
+    case 0xf2:
+    case 0xf3: { // REP/REPNE, of which only SCASB is modelled
+        if (rd8(p++) != 0xae)
+            return false;
+        in.op = SCAS;
+        in.rep = b == 0xf2 ? 1 : 2;
         break;
     }
     case 0x81:
@@ -237,6 +298,53 @@ bool decode(uint32_t a, Ins &in) {
             in.src = imm_operand((int8_t)rd8(p));
             p += 1;
         }
+        break;
+    }
+    case 0x80: { // group 1, r/m8, imm8
+        Operand rm;
+        if (!(n = modrm(p, rm, reg)))
+            return false;
+        p += n;
+        in.op = kGroup1[reg];
+        if (in.op == NOP)
+            return false;
+        rm.size = 1;
+        in.dst = rm;
+        in.src = imm_operand(rd8(p), 1);
+        p += 1;
+        break;
+    }
+    case 0x84: { // TEST r/m8, r8
+        Operand rm;
+        if (!(n = modrm(p, rm, reg)))
+            return false;
+        p += n;
+        rm.size = 1;
+        in.op = TEST;
+        in.dst = rm;
+        in.src = reg_operand(reg, 1);
+        break;
+    }
+    case 0x88: { // MOV r/m8, r8
+        Operand rm;
+        if (!(n = modrm(p, rm, reg)))
+            return false;
+        p += n;
+        rm.size = 1;
+        in.op = MOV;
+        in.dst = rm;
+        in.src = reg_operand(reg, 1);
+        break;
+    }
+    case 0x8a: { // MOV r8, r/m8
+        Operand rm;
+        if (!(n = modrm(p, rm, reg)))
+            return false;
+        p += n;
+        rm.size = 1;
+        in.op = MOV;
+        in.dst = reg_operand(reg, 1);
+        in.src = rm;
         break;
     }
     case 0x8d: {
@@ -338,6 +446,14 @@ bool decode(uint32_t a, Ins &in) {
             in.cond = b2 & 15;
             in.target = p + 4 + rd32(p);
             p += 4;
+        } else if (b2 >= 0x90 && b2 <= 0x9f) {
+            Operand rm;
+            if (!(n = modrm(p, rm, reg)))
+                return false;
+            p += n;
+            in.op = SETCC;
+            in.cond = b2 & 15;
+            in.dst = rm;
         } else if (b2 == 0xaf) {
             Operand rm;
             if (!(n = modrm(p, rm, reg)))
@@ -488,26 +604,29 @@ uint32_t load_mem(const X86 *c, const Operand &o);
 // out-of-line path, which is the one with an address to form and check.
 inline uint32_t load(const X86 *c, const Operand &o) {
     if (__builtin_expect(o.kind == 1, 1))
-        return c->r[o.reg];
+        return o.size == 1 ? (c->r[o.reg] & 0xffu) : c->r[o.reg];
     if (o.kind == 3)
-        return (uint32_t)o.disp;
+        return o.size == 1 ? ((uint32_t)o.disp & 0xffu) : (uint32_t)o.disp;
     return load_mem(c, o);
 }
 
 uint32_t load_mem(const X86 *c, const Operand &o) {
     uint32_t a = address_of(c, o);
-    if (!readable(a, 4)) {
+    if (!readable(a, o.size)) {
         snprintf(g_error, sizeof g_error, "read of %08x outside guest memory", a);
         throw Fault{};
     }
-    return rd32(a);
+    return o.size == 1 ? rd8(a) : rd32(a);
 }
 
 void store_mem(X86 *c, const Operand &o, uint32_t v);
 
 inline void store(X86 *c, const Operand &o, uint32_t v) {
     if (__builtin_expect(o.kind == 1, 1)) {
-        c->r[o.reg] = v;
+        if (o.size == 1)
+            c->r[o.reg] = (c->r[o.reg] & 0xffffff00u) | (v & 0xffu);
+        else
+            c->r[o.reg] = v;
         return;
     }
     store_mem(c, o, v);
@@ -515,11 +634,14 @@ inline void store(X86 *c, const Operand &o, uint32_t v) {
 
 void store_mem(X86 *c, const Operand &o, uint32_t v) {
     uint32_t a = address_of(c, o);
-    if (!readable(a, 4)) {
+    if (!readable(a, o.size)) {
         snprintf(g_error, sizeof g_error, "write of %08x outside guest memory", a);
         throw Fault{};
     }
-    wr32(a, v);
+    if (o.size == 1)
+        wr8(a, (uint8_t)v);
+    else
+        wr32(a, v);
 }
 
 void push(X86 *c, uint32_t v) {
@@ -719,44 +841,54 @@ void run(X86 *c, const Routine &r) {
             break;
         // One case per operation: the shape is decided when the routine is
         // decoded, so running an instruction is one dispatch, not two.
+        // An 8-bit operand keeps only its low 8 bits in the result, so ZF is
+        // the ZF of the byte operation (the only flag a byte routine reads in
+        // practice; CF/OF/SF for 8-bit stay 32-bit-wide and are unused here).
         case ADD: {
-            uint32_t a = load(c, in.dst), b = load(c, in.src), res = a + b;
+            uint32_t m = in.dst.size == 1 ? 0xffu : 0xffffffffu;
+            uint32_t a = load(c, in.dst), b = load(c, in.src), res = (a + b) & m;
             f = Flags{ADD, a, b, res, 0, 0};
             store(c, in.dst, res);
             break;
         }
         case OR: {
-            uint32_t a = load(c, in.dst), b = load(c, in.src), res = a | b;
+            uint32_t m = in.dst.size == 1 ? 0xffu : 0xffffffffu;
+            uint32_t a = load(c, in.dst), b = load(c, in.src), res = (a | b) & m;
             f = Flags{OR, a, b, res, 0, 0};
             store(c, in.dst, res);
             break;
         }
         case AND: {
-            uint32_t a = load(c, in.dst), b = load(c, in.src), res = a & b;
+            uint32_t m = in.dst.size == 1 ? 0xffu : 0xffffffffu;
+            uint32_t a = load(c, in.dst), b = load(c, in.src), res = (a & b) & m;
             f = Flags{AND, a, b, res, 0, 0};
             store(c, in.dst, res);
             break;
         }
         case SUB: {
-            uint32_t a = load(c, in.dst), b = load(c, in.src), res = a - b;
+            uint32_t m = in.dst.size == 1 ? 0xffu : 0xffffffffu;
+            uint32_t a = load(c, in.dst), b = load(c, in.src), res = (a - b) & m;
             f = Flags{SUB, a, b, res, 0, 0};
             store(c, in.dst, res);
             break;
         }
         case XOR: {
-            uint32_t a = load(c, in.dst), b = load(c, in.src), res = a ^ b;
+            uint32_t m = in.dst.size == 1 ? 0xffu : 0xffffffffu;
+            uint32_t a = load(c, in.dst), b = load(c, in.src), res = (a ^ b) & m;
             f = Flags{XOR, a, b, res, 0, 0};
             store(c, in.dst, res);
             break;
         }
         case CMP: { // SUB without the store
+            uint32_t m = in.dst.size == 1 ? 0xffu : 0xffffffffu;
             uint32_t a = load(c, in.dst), b = load(c, in.src);
-            f = Flags{CMP, a, b, a - b, 0, 0};
+            f = Flags{CMP, a, b, (a - b) & m, 0, 0};
             break;
         }
         case TEST: { // AND without the store
+            uint32_t m = in.dst.size == 1 ? 0xffu : 0xffffffffu;
             uint32_t a = load(c, in.dst), b = load(c, in.src);
-            f = Flags{AND, a, b, a & b, 0, 0};
+            f = Flags{AND, a, b, (a & b) & m, 0, 0};
             break;
         }
         case IMUL: {
@@ -767,6 +899,47 @@ void run(X86 *c, const Routine &r) {
             uint8_t ovf = full != (int64_t)(int32_t)res;
             f = Flags{IMUL, (uint32_t)a, (uint32_t)b, res, ovf, ovf};
             store(c, in.dst, res);
+            break;
+        }
+        case SETCC: {
+            uint32_t v = condition(c, f, in.cond) ? 1u : 0u;
+            if (in.dst.kind == 1) {
+                c->r[in.dst.reg] = (c->r[in.dst.reg] & 0xffffff00u) | v;
+            } else {
+                uint32_t a = address_of(c, in.dst);
+                if (!readable(a, 1)) {
+                    snprintf(g_error, sizeof g_error, "write of %08x outside guest memory", a);
+                    throw Fault{};
+                }
+                wr8(a, (uint8_t)v);
+            }
+            break;
+        }
+        case NOT: // no flags, so any pending ones stay pending
+            store(c, in.dst, ~load(c, in.dst));
+            break;
+        case SCAS: {
+            // REPNE/REPE SCASB AL, ES:[EDI]: scan one byte at a time, CMP's
+            // flags each step. DF is assumed clear (forward), which is what
+            // every compiler's string helper does.
+            uint32_t al = (uint8_t)c->r[R_EAX];
+            uint32_t edi = c->r[R_EDI];
+            for (;;) {
+                if (!readable(edi, 1)) {
+                    snprintf(g_error, sizeof g_error, "scan of %08x outside guest memory", edi);
+                    throw Fault{};
+                }
+                uint32_t v = rd8(edi);
+                f = Flags{CMP, al, v, al - v, 0, 0};
+                edi += 1;
+                c->r[R_ECX] -= 1;
+                bool zf = (al - v) == 0;
+                if (in.rep == 2 ? !zf : zf)
+                    break; // REPE stops when ZF clears, REPNE when it sets
+                if (c->r[R_ECX] == 0)
+                    break;
+            }
+            c->r[R_EDI] = edi;
             break;
         }
         case INC:

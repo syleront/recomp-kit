@@ -329,12 +329,19 @@ bool acm_read_format(uint32_t p, AcmFormat &f) {
     f.samples = rd16(p + 16) >= 2 && gm_valid(p, 20) ? rd16(p + 18) : 0;
     return f.channels == 1 || f.channels == 2;
 }
+// What the Microsoft PCM converter on a stock Windows XP does, plus the two
+// ADPCM decodes this game's waves use. The PCM converter is a rate/bit-depth/
+// channel converter: any 8- or 16-bit PCM source at any rate and 1 or 2
+// channels converts to any 8- or 16-bit PCM destination. The ADPCM decoders
+// only decode to PCM at the source's own rate and channel count (the codec
+// table has no separate resampler), so those keep the tighter test.
 bool acm_supported(const AcmStream &s) {
-    if (s.dst.tag != 1 || (s.dst.bits != 8 && s.dst.bits != 16) || !s.dst.rate)
+    if (s.dst.tag != 1 || (s.dst.bits != 8 && s.dst.bits != 16) || !s.dst.rate ||
+        (s.dst.channels != 1 && s.dst.channels != 2))
         return false;
     if (s.src.tag == 1)
-        return s.src.channels == s.dst.channels && s.src.rate == s.dst.rate &&
-               s.src.bits == s.dst.bits;
+        return (s.src.bits == 8 || s.src.bits == 16) && s.src.rate &&
+               (s.src.channels == 1 || s.src.channels == 2);
     // Microsoft ADPCM (tag 2): mono only. The stereo block layout interleaves
     // the two channels' headers differently and no wave in this game uses it,
     // so refusing it (the caller's documented fallback) beats guessing.
@@ -391,15 +398,66 @@ int ms_nibble(int nibble, int predictor, int &samp1, int &samp2, int &delta) {
         delta = 16;
     return samp;
 }
+// A PCM sample as a signed 16-bit value: 8-bit PCM is unsigned centred on 128.
+int read_pcm_sample(const uint8_t *p, uint32_t bits) {
+    return bits == 8 ? (int(p[0]) - 128) << 8 : (int)(int16_t)(p[0] | (p[1] << 8));
+}
+void write_pcm_sample(uint8_t *p, uint32_t bits, int sample) {
+    sample = std::clamp(sample, -32768, 32767);
+    if (bits == 8) {
+        p[0] = (uint8_t)((sample >> 8) + 128);
+    } else {
+        p[0] = (uint8_t)(sample & 0xff);
+        p[1] = (uint8_t)((sample >> 8) & 0xff);
+    }
+}
 void acm_decode(const AcmStream &s, uint32_t src, uint32_t src_bytes, uint32_t dst,
                 uint32_t dst_bytes, uint32_t &src_used, uint32_t &dst_used) {
     src_used = dst_used = 0;
-    if (s.src.tag == 1) { // PCM: the same samples, byte for byte
-        uint32_t n = std::min(src_bytes, dst_bytes);
-        if (n)
-            memcpy(g_mem + dst, g_mem + src, n);
-        src_used = n;
-        dst_used = n;
+    if (s.src.tag == 1) {
+        // PCM to PCM. An identical format is the same samples byte for byte;
+        // anything else is what the Microsoft PCM converter does: 8/16-bit
+        // depth, 1/2 channels and any sample rate, linearly interpolated.
+        uint32_t sframe = (s.src.bits / 8) * s.src.channels;
+        uint32_t dframe = (s.dst.bits / 8) * s.dst.channels;
+        if (!sframe || !dframe)
+            return;
+        if (s.src.bits == s.dst.bits && s.src.channels == s.dst.channels &&
+            s.src.rate == s.dst.rate) {
+            uint32_t n = std::min(src_bytes, dst_bytes);
+            if (n)
+                memcpy(g_mem + dst, g_mem + src, n);
+            src_used = n;
+            dst_used = n;
+            return;
+        }
+        uint32_t in_frames = src_bytes / sframe; // complete source frames
+        std::vector<int16_t> samples((size_t)in_frames * s.src.channels);
+        for (uint32_t f = 0; f < in_frames; ++f)
+            for (uint32_t ch = 0; ch < s.src.channels; ++ch)
+                samples[(size_t)f * s.src.channels + ch] = (int16_t)read_pcm_sample(
+                    g_mem + src + f * sframe + ch * (s.src.bits / 8), s.src.bits);
+        uint32_t out_frames = s.dst.rate == s.src.rate || !s.src.rate
+                                  ? in_frames
+                                  : (uint32_t)((uint64_t)in_frames * s.dst.rate / s.src.rate);
+        out_frames = std::min(out_frames, dst_bytes / dframe);
+        for (uint32_t f = 0; f < out_frames; ++f) {
+            double at = (s.dst.rate == s.src.rate || !s.src.rate)
+                            ? double(f)
+                            : double(f) * s.src.rate / double(s.dst.rate);
+            uint32_t i0 = (uint32_t)at;
+            double frac = at - i0;
+            uint32_t i1 = i0 + 1 < in_frames ? i0 + 1 : i0;
+            for (uint32_t ch = 0; ch < s.dst.channels; ++ch) {
+                uint32_t sc = ch < s.src.channels ? ch : s.src.channels - 1;
+                double v = samples[(size_t)i0 * s.src.channels + sc] * (1.0 - frac) +
+                           samples[(size_t)i1 * s.src.channels + sc] * frac;
+                write_pcm_sample(g_mem + dst + f * dframe + ch * (s.dst.bits / 8), s.dst.bits,
+                                 (int)(v < 0 ? v - 0.5 : v + 0.5));
+            }
+        }
+        src_used = in_frames * sframe;
+        dst_used = out_frames * dframe;
         return;
     }
     if (s.src.tag == 2) { // MS ADPCM, mono: seven-byte header then nibbles
@@ -493,14 +551,49 @@ void acm_decode(const AcmStream &s, uint32_t src, uint32_t src_bytes, uint32_t d
 
 void acm_Metrics(X86 *c) {
     uint32_t metric = arg(c, 1), out = arg(c, 2);
-    uint32_t value = metric == 0x32   ? 20 // ACM_METRIC_MAX_SIZE_FORMAT: WAVEFORMATEX + cbSize
-                     : metric == 0x33 ? 8  // ACM_METRIC_MAX_SIZE_FILTER: WAVEFILTER base
-                                      : 0;
+    // The metrics a stock Windows XP with the Microsoft PCM converter and the
+    // two ADPCM codecs reports (acm.h). The game only asks for
+    // ACM_METRIC_MAX_SIZE_FORMAT, but a caller that enumerates asks these.
+    uint32_t value;
+    switch (metric) {
+    case 1:  // ACM_METRIC_COUNT_DRIVERS
+    case 20: // ACM_METRIC_COUNT_LOCAL_DRIVERS
+        value = 1;
+        break;
+    case 2:        // ACM_METRIC_COUNT_CODECS
+    case 21:       // ACM_METRIC_COUNT_LOCAL_CODECS
+        value = 3; // PCM converter, IMA ADPCM, Microsoft ADPCM
+        break;
+    case 3:  // ACM_METRIC_COUNT_CONVERTERS
+    case 22: // ACM_METRIC_COUNT_LOCAL_CONVERTERS
+        value = 4;
+        break;
+    case 4:   // ACM_METRIC_COUNT_FILTERS
+    case 5:   // ACM_METRIC_COUNT_DISABLED
+    case 6:   // ACM_METRIC_COUNT_HARDWARE
+    case 23:  // ACM_METRIC_COUNT_LOCAL_FILTERS
+    case 24:  // ACM_METRIC_COUNT_LOCAL_DISABLED
+    case 100: // ACM_METRIC_DRIVER_SUPPORT
+    case 101: // ACM_METRIC_DRIVER_PRIORITY
+        value = 0;
+        break;
+    case 30:                 // ACM_METRIC_HARDWARE_WAVE_INPUT
+    case 31:                 // ACM_METRIC_HARDWARE_WAVE_OUTPUT
+        value = 0xffffffffu; // WAVE_MAPPER: no hardware wave device
+        break;
+    case 50: // ACM_METRIC_MAX_SIZE_FORMAT
+        value = 20;
+        break;
+    case 51: // ACM_METRIC_MAX_SIZE_FILTER
+        value = 8;
+        break;
+    default:
+        set_eax(c, 8); // 8 = MMSYSERR_NOTSUPPORTED
+        return;
+    }
     if (out && gm_valid(out, 4))
         wr32(out, value);
-    // Every metric the game asks for (0x32) is answered; anything else is a
-    // codec-enumeration query this one-codec implementation does not serve.
-    set_eax(c, metric == 0x32 || metric == 0x33 ? 0u : 8u); // 8 = MMSYSERR_NOTSUPPORTED
+    set_eax(c, 0);
 }
 void acm_FormatSuggest(X86 *c) {
     uint32_t src = arg(c, 1), dst = arg(c, 2), cb = arg(c, 3);
@@ -512,6 +605,8 @@ void acm_FormatSuggest(X86 *c) {
     }
     if (df.tag == 0)
         df.tag = 1;
+    if (!df.rate)
+        df.rate = sf.rate; // an unset rate adopts the source's, as ACM does
     if (!df.channels)
         df.channels = 1;
     if (!df.bits)
@@ -527,6 +622,7 @@ void acm_FormatSuggest(X86 *c) {
     }
     wr16(dst, (uint16_t)df.tag);
     wr16(dst + 2, (uint16_t)df.channels);
+    wr32(dst + 4, df.rate);
     wr16(dst + 12, (uint16_t)df.align);
     wr16(dst + 14, (uint16_t)df.bits);
     set_eax(c, 0);
@@ -559,7 +655,27 @@ void acm_StreamSize(X86 *c) {
     }
     const AcmStream &s = it->second;
     uint32_t result = cb;
-    if (s.src.tag == 0x11 || s.src.tag == 2) {
+    if (s.src.tag == 1) {
+        // PCM: frames of (bits/8 * channels) bytes, re-rated by the ratio.
+        uint32_t sframe = (s.src.bits / 8) * s.src.channels;
+        uint32_t dframe = (s.dst.bits / 8) * s.dst.channels;
+        if (sframe && dframe) {
+            if (mode == 1) { // ACM_STREAMSIZEF_DESTINATION
+                uint32_t d = cb / dframe;
+                uint32_t sf =
+                    (s.dst.rate && s.src.rate && s.dst.rate != s.src.rate)
+                        ? (uint32_t)(((uint64_t)d * s.src.rate + s.dst.rate - 1) / s.dst.rate)
+                        : d;
+                result = sf * sframe;
+            } else { // ACM_STREAMSIZEF_SOURCE
+                uint32_t sf = cb / sframe;
+                uint32_t d = (s.dst.rate && s.src.rate && s.dst.rate != s.src.rate)
+                                 ? (uint32_t)((uint64_t)sf * s.dst.rate / s.src.rate)
+                                 : sf;
+                result = d * dframe;
+            }
+        }
+    } else if (s.src.tag == 0x11 || s.src.tag == 2) {
         uint32_t bytes_per_sample = s.dst.bits / 8;
         uint32_t block_out = acm_samples_per_block(s.src) * s.dst.channels * bytes_per_sample;
         if (mode == 1) { // ACM_STREAMSIZEF_DESTINATION

@@ -1200,7 +1200,31 @@ void u_PostQuitMessage(X86 *c) {
 // Paint / DC / cursor / input
 // ---------------------------------------------------------------------------
 void u_GetDC(X86 *c) {
-    set_eax(c, gdi_window_dc(arg(c, 0)));
+    uint32_t hwnd = arg(c, 0);
+    uint32_t hdc = gdi_window_dc(hwnd);
+    // A dialog control's DC carries the background colour its parent chose for
+    // it (WM_CTLCOLORSTATIC), so a STATIC that draws its caption directly into
+    // a GetDC (Petz 5's warning procedure does) fills with the dialog face
+    // instead of the default white. A dialog procedure that leaves the message
+    // unhandled gets DefDlgProc's face brush, as paint_control's fallback does.
+    if (hdc) {
+        if (Window *w = find_window(hwnd); w && w->parent && w->cls == "static") {
+            uint32_t brush =
+                host_dispatch_to_wndproc(c, w->parent, 0x0138 /* WM_CTLCOLORSTATIC */, hdc, hwnd);
+            uint32_t pixel;
+            bool have = brush && gdi::brush_color(brush, &pixel);
+            if (!have) {
+                if (Window *pw = find_window(w->parent); pw && pw->cls == "#32770") {
+                    pixel = gdi::argb(0x00c8d0d4); // COLOR_BTNFACE, RGB(0xD4,0xD0,0xC8)
+                    have = true;
+                }
+            }
+            if (have)
+                if (auto *dc = gdi::dc_of(hdc))
+                    dc->bk_color = pixel;
+        }
+    }
+    set_eax(c, hdc);
 }
 void u_ReleaseDC(X86 *c) {
     set_eax(c, gdi_release_window_dc(arg(c, 0), arg(c, 1)));
@@ -2008,7 +2032,7 @@ void u_DrawStateA(X86 *c) {
         dc->bk_mode = 1; // TRANSPARENT: keep the already-painted item cell
         gdi::draw_text(hdc, block + 16, units, block, 0x20 /*DT_SINGLELINE*/);
     };
-    if (flags & 0x20u) { // DSS_DISABLED
+    if (flags & 0x20u) {             // DSS_DISABLED
         dc->text_color = 0x00ffffff; // COLOR_3DHILIGHT
         draw_at(1, 1);
         dc->text_color = 0x00808080; // COLOR_3DSHADOW
@@ -2182,6 +2206,24 @@ void u_EndDialog(X86 *c) {
     else
         destroy_window(c, hwnd); // a modeless caller destroys its own
     set_eax(c, 1);
+}
+
+// The close box's rule, which Windows puts in DefDlgProc: the click becomes
+// WM_COMMAND IDCANCEL, and a dialog procedure that does not end the dialog
+// (Petz 5's warning procedure answers IDCANCEL with 0, so EndDialog is never
+// reached) gets a WM_CLOSE next, which is what ends it. Only a #32770 dialog
+// has a close box in this runtime, so both steps are a dialog's.
+bool close_box_request(X86 *c, uint32_t hwnd) {
+    if (!find_window(hwnd))
+        return false;
+    host_dispatch_to_wndproc(c, hwnd, 0x0111 /* WM_COMMAND */, 2 /* IDCANCEL */, hwnd);
+    if (!find_window(hwnd))
+        return true;
+    auto it = dialog_running.find(hwnd);
+    if (it != dialog_running.end() && !it->second)
+        return true; // the procedure ended the dialog on its own
+    host_dispatch_to_wndproc(c, hwnd, 0x0010 /* WM_CLOSE */, 0, 0);
+    return true;
 }
 
 // One row height, asked of the parent with WM_MEASUREITEM. An owner-draw box

@@ -137,6 +137,11 @@ void ensure_system_classes();
 // engine's control_proc.
 void paint_control(X86 *c, uint32_t hwnd, uint32_t into);
 } // namespace user32
+
+// The close box's rule (DefDlgProc): WM_COMMAND IDCANCEL, then WM_CLOSE when
+// the dialog procedure does not end the dialog. A global so the input layer
+// reaches it without the dialog engine's maps.
+bool close_box_request(X86 *c, uint32_t hwnd);
 // Registers the dialog control classes ("button", "edit", "listbox", ...) on
 // first use. The message loop calls it before a dialog is created; a direct
 // CreateWindowExA of a control class has to as well.

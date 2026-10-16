@@ -176,8 +176,7 @@ void pump_mouse_input(X86 *c) {
                     const int32_t y0 = -fw->nc_top + 2;
                     if (fw->nc_caption && (fw->style & 0x00080000u) && cxp >= x1 - box &&
                         cxp < x1 && cyp >= y0 && cyp < y0 + box) {
-                        host_dispatch_to_wndproc(c, hwnd, 0x0111 /* WM_COMMAND */, 2 /* IDCANCEL */,
-                                                 hwnd);
+                        ::close_box_request(c, hwnd); // IDCANCEL, then WM_CLOSE if unanswered
                         return;
                     }
                 }

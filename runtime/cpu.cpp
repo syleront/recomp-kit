@@ -242,6 +242,11 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
     // dereference this page exists to refuse.
     if (target >= GUEST_NULL_LIMIT && interp_call(c, target))
         return;
+    if (const char *why = interp_last_error(); why && *why) {
+        char key[64];
+        snprintf(key, sizeof key, "interp-failed:%08x", target);
+        log_once(key, "interp: routine %08x was not decoded (%s)", target, why);
+    }
     if (target == GUEST_RETURN_SENTINEL) {
         recomp_callback_return(c);
         // With no matching live callback this is an ordinary undeliverable

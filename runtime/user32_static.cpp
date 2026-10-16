@@ -71,7 +71,24 @@ void paint_control(X86 *c, uint32_t hwnd, uint32_t into) {
     uint32_t brush =
         parent ? host_dispatch_to_wndproc(c, parent, 0x0138 /* WM_CTLCOLORSTATIC */, hdc, hwnd) : 0;
     uint32_t pixel;
-    if (brush && gdi::brush_color(brush, &pixel))
+    bool have_pixel = brush && gdi::brush_color(brush, &pixel);
+    if (!have_pixel) {
+        // Windows' DefDlgProc answers WM_CTLCOLORSTATIC with the dialog's own
+        // background brush. A game's dialog procedure can leave it unhandled
+        // (Petz 5's warning procedure answers 0), and the caption must still
+        // sit on the dialog face: without this the control's opaque surface
+        // shows through as white behind the text.
+        if (Window *pw = find_window(parent); pw && pw->cls == "#32770") {
+            uint32_t dlg_brush =
+                host_dispatch_to_wndproc(c, parent, 0x0131 /* WM_CTLCOLORDLG */, hdc, parent);
+            have_pixel = dlg_brush && gdi::brush_color(dlg_brush, &pixel);
+            if (!have_pixel) {
+                pixel = gdi::argb(0x00c8d0d4); // COLOR_BTNFACE, RGB(0xD4,0xD0,0xC8)
+                have_pixel = true;
+            }
+        }
+    }
+    if (have_pixel)
         gdi::fill(hdc, {0, 0, width, height}, pixel);
     uint32_t units = text.empty() ? 0 : wide_units(text);
     if (flags && units && units < (UINT32_MAX - 32) / 2) {
