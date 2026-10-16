@@ -201,11 +201,16 @@ uint32_t host_dispatch_to_wndproc(X86 *c, uint32_t hwnd, uint32_t msg, uint32_t 
     return guest_call(c, proc, hwnd, msg, wparam, lparam);
 }
 
+// Defined with the rest of the dialog engine below (global scope); the dialog
+// entry points inside namespace user32 need it before that.
+uint32_t dlg_item(uint32_t parent, uint32_t id);
+
 namespace user32 {
 
 // ---------------------------------------------------------------------------
 // Classes and windows
 // ---------------------------------------------------------------------------
+
 // WNDCLASSA and WNDCLASSEXA hold the same fields in the same order; the Ex
 // form puts cbSize in front of them and hIconSm behind, so one reader with a
 // field offset serves both. `shift` is 4 for the Ex form.
@@ -757,7 +762,12 @@ void u_SetWindowTextA(X86 *c) {
 }
 
 void u_SetDlgItemTextA(X86 *c) {
-    set_eax(c, 1);
+    uint32_t child = dlg_item(arg(c, 0), arg(c, 1));
+    if (!child) {
+        set_eax(c, 0);
+        return;
+    }
+    set_eax(c, deliver_message(c, child, 0x000c /* WM_SETTEXT */, 0, arg(c, 2), false));
 }
 
 // ---------------------------------------------------------------------------
@@ -1998,6 +2008,16 @@ void control_proc(X86 *c) {
     uint32_t hwnd = arg(c, 0), msg = arg(c, 1);
     Window *w = find_window(hwnd);
     switch (msg) {
+    case 0x000f: // WM_PAINT
+    case 0x0318: // WM_PRINTCLIENT
+        paint_control(c, hwnd, arg(c, 2));
+        set_eax(c, 0);
+        return;
+    case 0x000c: // WM_SETTEXT: the new caption has to be drawn
+        def_window_proc(c, w && w->unicode);
+        if (Window *after = find_window(hwnd))
+            after->update_pending = true;
+        return;
     case 0x00f1: // BM_SETCHECK
         if (w)
             w->userdata = arg(c, 2);
@@ -2009,6 +2029,21 @@ void control_proc(X86 *c) {
     case 0x00f2: // BM_GETSTATE
         set_eax(c, 0);
         return;
+    case 0x0201: // WM_LBUTTONDOWN: remember the press so the click is a pair
+        if (w)
+            w->userdata |= 1u;
+        set_eax(c, 0);
+        return;
+    case 0x0202: { // WM_LBUTTONUP: a completed click reports WM_COMMAND
+        uint32_t parent = w ? w->parent : 0, id = w ? w->id : 0;
+        if (w)
+            w->userdata &= ~1u;
+        if (parent)
+            host_dispatch_to_wndproc(c, parent, 0x0111 /* WM_COMMAND */,
+                                     (1u /* BN_CLICKED */ << 16) | (id & 0xffffu), hwnd);
+        set_eax(c, 0);
+        return;
+    }
     default:
         def_window_proc(c, w && w->unicode);
     }
@@ -2210,20 +2245,27 @@ uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it) {
     g_next_hwnd += 4;
     Window w;
     w.hwnd = hwnd;
-    w.wndproc = control_proc_addr();
+    // The control's class owns its window procedure, exactly as on Windows:
+    // STATIC paints its caption, the others answer the button/text messages.
+    // The template names the class, so the engine looks it up rather than
+    // forcing one procedure on every control.
+    w.cls = dlg_control_class(it);
+    auto cls = classes().find(w.cls);
+    w.wndproc = cls != classes().end() && cls->second.wndproc ? cls->second.wndproc
+                                                              : control_proc_addr();
     w.style = it.style;
     w.exstyle = it.exstyle;
     w.x = it.x;
     w.y = it.y;
     w.w = it.cx;
     w.h = it.cy;
-    w.cls = dlg_control_class(it);
     w.title_utf8 = it.text;
     w.parent = parent;
     w.id = it.id;
     w.thread = guest_current_thread_id();
     w.visible = true;
     w.shown = true;
+    w.update_pending = true; // a new control has to be painted
     windows()[hwnd] = w;
     window_created(hwnd);
     return hwnd;
@@ -2272,6 +2314,7 @@ void u_DialogBoxParamA(X86 *c) {
     std::string why;
     uint32_t entry = resource_find_in(hinst, 5 /* RT_DIALOG */, name, true, &why);
     uint32_t size = 0, p = entry ? resource_data(entry, &size, &why) : 0;
+    LOGV("DialogBoxParamA: hinst=%08x name=%u entry=%08x size=%u", hinst, name, entry, size);
     DlgTemplate t;
     if (!p || !parse_dlg_template(p, size, &t)) {
         log_once("DialogBoxParamA-template",

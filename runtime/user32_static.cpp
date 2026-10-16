@@ -45,7 +45,11 @@ uint32_t text_flags(uint32_t style) {
 // of the window. A program that double-buffers its controls - the VCL does -
 // paints them into a memory DC this way and copies it over the window after,
 // so painting the window directly would be covered by that copy.
-void paint(X86 *c, uint32_t hwnd, uint32_t into) {
+} // namespace
+
+// Shared with the dialog engine's control_proc, so a dialog control the engine
+// created paints its caption the same way the STATIC class does.
+void paint_control(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
     if (!w)
         return;
@@ -85,6 +89,7 @@ void paint(X86 *c, uint32_t hwnd, uint32_t into) {
         caller->font = caller_font;
 }
 
+namespace {
 void static_proc(X86 *c) {
     uint32_t hwnd = arg(c, 0), msg = arg(c, 1);
     Window *w = find_window(hwnd);
@@ -96,7 +101,7 @@ void static_proc(X86 *c) {
         return;
     case 0x000f: // WM_PAINT
     case 0x0318: // WM_PRINTCLIENT
-        paint(c, hwnd, arg(c, 2));
+        paint_control(c, hwnd, arg(c, 2));
         set_eax(c, 0);
         return;
     case 0x0030: // WM_SETFONT

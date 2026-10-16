@@ -94,6 +94,10 @@ void display_rect(uint32_t out);
 void alias_ansi(X86 *c, const char *name);
 // Registers the system control classes (STATIC) on first use.
 void ensure_system_classes();
+// Paints a control's caption the way the STATIC class does (fill from the
+// parent's WM_CTLCOLORSTATIC brush, then the text). Shared with the dialog
+// engine's control_proc.
+void paint_control(X86 *c, uint32_t hwnd, uint32_t into);
 } // namespace user32
 void user32_wide_register();
 
