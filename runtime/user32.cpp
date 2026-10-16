@@ -2266,8 +2266,8 @@ uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it) {
     // forcing one procedure on every control.
     w.cls = dlg_control_class(it);
     auto cls = classes().find(w.cls);
-    w.wndproc = cls != classes().end() && cls->second.wndproc ? cls->second.wndproc
-                                                              : control_proc_addr();
+    w.wndproc =
+        cls != classes().end() && cls->second.wndproc ? cls->second.wndproc : control_proc_addr();
     w.style = it.style;
     w.exstyle = it.exstyle;
     w.x = it.x;
@@ -2289,7 +2289,8 @@ uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it) {
 // modal (DialogBoxParamA) and modeless (CreateDialogParamA) entry points. A
 // template without WS_VISIBLE is created hidden, exactly as Windows does, so
 // the caller's ShowWindow is what makes it appear and invalidates it.
-uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc, const DlgTemplate &t) {
+uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
+                              const DlgTemplate &t) {
     ensure_dialog_classes();
     uint32_t hwnd = g_next_hwnd;
     g_next_hwnd += 4;
