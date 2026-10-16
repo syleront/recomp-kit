@@ -2341,6 +2341,45 @@ static void test_listbox_ownerdraw_hit(X86 *c) {
     call_import(c, "USER32.dll", "DestroyWindow", {parent});
 }
 
+// A dialog template stores its rectangle and every control in dialog units.
+// Windows scales a unit with the DS_SETFONT face: a quarter of the font's
+// average character width across, an eighth of its cell height down. A template
+// laid out with raw DLUs as pixels is exactly why the More Scenes list only
+// showed six of its seven rows.
+static void test_dialog_dlu_mapping(X86 *c) {
+    section("USER32 dialog unit mapping");
+    (void)c;
+    // The classic Windows base units for MS Sans Serif 8 pt are 6x13; the map
+    // is MulDiv (round half away from zero).
+    check(user32::dialog_map_unit(199, 6, 4) == 299, "199 DLU across at 6 px/4 is 299 px");
+    check(user32::dialog_map_unit(222, 13, 8) == 361, "222 DLU down at 13 px/8 is 361 px");
+    check(user32::dialog_map_unit(181, 13, 8) == 294, "181 DLU down at 13 px/8 is 294 px");
+    check(user32::dialog_map_unit(5, 6, 4) == 8, "5 DLU across at 6 px/4 rounds to 8 px");
+
+    // With DS_SETFONT the base units are the measured font's, not the 8x16
+    // bitmap cell: the substituted face the runtime draws the dialog with.
+    user32::DlgBaseUnit sans = user32::dialog_base_units("MS Sans Serif", 8, 400);
+    check(sans.x >= 5 && sans.x <= 8 && sans.y >= 12 && sans.y <= 17,
+          "MS Sans Serif 8 pt base units are a font metric (%d x %d)", sans.x, sans.y);
+    check(!(sans.x == 8 && sans.y == 16),
+          "a DS_SETFONT face is not laid out with the 8x16 bitmap cell");
+
+    // The More Scenes template (id 215): dialog 199x222 DLU, listbox 187x181 DLU
+    // at (5,8), OK/Cancel 50x14 DLU at y=201. The 181 DLU listbox must hold the
+    // game's seven 29 px owner-draw rows, which a raw-DLU rectangle (181 px) did
+    // not.
+    int32_t lb_h = user32::dialog_map_unit(181, sans.y, 8);
+    check(lb_h >= 7 * 29, "the mapped listbox fits seven 29 px rows (%d px)", lb_h);
+    check(user32::dialog_map_unit(199, sans.x, 4) > 199,
+          "the mapped dialog is wider than its raw DLU width");
+
+    // A face the runtime cannot measure, and a fontless template, keep 8x16.
+    user32::DlgBaseUnit raster = user32::dialog_base_units("System", 8, 400);
+    check(raster.x == 8 && raster.y == 16, "a raster face falls back to the 8x16 cell");
+    user32::DlgBaseUnit none = user32::dialog_base_units("", 0, 0);
+    check(none.x == 8 && none.y == 16, "a fontless template uses the 8x16 cell");
+}
+
 static void test_windows(X86 *c) {
     section("USER32 windows and messages");
     // The window procedure is a stand-in the test-only recomp_call can reach;
@@ -7017,6 +7056,7 @@ int main(int argc, char **argv) {
     test_windows(c);
     test_synchronous_geometry(c);
     test_listbox_ownerdraw_hit(c);
+    test_dialog_dlu_mapping(c);
     test_guest_thunks(c);
     test_callbacks(c);
     test_scheduling(c);
