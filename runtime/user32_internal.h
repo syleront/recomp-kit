@@ -107,6 +107,12 @@ void pump_window_timers();
 // Whether some visible window has an update region a paint would answer.
 bool paint_pending();
 void window_created(uint32_t hwnd);
+// The next free window handle. Exposed so a runtime-owned window (the popup
+// menu) is allocated from the same sequence as every other one.
+uint32_t alloc_window_handle();
+// The first visible window with an update region, in paint order (the modal
+// pump's paint synthesis asks for it).
+Window *first_paint_window();
 // Give the keyboard focus to a window (the dialog engine's first tab stop).
 void set_focus_window(uint32_t hwnd);
 // The window that currently has the keyboard focus (GetFocus's answer), so a
@@ -127,9 +133,6 @@ void reorder_window(uint32_t hwnd, uint32_t after);
 void pump_mouse_input(X86 *c);
 void forget_window_services(uint32_t hwnd);
 bool destroy_window(X86 *c, uint32_t hwnd);
-// Ask every visible window to repaint: what a hidden or destroyed window
-// covered has to be drawn again (there is no damage region here).
-void repaint_exposed_windows();
 void client_origin(uint32_t hwnd, int32_t *x, int32_t *y);
 // A window's OUTER (frame) origin: like client_origin but without the
 // non-client insets. Equal to client_origin on every window without a frame.

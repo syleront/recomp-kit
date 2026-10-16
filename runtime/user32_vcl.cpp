@@ -219,17 +219,6 @@ void pump_window_timers() {
         t.due = now + t.interval;
     }
 }
-// Windows repaints whatever a hidden or destroyed window was covering. There is
-// no damage region here - a window paints whole - so every other visible window
-// is asked to repaint. Without this a popup menu that closes while nothing else
-// invalidates keeps its pixels in the host's last presented frame: the compact
-// menus the game draws (Go To, Pick A Pet, Family Tree) close over an idle
-// dialog, and the frame is only recomposed when some window is dirty.
-void repaint_exposed_windows() {
-    for (auto &kv : windows())
-        if (kv.second.visible)
-            kv.second.update_pending = true;
-}
 // Snapshot children before callbacks: WM_DESTROY/WM_NCDESTROY can recursively
 // destroy another window, change parentage or create a new window.
 bool destroy_window(X86 *c, uint32_t hwnd) {
@@ -266,7 +255,6 @@ bool destroy_window(X86 *c, uint32_t hwnd) {
     if (g_main_hwnd == hwnd)
         g_main_hwnd = windows().empty() ? 0 : windows().begin()->first;
     destroying.erase(hwnd);
-    repaint_exposed_windows();
     return true;
 }
 void client_origin(uint32_t hwnd, int32_t *x, int32_t *y) {
@@ -499,14 +487,7 @@ void enable_window(X86 *c) {
     Window *w = find_window(arg(c, 0));
     bool disabled = w && !w->enabled;
     if (w) {
-        bool enable = arg(c, 1) != 0;
-        // Windows repaints the window when the enabled state changes: the
-        // greyed caption or bevel of a disabled control has to appear (and go
-        // away again), which is a visible state a program sets without ever
-        // calling InvalidateRect.
-        if (enable != w->enabled)
-            w->update_pending = true;
-        w->enabled = enable;
+        w->enabled = arg(c, 1) != 0;
         if (w->enabled)
             w->style &= ~0x08000000u;
         else
@@ -1715,30 +1696,505 @@ void insert_menu_info_w(X86 *c) {
 void insert_menu_info_a(X86 *c) {
     insert_menu_info(c, true);
 }
-// A game may own its popup menus: it calls the native TrackPopupMenu but draws
-// and drives the menu with its own window class (Petz 5's WinMenu). The runtime
-// has no owner-draw menu engine, so when game.toml names the game's menu routine
-// the call is handed to it - the same routine the game's own custom-menu path
-// already calls, so its message loop drives the popup exactly as for that path.
-// The menu owner is the `this` pointer (a guest global), passed in ECX.
-void track_popup_menu(X86 *c) {
-#if defined(RECOMP_HOOK_MENU_TRACK_POPUP) && defined(RECOMP_HOOK_MENU_OWNER)
-    uint32_t owner = RECOMP_HOOK_MENU_OWNER ? rd32(RECOMP_HOOK_MENU_OWNER) : 0;
-    if (!owner) {
-        zero(c);
+// ---------------------------------------------------------------------------
+// The system popup menu (TrackPopupMenu).
+//
+// On Windows this is a system service: it measures and draws ordinary items
+// itself - the text, the accelerator after a tab, separators, the check mark,
+// the greyed disabled state, the item bitmap and a submenu arrow - and asks the
+// owner window (WM_MEASUREITEM / WM_DRAWITEM) only for MFT_OWNERDRAW items.
+//
+// Petz 5 has two menu paths, and only one of them is the game's own WinMenu:
+// FUN_00405b70 shows a menu through WinMenu::PFTrackPopupMenu (0x407cc0) when
+// ShlGlobals+0x50c is set and ShlGlobals+0x274 is not 5, and through the
+// *imported* TrackPopupMenu otherwise; the Petz Profile's Family Tree button
+// (0x415370) calls the import directly. WinMenu's own measure routine
+// (WinMenu::DoWMMeasureItem, 0x406b00) has size rules only for the game's own
+// menu id ranges (adopted pets 0xbb8..0xf9f, scenes 0x2af8..0x36af, the
+// separator 0x2afc, 0x64..0x71); the family-tree menu FUN_00413000 builds is a
+// plain MF_STRING menu whose ids are 28000+ (0x6d60+), so WinMenu measured every
+// item 0x0 and moved its popup to 0x0: the menu was created and never visible.
+// Forwarding the import to WinMenu was the port's shortcut; this is the runtime
+// running the menu the way Windows does, so a menu the game did not design for
+// WinMenu appears with its own items.
+struct PopupMenu {
+    uint32_t hwnd = 0, owner = 0, menu = 0, font = 0;
+    std::vector<gdi::Rect> rects;
+    int32_t width = 0, height = 0, item_height = 0, check_width = 0;
+    int hot = -1, result = 0;
+    bool done = false, return_command = false, any_check = false, any_submenu = false;
+};
+PopupMenu g_popup;
+// The menu font: Windows' menu face is the same proportional interface face as
+// DEFAULT_GUI_FONT, at the same 8 pt.
+uint32_t menu_font() {
+    if (!g_popup.font)
+        g_popup.font = gdi::make_object(gdi::dialog_font_object("MS Shell Dlg", 8, 400));
+    return g_popup.font;
+}
+// The width and height of one item's text, measured with the menu font through
+// the same DT_CALCRECT path the game's own measure uses. A '\t' starts the
+// accelerator column, which is not part of the left-aligned text.
+void menu_text_extent(uint32_t hdc, const std::string &text, int32_t *w, int32_t *h) {
+    *w = 0;
+    *h = 0;
+    std::string t = text;
+    size_t tab = t.find('\t');
+    if (tab != std::string::npos)
+        t = t.substr(0, tab);
+    uint32_t units = t.empty() ? 0 : wide_units(t);
+    if (!units || units > (UINT32_MAX - 32) / 2)
+        return;
+    uint32_t block = heap_alloc(16 + 2 * (units + 1), true);
+    if (!block)
+        return;
+    for (int i = 0; i < 4; ++i)
+        wr32(block + 4 * i, 0);
+    gm_put_wstr(block + 16, t, units + 1);
+    gdi::draw_text(hdc, block + 16, units, block,
+                   0x400 /*DT_CALCRECT*/ | 0x20 /*DT_SINGLELINE*/ | 0x800 /*DT_NOPREFIX*/);
+    *w = int32_t(rd32(block + 8));
+    *h = int32_t(rd32(block + 12));
+    heap_free(block);
+}
+// An item is a separator, owner-draw, or an ordinary text item.
+bool menu_item_separator(const MenuItem &m) {
+    return (m.type & 0x800u) != 0; // MFT_SEPARATOR
+}
+bool menu_item_ownerdraw(const MenuItem &m) {
+    return (m.type & 0x100u) != 0; // MFT_OWNERDRAW
+}
+bool menu_item_disabled(const MenuItem &m) {
+    return (m.state & 3u) != 0; // MFS_GRAYED | MFS_DISABLED
+}
+// One owner-draw item's size, from the owner's WM_MEASUREITEM (Windows sends it
+// only for MFT_OWNERDRAW items). A zero answer keeps the runtime's own default.
+void menu_measure_ownerdraw(X86 *c, size_t i, int32_t *w, int32_t *h) {
+    uint32_t ms = heap_alloc(0x20, true);
+    if (!ms)
+        return;
+    wr32(ms + 0x00, 1); // ODT_MENU
+    wr32(ms + 0x04, g_popup.menu);
+    wr32(ms + 0x08, uint32_t(i)); // itemID is the POSITION for a menu
+    wr32(ms + 0x0c, 0);
+    wr32(ms + 0x10, 0);
+    const MenuItem &item = menus[g_popup.menu].items[i];
+    wr32(ms + 0x14, item.data);
+    host_dispatch_to_wndproc(c, g_popup.owner, 0x002c /* WM_MEASUREITEM */, uint32_t(i), ms);
+    if (int32_t mw = int32_t(rd32(ms + 0x0c)))
+        *w = mw;
+    if (int32_t mh = int32_t(rd32(ms + 0x10)))
+        *h = mh;
+    heap_free(ms);
+}
+// Lay the menu out: one client rect per item, the widest text plus the check
+// column on the left and the submenu arrow on the right. Separators are thin.
+void menu_layout(X86 *c) {
+    PopupMenu &m = g_popup;
+    auto it = menus.find(m.menu);
+    if (it == menus.end())
+        return;
+    const std::vector<MenuItem> &items = it->second.items;
+    m.rects.assign(items.size(), gdi::Rect{});
+    uint32_t hdc = gdi_window_dc(m.hwnd);
+    if (auto *dc = gdi::dc_of(hdc)) {
+        dc->font = menu_font();
+        dc->bk_mode = 1; // TRANSPARENT
+    }
+    int32_t text_w = 0, text_h = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const MenuItem &item = items[i];
+        if (menu_item_separator(item))
+            continue;
+        int32_t w = 0, h = 0;
+        if (menu_item_ownerdraw(item))
+            menu_measure_ownerdraw(c, i, &w, &h);
+        if (!w) {
+            menu_text_extent(hdc, item.text, &w, &h);
+            size_t tab = item.text.find('\t');
+            if (tab != std::string::npos) {
+                int32_t aw = 0, ah = 0;
+                menu_text_extent(hdc, item.text.substr(tab + 1), &aw, &ah);
+                w += aw + 12; // the accelerator column sits to the right
+            }
+        }
+        text_w = std::max(text_w, w);
+        text_h = std::max(text_h, h);
+        if (item.state & 8u) // MFS_CHECKED
+            m.any_check = true;
+        if (item.bitmap)
+            m.any_check = true;
+        if (item.submenu)
+            m.any_submenu = true;
+    }
+    gdi_release_window_dc(m.hwnd, hdc);
+    if (text_h <= 0)
+        text_h = 16;
+    m.item_height = text_h + 6;
+    m.check_width = m.any_check ? 16 : 4;
+    const int32_t arrow = m.any_submenu ? 14 : 0;
+    m.width = m.check_width + text_w + 8 + arrow;
+    if (m.width < 40)
+        m.width = 40;
+    int32_t y = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const int32_t h =
+            menu_item_separator(items[i]) ? std::max<int32_t>(3, text_h / 2) : m.item_height;
+        m.rects[i] = {0, y, m.width, y + h};
+        y += h;
+    }
+    m.height = y + 2; // the 1 px frame top and bottom
+}
+// The item under a client point, or -1. Separators are never hot.
+int menu_hit(const PopupMenu &m, int32_t x, int32_t y) {
+    auto it = menus.find(m.menu);
+    if (it == menus.end())
+        return -1;
+    for (size_t i = 0; i < m.rects.size(); ++i) {
+        const gdi::Rect &r = m.rects[i];
+        if (x >= r.l && x < r.r && y >= r.t && y < r.b)
+            return menu_item_separator(it->second.items[i]) ? -1 : int(i);
+    }
+    return -1;
+}
+// A 1 px raised frame, the menu face inside, and each item: the hot one on the
+// highlight colour, its check mark, its text, its accelerator column and a
+// submenu arrow. An owner-draw item is the owner's to draw (WM_DRAWITEM), with
+// the runtime's text as the fallback when the owner does not.
+void menu_paint(X86 *c, uint32_t hwnd) {
+    PopupMenu &m = g_popup;
+    auto it = menus.find(m.menu);
+    if (it == menus.end())
+        return;
+    const std::vector<MenuItem> &items = it->second.items;
+    uint32_t hdc = gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        gdi_release_window_dc(hwnd, hdc);
         return;
     }
-    uint32_t args[7];
-    for (int i = 0; i < 7; ++i)
-        args[i] = arg(c, i);
-    uint32_t saved_ecx = c->r[1];
-    c->r[1] = owner;
-    uint32_t result = guest_call(c, RECOMP_HOOK_MENU_TRACK_POPUP, args, 7);
-    c->r[1] = saved_ecx;
-    set_eax(c, result);
-#else
-    zero(c);
+    const Window *w = find_window(hwnd);
+    const int32_t width = w ? w->w : m.width, height = w ? w->h : m.height;
+    gdi::fill(hdc, {0, 0, width, height}, gdi::argb(colors[4])); // COLOR_MENU
+    gdi::fill(hdc, {0, 0, width, 1}, gdi::argb(colors[20]));     // COLOR_BTNHIGHLIGHT
+    gdi::fill(hdc, {0, 0, 1, height}, gdi::argb(colors[20]));
+    gdi::fill(hdc, {0, height - 1, width, height}, gdi::argb(colors[21])); // COLOR_BTNSHADOW
+    gdi::fill(hdc, {width - 1, 0, width, height}, gdi::argb(colors[21]));
+    dc->font = menu_font();
+    dc->bk_mode = 1; // TRANSPARENT
+    for (size_t i = 0; i < items.size() && i < m.rects.size(); ++i) {
+        const MenuItem &item = items[i];
+        const gdi::Rect r = m.rects[i];
+        if (menu_item_separator(item)) {
+            const int32_t y = r.t + (r.b - r.t) / 2;
+            gdi::fill(hdc, {2, y, width - 2, y + 1}, gdi::argb(colors[21]));
+            gdi::fill(hdc, {2, y + 1, width - 2, y + 2}, gdi::argb(colors[20]));
+            continue;
+        }
+        const bool disabled = menu_item_disabled(item);
+        const bool hot = int(i) == m.hot && !disabled;
+        if (hot)
+            gdi::fill(hdc, {1, r.t, width - 1, r.b}, gdi::argb(colors[10])); // COLOR_HIGHLIGHT
+        if (menu_item_ownerdraw(item)) {
+            uint32_t ds = heap_alloc(0x30, true);
+            bool drawn = false;
+            if (ds) {
+                wr32(ds + 0x00, 1); // ODT_MENU
+                wr32(ds + 0x04, m.menu);
+                wr32(ds + 0x08, uint32_t(i)); // itemID = position
+                wr32(ds + 0x0c, 1);           // itemAction = ODA_DRAWENTIRE
+                wr32(ds + 0x10,
+                     (hot ? 1u : 0u) | (disabled ? 2u : 0u)); // ODS_SELECTED|ODS_DISABLED
+                wr32(ds + 0x14, hwnd);                        // hwndItem
+                wr32(ds + 0x18, hdc);
+                wr32(ds + 0x1c, uint32_t(r.l));
+                wr32(ds + 0x20, uint32_t(r.t));
+                wr32(ds + 0x24, uint32_t(r.r));
+                wr32(ds + 0x28, uint32_t(r.b));
+                wr32(ds + 0x2c, item.data);
+                drawn = host_dispatch_to_wndproc(c, m.owner, 0x002b /* WM_DRAWITEM */, uint32_t(i),
+                                                 ds) != 0;
+                heap_free(ds);
+            }
+            if (drawn)
+                continue;
+        }
+        dc->text_color = hot ? gdi::argb(colors[14])                   // COLOR_HIGHLIGHTTEXT
+                             : (disabled ? gdi::argb(colors[17]) : 0); // COLOR_GRAYTEXT
+        if ((item.state & 8u) || item.bitmap) { // MFS_CHECKED, or an item bitmap
+            const int32_t cx = 4, cy = r.t + (r.b - r.t) / 2;
+            if (item.state & 8u) {
+                gdi::line(hdc, cx + 1, cy, cx + 4, cy + 3);
+                gdi::line(hdc, cx + 4, cy + 3, cx + 9, cy - 3);
+            } else {
+                gdi::fill(hdc, {cx, cy - 5, cx + 10, cy + 5}, gdi::argb(colors[21]));
+            }
+        }
+        // The text, then the accelerator column right-aligned in the same row.
+        std::string label = item.text, accel;
+        size_t tab = label.find('\t');
+        if (tab != std::string::npos) {
+            accel = label.substr(tab + 1);
+            label = label.substr(0, tab);
+        }
+        const int32_t text_left = m.check_width;
+        const int32_t text_right = width - (m.any_submenu ? 14 : 4);
+        if (!label.empty()) {
+            uint32_t units = wide_units(label);
+            if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+                wr32(block + 0, uint32_t(text_left));
+                wr32(block + 4, uint32_t(r.t));
+                wr32(block + 8, uint32_t(text_right));
+                wr32(block + 12, uint32_t(r.b));
+                gm_put_wstr(block + 16, label, units + 1);
+                gdi::draw_text(hdc, block + 16, units, block,
+                               0x20 /*DT_SINGLELINE*/ | 0x4 /*DT_VCENTER*/ | 0x800 /*DT_NOPREFIX*/);
+                heap_free(block);
+            }
+        }
+        if (!accel.empty()) {
+            uint32_t units = wide_units(accel);
+            if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+                wr32(block + 0, uint32_t(text_left));
+                wr32(block + 4, uint32_t(r.t));
+                wr32(block + 8, uint32_t(text_right));
+                wr32(block + 12, uint32_t(r.b));
+                gm_put_wstr(block + 16, accel, units + 1);
+                gdi::draw_text(hdc, block + 16, units, block,
+                               0x20 /*DT_SINGLELINE*/ | 0x4 /*DT_VCENTER*/ | 0x2 /*DT_RIGHT*/ |
+                                   0x800 /*DT_NOPREFIX*/);
+                heap_free(block);
+            }
+        }
+        if (item.submenu) {
+            const int32_t ax = width - 11, ay = r.t + (r.b - r.t) / 2;
+            for (int32_t k = 0; k < 4; ++k)
+                gdi::line(hdc, ax + k, ay - 4 + k, ax + k, ay + 4 - k);
+        }
+    }
+    gdi_release_window_dc(hwnd, hdc);
+}
+// The menu window's own procedure: it owns the menu's painting and input.
+void menu_proc(X86 *c) {
+    const uint32_t hwnd = arg(c, 0), msg = arg(c, 1), wparam = arg(c, 2), lparam = arg(c, 3);
+    PopupMenu &m = g_popup;
+    const int32_t x = int16_t(lparam), y = int16_t(lparam >> 16);
+    switch (msg) {
+    case 0x000f: // WM_PAINT: the whole menu is the update region
+        if (Window *w = find_window(hwnd))
+            w->update_pending = false;
+        menu_paint(c, hwnd);
+        set_eax(c, 0);
+        return;
+    case 0x0014: // WM_ERASEBKGND: the paint fills the face itself
+        set_eax(c, 1);
+        return;
+    case 0x0200: { // WM_MOUSEMOVE: the hot item follows the pointer
+        const int item = menu_hit(m, x, y);
+        if (item != m.hot) {
+            m.hot = item;
+            if (Window *w = find_window(hwnd))
+                w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    }
+    case 0x0201: // WM_LBUTTONDOWN outside the items dismisses the menu
+        if (menu_hit(m, x, y) < 0) {
+            m.result = 0;
+            m.done = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0202: { // WM_LBUTTONUP: the release chooses the item under it
+        const int item = menu_hit(m, x, y);
+        auto it = menus.find(m.menu);
+        m.result = 0;
+        if (item >= 0 && it != menus.end() && !menu_item_disabled(it->second.items[size_t(item)]))
+            m.result = int(it->second.items[size_t(item)].id);
+        m.done = true;
+        set_eax(c, 0);
+        return;
+    }
+    case 0x0100: { // WM_KEYDOWN: Esc cancels, the arrows move, Enter chooses
+        auto it = menus.find(m.menu);
+        if (wparam == 0x1b) {
+            m.result = 0;
+            m.done = true;
+        } else if (it != menus.end() && !it->second.items.empty()) {
+            const int count = int(it->second.items.size());
+            if (wparam == 0x28 || wparam == 0x26) { // VK_DOWN / VK_UP
+                int item = m.hot;
+                for (int n = 0; n < count; ++n) {
+                    item = (item + (wparam == 0x28 ? 1 : count - 1)) % count;
+                    if (!menu_item_separator(it->second.items[size_t(item)]) &&
+                        !menu_item_disabled(it->second.items[size_t(item)]))
+                        break;
+                }
+                m.hot = item;
+                if (Window *w = find_window(hwnd))
+                    w->update_pending = true;
+            } else if (wparam == 0x0d && m.hot >= 0 && m.hot < count) {
+                const MenuItem &item = it->second.items[size_t(m.hot)];
+                if (!menu_item_disabled(item))
+                    m.result = int(item.id);
+                m.done = true;
+            }
+        }
+        set_eax(c, 0);
+        return;
+    }
+    default:
+        set_eax(c, 0);
+        return;
+    }
+}
+uint32_t menu_proc_addr() {
+    static uint32_t addr = 0;
+    if (!addr)
+        addr = imports_alloc_trampoline("USER32.dll", "popup menu procedure", menu_proc, 4);
+    return addr;
+}
+// Show a menu and run it to a choice. Returns the selected command id (0 when
+// the menu was dismissed). The caller decides whether to report it or to post
+// WM_COMMAND, which is what TPM_RETURNCMD separates on Windows.
+int32_t run_popup_menu(X86 *c, uint32_t hmenu, uint32_t flags, int32_t x, int32_t y,
+                       uint32_t owner) {
+    if (!menus.count(hmenu))
+        return 0;
+    PopupMenu &m = g_popup;
+    m = PopupMenu{};
+    m.menu = hmenu;
+    m.owner = owner;
+    m.return_command = (flags & 0x0100u) != 0; // TPM_RETURNCMD
+    // Windows sends WM_INITMENUPOPUP before it measures, so a menu whose items
+    // are filled in there is sized from what the owner put in them.
+    if (owner)
+        host_dispatch_to_wndproc(c, owner, 0x0117 /* WM_INITMENUPOPUP */, hmenu, 0);
+    m.hwnd = alloc_window_handle();
+    Window w;
+    w.hwnd = m.hwnd;
+    w.wndproc = menu_proc_addr();
+    w.style = 0x80000000u | 0x10000000u; // WS_POPUP | WS_VISIBLE
+    w.cls = "recomp popup menu";
+    w.x = x;
+    w.y = y;
+    w.owner = owner;
+    w.thread = guest_current_thread_id();
+    w.visible = true;
+    w.shown = true;
+    w.update_pending = true;
+    windows()[m.hwnd] = w;
+    window_created(m.hwnd);
+    reorder_window(m.hwnd, 0); // the menu is above everything it covers
+    menu_layout(c);
+    if (Window *mw = find_window(m.hwnd)) {
+        mw->w = m.width;
+        mw->h = m.height;
+        mw->update_pending = true;
+    }
+    LOGV("TrackPopupMenu: menu=%08x owner=%08x flags=%x at %d,%d -> window %08x %dx%d (%zu items)",
+         hmenu, owner, flags, x, y, m.hwnd, m.width, m.height, menus[hmenu].items.size());
+    const uint32_t previous_capture = capture;
+    capture = m.hwnd;
+    set_focus_window(m.hwnd);
+    // The modal loop: Windows' own TrackPopupMenu runs one. Messages go to the
+    // window they name (the menu has capture, so the pointer events are its
+    // own); with nothing queued the update region is painted, exactly as the
+    // dialog engine's pump does.
+    while (!m.done) {
+        host_pump_timers(c);
+        pump_window_timers();
+        pump_mouse_input(c);
+        gdi_present_windows();
+        bool dispatched = false;
+        auto &q = queue();
+        while (!q.empty()) {
+            Msg msg = q.front();
+            q.pop_front();
+            if (msg.message == 0x0012) { // WM_QUIT
+                m.done = true;
+                break;
+            }
+            last_message = msg;
+            if (find_window(msg.hwnd))
+                host_dispatch_to_wndproc(c, msg.hwnd, msg.message, msg.wparam, msg.lparam);
+            dispatched = true;
+            if (m.done)
+                break;
+        }
+        if (m.done)
+            break;
+        if (dispatched)
+            continue;
+        if (Window *pw = first_paint_window()) {
+            paint_dialog_chrome(c, pw->hwnd);
+            host_dispatch_to_wndproc(c, pw->hwnd, 0x000f /* WM_PAINT */, 0, 0);
+            continue;
+        }
+        if (!g_message_waiter) {
+            log_once("TrackPopupMenu-nohost",
+                     "TrackPopupMenu: nothing is queued and there is no host to wait on");
+            break;
+        }
+        g_message_waiter();
+        if (!host_guest_yield())
+            guest_sleep_ms(1);
+    }
+    capture = find_window(previous_capture) ? previous_capture : 0;
+    const int32_t result = m.result;
+    if (find_window(m.hwnd))
+        destroy_window(c, m.hwnd);
+    m.hwnd = 0;
+    return result;
+}
+// Does this menu contain an item the program draws itself (MFT_OWNERDRAW)? A
+// game that owns such a menu also owns its menu engine, and its WM_MEASUREITEM
+// answer is the only size those items have, so the runtime hands the whole menu
+// to the game's routine (game.toml's menu_track_popup). Everything else - the
+// plain text, separator and bitmap menus - is what Windows' own TrackPopupMenu
+// measures and draws, and the runtime does that itself (run_popup_menu).
+bool menu_needs_game_engine(uint32_t hmenu) {
+    auto it = menus.find(hmenu);
+    if (it == menus.end())
+        return false;
+    for (const MenuItem &item : it->second.items)
+        if (item.type & 0x100u) // MFT_OWNERDRAW
+            return true;
+    return false;
+}
+// A game may own its popup menus: it calls the native TrackPopupMenu but draws
+// and drives the menu with its own window class (Petz 5's WinMenu). That is the
+// game's *custom* path, which it also takes by calling WinMenu directly; the
+// owner is the `this` pointer (a guest global), passed in ECX. Only a menu with
+// owner-draw items goes there - the engine's measure routine
+// (WinMenu::DoWMMeasureItem) knows the game's own item ids and sizes everything
+// else 0x0, which is how a plain text menu came out invisible.
+void track_popup_menu(X86 *c) {
+    uint32_t hmenu = arg(c, 0), flags = arg(c, 1);
+    uint32_t owner = arg(c, 5);
+    if (!owner)
+        owner = active ? active : (focus ? focus : g_main_hwnd);
+#if defined(RECOMP_HOOK_MENU_TRACK_POPUP) && defined(RECOMP_HOOK_MENU_OWNER)
+    uint32_t engine = RECOMP_HOOK_MENU_OWNER ? rd32(RECOMP_HOOK_MENU_OWNER) : 0;
+    if (engine && menu_needs_game_engine(hmenu)) {
+        uint32_t args[7];
+        for (int i = 0; i < 7; ++i)
+            args[i] = arg(c, i);
+        uint32_t saved_ecx = c->r[1];
+        c->r[1] = engine;
+        uint32_t result = guest_call(c, RECOMP_HOOK_MENU_TRACK_POPUP, args, 7);
+        c->r[1] = saved_ecx;
+        set_eax(c, result);
+        return;
+    }
 #endif
+    // The runtime's own menu, with Windows' return contract: TPM_RETURNCMD
+    // reports the id and sends nothing, otherwise WM_COMMAND goes to the owner.
+    int32_t id = run_popup_menu(c, hmenu, flags, int32_t(arg(c, 2)), int32_t(arg(c, 3)), owner);
+    if ((flags & 0x0100u) == 0 && id > 0 && owner)
+        host_dispatch_to_wndproc(c, owner, 0x0111 /* WM_COMMAND */, uint32_t(uint16_t(id)), 0);
+    set_eax(c, (flags & 0x0100u) ? uint32_t(id) : 1);
 }
 
 const ImportShim shims[] = {
