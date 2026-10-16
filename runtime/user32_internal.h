@@ -139,12 +139,6 @@ void ensure_system_classes();
 // parent's WM_CTLCOLORSTATIC brush, then the text). Shared with the dialog
 // engine's control_proc.
 void paint_control(X86 *c, uint32_t hwnd, uint32_t into);
-// Paints an EDIT control: the parent's WM_CTLCOLOREDIT brush (or
-// WM_CTLCOLORSTATIC for a read-only edit; COLOR_WINDOW when the dialog answers
-// nothing) inside its sunken border, then the control's own text in the
-// dialog's WM_SETFONT face. The dialog engine's control_proc calls it for an
-// "edit" window.
-void paint_edit(X86 *c, uint32_t hwnd, uint32_t into);
 // Builds a dialog and its controls from a DLGTEMPLATE that is already in guest
 // memory (address `tmpl`, `size` bytes), applying the template's DS_SETFONT
 // face to the dialog and each control. The resource entry points share this

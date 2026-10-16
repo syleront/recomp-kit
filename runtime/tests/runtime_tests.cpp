@@ -1831,6 +1831,30 @@ static void test_misc_shims(X86 *c) {
     call_import(c, "USER32.dll", "wvsprintfA", {out, fmt, va});
     check(gm_str(out) == "blue has 12 units (002a)", "wvsprintfA -> \"%s\"", gm_str(out).c_str());
 
+    // MSVC's strftime '#' flag (ISO C alternate form) removes leading zeros;
+    // the host C library does not implement it. The Petz Profile "Adopted"
+    // line formats "%B %#d, %#Y", which reached the dialog as
+    // "October #d, #Y" before the shim translated the flag.
+    uint32_t tmv = scratch_block(36);
+    wr32(tmv + 0, 0);
+    wr32(tmv + 4, 5);
+    wr32(tmv + 8, 9);    // 09:05
+    wr32(tmv + 12, 5);   // day 5 -> "%#d" is "5"
+    wr32(tmv + 16, 9);   // October (0-based)
+    wr32(tmv + 20, 126); // 2026
+    wr32(tmv + 24, 1);
+    wr32(tmv + 28, 4); // tm_yday 4 -> "%j" is "005" (1-based day of year)
+    wr32(tmv + 32, 0);
+    uint32_t tout = scratch_block(64);
+    call_import(c, "MSVCRT.dll", "strftime", {tout, 64, put_str("%d/%H/%j/%y"), tmv});
+    check(gm_str(tout) == "05/09/005/26", "strftime without '#' keeps the zeros -> \"%s\"",
+          gm_str(tout).c_str());
+    call_import(c, "MSVCRT.dll", "strftime", {tout, 64, put_str("%B %#d, %#Y"), tmv});
+    check(gm_str(tout) == "October 5, 2026", "strftime '#' strips the leading zero -> \"%s\"",
+          gm_str(tout).c_str());
+    call_import(c, "MSVCRT.dll", "strftime", {tout, 64, put_str("%#H:%M %#j"), tmv});
+    check(gm_str(tout) == "9:05 5", "strftime '#' on H and j -> \"%s\"", gm_str(tout).c_str());
+
     uint32_t spc = scratch_block(4), bps = scratch_block(4), fr = scratch_block(4),
              tot = scratch_block(4);
     uint32_t root = put_str("C:\\");

@@ -441,7 +441,8 @@ template <typename T> std::string fmt1(const std::string &spec, T v) {
 // Visual C++ prints three exponent digits ("1.5e+000").
 std::string msvc_exponent(std::string s) {
     for (size_t i = 0; i + 3 < s.size() + 1; ++i) {
-        if ((s[i] == 'e' || s[i] == 'E') && i + 1 < s.size() && (s[i + 1] == '+' || s[i + 1] == '-')) {
+        if ((s[i] == 'e' || s[i] == 'E') && i + 1 < s.size() &&
+            (s[i + 1] == '+' || s[i + 1] == '-')) {
             size_t d = i + 2, e = d;
             while (e < s.size() && isdigit((unsigned char)s[e]))
                 ++e;
@@ -513,9 +514,9 @@ std::string gformat(const char *p, VaReader &va) {
         switch (conv) {
         case 'd':
         case 'i': {
-            long long v = len == 3 ? (long long)(int64_t)va.next64()
-                                   : len == 1 ? (long long)(int16_t)va.next32()
-                                              : (long long)(int32_t)va.next32();
+            long long v = len == 3   ? (long long)(int64_t)va.next64()
+                          : len == 1 ? (long long)(int16_t)va.next32()
+                                     : (long long)(int32_t)va.next32();
             out += fmt1(spec + "lld", v);
             break;
         }
@@ -523,7 +524,7 @@ std::string gformat(const char *p, VaReader &va) {
         case 'x':
         case 'X':
         case 'o': {
-            unsigned long long v = len == 3 ? (unsigned long long)va.next64()
+            unsigned long long v = len == 3   ? (unsigned long long)va.next64()
                                    : len == 1 ? (unsigned long long)(uint16_t)va.next32()
                                               : (unsigned long long)va.next32();
             out += fmt1(spec + "ll" + conv, v);
@@ -957,7 +958,9 @@ void crt_fseek(X86 *c) {
     }
     int origin = (int)arg(c, 2);
     int r = fseek(gf->f, (long)(int32_t)arg(c, 1),
-                  origin == 1 ? SEEK_CUR : origin == 2 ? SEEK_END : SEEK_SET);
+                  origin == 1   ? SEEK_CUR
+                  : origin == 2 ? SEEK_END
+                                : SEEK_SET);
     set_flag(fp, IOEOF, false);
     set_eax(c, r ? 0xffffffffu : 0);
 }
@@ -1029,7 +1032,7 @@ void read_tm(uint32_t a, struct tm *t) {
     t->tm_isdst = (int)rd32(a + 32);
 }
 void write_tm(uint32_t a, const struct tm *t) {
-    const int v[9] = {t->tm_sec, t->tm_min, t->tm_hour, t->tm_mday, t->tm_mon,
+    const int v[9] = {t->tm_sec,  t->tm_min,  t->tm_hour, t->tm_mday, t->tm_mon,
                       t->tm_year, t->tm_wday, t->tm_yday, t->tm_isdst};
     for (int i = 0; i < 9; ++i)
         wr32(a + 4 * (uint32_t)i, (uint32_t)v[i]);
@@ -1065,16 +1068,97 @@ void crt_mktime(X86 *c) {
 void crt_difftime(X86 *c) {
     fpush(c, (double)(int32_t)arg(c, 0) - (double)(int32_t)arg(c, 1));
 }
+// MSVC's strftime accepts a '#' flag (the ISO C "alternate form") that removes
+// leading zeros: "%#d" is "5", not "05"; "%#H" is "9", not "09". The host C
+// library does not implement the flag, so passing "%B %#d, %#Y" straight to it
+// reached the Petz Profile dialog as "October #d, #Y". Format one conversion at
+// a time with the host library (whose output for the plain specifier matches
+// MSVC), then apply the flag's rule to that conversion's text. Uses the host
+// only for the pieces it knows; '#' never reaches it.
+std::string msvc_strftime(const std::string &fmt, const struct tm *tmv) {
+    std::string out;
+    out.reserve(fmt.size() + 16);
+    for (size_t i = 0; i < fmt.size(); ++i) {
+        if (fmt[i] != '%') {
+            out += fmt[i];
+            continue;
+        }
+        size_t j = i + 1;
+        bool alt = false;
+        std::string flags;
+        while (j < fmt.size() &&
+               (fmt[j] == '#' || fmt[j] == '-' || fmt[j] == '0' || fmt[j] == '^')) {
+            if (fmt[j] == '#')
+                alt = true; // emulated below; never passed to the host
+            else
+                flags += fmt[j];
+            ++j;
+        }
+        if (j >= fmt.size()) { // trailing '%' or flags: copy the rest verbatim
+            out += fmt.substr(i);
+            break;
+        }
+        const char conv = fmt[j];
+        i = j;
+        if (conv == '%') {
+            out += '%';
+            continue;
+        }
+        char spec[8];
+        size_t n = 0;
+        spec[n++] = '%';
+        for (char f : flags)
+            spec[n++] = f;
+        spec[n++] = conv;
+        spec[n] = '\0';
+        char buf[128];
+        size_t got = strftime(buf, sizeof(buf), spec, tmv);
+        std::string s(buf, got);
+        if (alt) {
+            switch (conv) {
+            case 'd':
+            case 'H':
+            case 'I':
+            case 'j':
+            case 'm':
+            case 'M':
+            case 'S':
+            case 'U':
+            case 'w':
+            case 'W':
+            case 'y':
+            case 'Y': {
+                size_t zero = s.find_first_not_of('0');
+                if (zero == std::string::npos)
+                    s = "0"; // "00" like "0" for a zero field
+                else if (zero)
+                    s.erase(0, zero);
+                break;
+            }
+            case 'p':
+            case 'Z': // the alternate form lowercases the text
+                for (char &ch : s)
+                    ch = char(tolower((unsigned char)ch));
+                break;
+            default: // "%#c"/"%#x" keep the locale's long form, as the host returns
+                break;
+            }
+        }
+        out += s;
+    }
+    return out;
+}
 void crt_strftime(X86 *c) {
     uint32_t out = arg(c, 0), max = arg(c, 1);
     struct tm tmv;
     read_tm(arg(c, 3), &tmv);
-    std::string fmt = gm_str(arg(c, 2));
-    std::vector<char> buf(max + 1);
-    size_t n = max ? strftime(buf.data(), max, fmt.c_str(), &tmv) : 0;
-    if (n)
-        gm_put_str(out, buf.data(), (uint32_t)n + 1);
-    set_eax(c, (uint32_t)n);
+    std::string s = msvc_strftime(gm_str(arg(c, 2)), &tmv);
+    if (!max || s.size() + 1 > max) { // the CRT writes nothing and returns 0
+        set_eax(c, 0);
+        return;
+    }
+    gm_put_str(out, s.c_str(), uint32_t(s.size()) + 1);
+    set_eax(c, (uint32_t)s.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,9 +1232,8 @@ void crt_bsearch(X86 *c) {
 // ---------------------------------------------------------------------------
 void crt_ftol(X86 *c) {
     double v = fpop(c);
-    int64_t r = (v != v || v >= 9.2233720368547758e18 || v < -9.2233720368547758e18)
-                    ? INT64_MIN
-                    : (int64_t)v;
+    int64_t r = (v != v || v >= 9.2233720368547758e18 || v < -9.2233720368547758e18) ? INT64_MIN
+                                                                                     : (int64_t)v;
     set_eax64(c, (uint64_t)r);
 }
 void crt_cipow(X86 *c) {
@@ -1380,8 +1463,7 @@ void crt_cxx_frame_handler(X86 *c) {
                 if (ctype && rd8(ctype + 8))
                     continue; // only catch(...) accepts a non-C++ exception
             }
-            LOGV("MSVCRT: frame %08x catches exception %08x in try %u block %u", frame, code, t,
-                 k);
+            LOGV("MSVCRT: frame %08x catches exception %08x in try %u block %u", frame, code, t, k);
             if (cxx)
                 copy_exception(c, frame, cb, type, object);
             // Global unwind: every frame above this one runs its cleanups.

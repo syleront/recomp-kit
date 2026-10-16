@@ -2838,9 +2838,9 @@ void paint_edit(X86 *c, uint32_t hwnd, uint32_t into) {
             wr32(block + 8, uint32_t(width - inset - 1));
             wr32(block + 12, uint32_t(height - inset));
             gm_put_wstr(block + 16, text, units + 1);
-            uint32_t flags = 0x800; // DT_NOPREFIX
-            if (w->style & 0x0004u) // ES_MULTILINE
-                flags |= 0x10;      // DT_WORDBREAK
+            uint32_t flags = 0x800 | 0x40; // DT_NOPREFIX | DT_EXPANDTABS
+            if (w->style & 0x0004u)        // ES_MULTILINE
+                flags |= 0x10;             // DT_WORDBREAK
             else
                 flags |= 0x20 | 0x4; // DT_SINGLELINE | DT_VCENTER (DT_LEFT is 0)
             gdi::draw_text(hdc, block + 16, units, block, flags);
