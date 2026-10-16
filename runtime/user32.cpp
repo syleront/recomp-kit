@@ -127,6 +127,28 @@ void host_post_message(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lp
 uint32_t host_main_window() {
     return g_main_hwnd;
 }
+// The host asking the program to close is a user closing a window, and Windows
+// delivers WM_CLOSE to the window the user closed - a visible top-level window,
+// not the invisible application window host_main_window names. A program like
+// Catz 5 makes its first window an off-screen WS_POPUP helper and only its
+// second window visible, so posting WM_CLOSE to host_main_window reaches a
+// window whose own close handler refuses to quit (the guest compares the hwnd
+// against its recorded main window). Deliver it to every visible top-level
+// window; the program's real close handler is among them. With no visible
+// window, fall back to host_main_window so a program that hides its windows
+// still gets the request.
+void host_post_close_messages() {
+    bool any = false;
+    for (auto &kv : windows()) {
+        const Window &w = kv.second;
+        if (w.parent || !w.visible)
+            continue;
+        host_post_message(w.hwnd, 0x0010 /* WM_CLOSE */, 0, 0);
+        any = true;
+    }
+    if (!any && g_main_hwnd)
+        host_post_message(g_main_hwnd, 0x0010 /* WM_CLOSE */, 0, 0);
+}
 uint32_t host_window_proc(uint32_t hwnd) {
     Window *w = find_window(hwnd);
     return w ? w->wndproc : 0;

@@ -278,21 +278,32 @@ void r_UuidEqual(X86 *c) {
 
 // ---------------------------------------------------------------------------
 // MSACM32: audio compression manager. Petz 5 stores its wave effects as mono
-// IMA ADPCM (WAVE_FORMAT_IMA_ADPCM, format tag 0x11, 4 bits) and converts them
-// to PCM once at load through CWave::ConvertToPCM; nothing else in the game
-// uses ACM. The streams below therefore implement exactly that conversion:
-// IMA ADPCM (or plain PCM) in, 8- or 16-bit PCM out, at the same rate and
-// channel count. Any other codec pair is refused with ACMERR_NOTPOSSIBLE so the
-// caller takes its documented failure path rather than playing garbage.
+// ADPCM and converts them to PCM once at load through CWave::ConvertToPCM;
+// nothing else in the game uses ACM. Ten waves are IMA ADPCM
+// (WAVE_FORMAT_IMA_ADPCM, format tag 0x11, 4 bits) and five are Microsoft
+// ADPCM (WAVE_FORMAT_ADPCM, format tag 2, 4 bits). The streams below implement
+// exactly that conversion: IMA ADPCM, MS ADPCM or plain PCM in, 8- or 16-bit
+// PCM out, at the same rate and channel count. Any other codec pair is refused
+// with ACMERR_NOTPOSSIBLE so the caller takes its documented failure path
+// rather than playing garbage. (Before MS ADPCM was handled, the tag-2 waves
+// failed ConvertToPCM, and the caller fell back to a compressed DirectSound
+// buffer that the sound shim played as if it were PCM - audible noise.)
 // ---------------------------------------------------------------------------
+// Microsoft ADPCM (WAVE_FORMAT_ADPCM, tag 2): the reference coefficient and
+// adaptation tables from the Microsoft Multimedia Programmer's Reference. Five
+// of the game's waves (the dh_angry* pet sounds) are this codec.
+const int k_ms_coeff1[7] = {256, 512, 0, 192, 240, 460, 392};
+const int k_ms_coeff2[7] = {0, -256, 0, 64, 0, -208, -232};
+const int k_ms_adapt[16] = {230, 230, 230, 230, 307, 409, 512, 614,
+                            768, 614, 512, 409, 307, 230, 230, 230};
 const int k_ima_index[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
 const int k_ima_step[89] = {
-    7,     8,     9,     10,    11,    12,    13,    14,    16,    17,    19,    21,    23,
-    25,    28,    31,    34,    37,    41,    45,    50,    55,    60,    66,    73,    80,
-    88,    97,    107,   118,   130,   143,   157,   173,   190,   209,   230,   253,   279,
-    307,   337,   371,   408,   449,   494,   544,   598,   658,   724,   796,   876,   963,
-    1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,  2272,  2499,  2749,  3024,  3327,
-    3660,  4026,  4428,  4871,  5358,  5894,  6484,  7132,  7845,  8630,  9493,  10442, 11487,
+    7,     8,     9,     10,    11,    12,    13,    14,    16,    17,    19,   21,    23,
+    25,    28,    31,    34,    37,    41,    45,    50,    55,    60,    66,   73,    80,
+    88,    97,    107,   118,   130,   143,   157,   173,   190,   209,   230,  253,   279,
+    307,   337,   371,   408,   449,   494,   544,   598,   658,   724,   796,  876,   963,
+    1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,  2272,  2499,  2749, 3024,  3327,
+    3660,  4026,  4428,  4871,  5358,  5894,  6484,  7132,  7845,  8630,  9493, 10442, 11487,
     12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
 
 struct AcmFormat {
@@ -324,6 +335,12 @@ bool acm_supported(const AcmStream &s) {
     if (s.src.tag == 1)
         return s.src.channels == s.dst.channels && s.src.rate == s.dst.rate &&
                s.src.bits == s.dst.bits;
+    // Microsoft ADPCM (tag 2): mono only. The stereo block layout interleaves
+    // the two channels' headers differently and no wave in this game uses it,
+    // so refusing it (the caller's documented fallback) beats guessing.
+    if (s.src.tag == 2)
+        return s.src.bits == 4 && s.src.channels == 1 && s.dst.channels == 1 &&
+               s.src.rate == s.dst.rate && s.src.align > 7;
     return s.src.tag == 0x11 && s.src.bits == 4 && s.src.channels == s.dst.channels &&
            s.src.rate == s.dst.rate && s.src.align >= 4u * s.src.channels;
 }
@@ -332,6 +349,10 @@ uint32_t acm_samples_per_block(const AcmFormat &src) {
         return src.samples;
     uint32_t align = src.align ? src.align : 512;
     uint32_t channels = src.channels ? src.channels : 1;
+    // MS ADPCM: a seven-byte block header (predictor, delta, two seed samples)
+    // then two samples per byte.
+    if (src.tag == 2)
+        return align > 7 ? (align - 7) * 2 + 2 : 1;
     if (align <= 4 * channels)
         return 1;
     return (align - 4 * channels) * 2 / channels + 1;
@@ -348,13 +369,27 @@ int ima_nibble(int nibble, int &predictor, int &index) {
     index = std::clamp(index + k_ima_index[nibble], 0, 88);
     return predictor;
 }
-void ima_emit(std::vector<uint8_t> &out, int sample, uint32_t bits) {
+void pcm_emit(std::vector<uint8_t> &out, int sample, uint32_t bits) {
     if (bits == 8)
         out.push_back((uint8_t)((sample >> 8) + 128)); // 8-bit PCM is unsigned
     else {
         out.push_back((uint8_t)(sample & 0xff));
         out.push_back((uint8_t)((sample >> 8) & 0xff));
     }
+}
+// One 4-bit MS ADPCM nibble: predict from the two previous samples with the
+// block's coefficient pair, add the sign-extended nibble scaled by the running
+// delta, clamp, then adapt the delta. Returns the decoded sample.
+int ms_nibble(int nibble, int predictor, int &samp1, int &samp2, int &delta) {
+    int pred = (samp1 * k_ms_coeff1[predictor] + samp2 * k_ms_coeff2[predictor]) / 256;
+    int n = (nibble & 8) ? nibble - 16 : nibble;
+    int samp = std::clamp(pred + n * delta, -32768, 32767);
+    samp2 = samp1;
+    samp1 = samp;
+    delta = (k_ms_adapt[nibble] * delta) / 256;
+    if (delta < 16)
+        delta = 16;
+    return samp;
 }
 void acm_decode(const AcmStream &s, uint32_t src, uint32_t src_bytes, uint32_t dst,
                 uint32_t dst_bytes, uint32_t &src_used, uint32_t &dst_used) {
@@ -364,6 +399,40 @@ void acm_decode(const AcmStream &s, uint32_t src, uint32_t src_bytes, uint32_t d
         if (n)
             memcpy(g_mem + dst, g_mem + src, n);
         src_used = n;
+        dst_used = n;
+        return;
+    }
+    if (s.src.tag == 2) { // MS ADPCM, mono: seven-byte header then nibbles
+        uint32_t align = s.src.align;
+        if (s.src.channels != 1 || align < 8)
+            return;
+        std::vector<uint8_t> pcm;
+        pcm.reserve((size_t)(src_bytes / align + 1) * acm_samples_per_block(s.src) *
+                    (s.dst.bits / 8));
+        uint32_t off = 0;
+        // A wave need not be a whole number of blocks (the game's are not: the
+        // last block is short), so the final one is decoded for as many bytes
+        // as it has rather than dropped.
+        while (off + 7 <= src_bytes) {
+            uint32_t block = std::min(align, src_bytes - off);
+            const uint8_t *p = g_mem + src + off;
+            int predictor = p[0] < 7 ? p[0] : 0;
+            int delta = (int16_t)(p[1] | (p[2] << 8));
+            int samp1 = (int16_t)(p[3] | (p[4] << 8));
+            int samp2 = (int16_t)(p[5] | (p[6] << 8));
+            pcm_emit(pcm, samp2, s.dst.bits); // the two seed samples, in order
+            pcm_emit(pcm, samp1, s.dst.bits);
+            for (uint32_t i = 7; i < block; ++i) {
+                uint8_t byte = p[i];
+                pcm_emit(pcm, ms_nibble(byte >> 4, predictor, samp1, samp2, delta), s.dst.bits);
+                pcm_emit(pcm, ms_nibble(byte & 0x0f, predictor, samp1, samp2, delta), s.dst.bits);
+            }
+            off += block;
+        }
+        uint32_t n = (uint32_t)std::min<size_t>(pcm.size(), dst_bytes);
+        if (n)
+            memcpy(g_mem + dst, pcm.data(), n);
+        src_used = off;
         dst_used = n;
         return;
     }
@@ -413,7 +482,7 @@ void acm_decode(const AcmStream &s, uint32_t src, uint32_t src_bytes, uint32_t d
         }
         for (uint32_t i = 0; i < spb; ++i)
             for (uint32_t ch = 0; ch < channels; ++ch)
-                ima_emit(pcm, plane[(size_t)ch * spb + i], s.dst.bits);
+                pcm_emit(pcm, plane[(size_t)ch * spb + i], s.dst.bits);
     }
     uint32_t n = (uint32_t)std::min<size_t>(pcm.size(), dst_bytes);
     if (n)
@@ -424,8 +493,8 @@ void acm_decode(const AcmStream &s, uint32_t src, uint32_t src_bytes, uint32_t d
 
 void acm_Metrics(X86 *c) {
     uint32_t metric = arg(c, 1), out = arg(c, 2);
-    uint32_t value = metric == 0x32   ? 20   // ACM_METRIC_MAX_SIZE_FORMAT: WAVEFORMATEX + cbSize
-                     : metric == 0x33 ? 8    // ACM_METRIC_MAX_SIZE_FILTER: WAVEFILTER base
+    uint32_t value = metric == 0x32   ? 20 // ACM_METRIC_MAX_SIZE_FORMAT: WAVEFORMATEX + cbSize
+                     : metric == 0x33 ? 8  // ACM_METRIC_MAX_SIZE_FILTER: WAVEFILTER base
                                       : 0;
     if (out && gm_valid(out, 4))
         wr32(out, value);
@@ -490,7 +559,7 @@ void acm_StreamSize(X86 *c) {
     }
     const AcmStream &s = it->second;
     uint32_t result = cb;
-    if (s.src.tag == 0x11) {
+    if (s.src.tag == 0x11 || s.src.tag == 2) {
         uint32_t bytes_per_sample = s.dst.bits / 8;
         uint32_t block_out = acm_samples_per_block(s.src) * s.dst.channels * bytes_per_sample;
         if (mode == 1) { // ACM_STREAMSIZEF_DESTINATION
@@ -536,8 +605,8 @@ void acm_Convert(X86 *c) {
     }
     uint32_t src_used = 0, dst_used = 0;
     acm_decode(it->second, pb_src, cb_src, pb_dst, cb_dst, src_used, dst_used);
-    wr32(pah + 20, src_used); // cbSrcLengthUsed
-    wr32(pah + 36, dst_used); // cbDstLengthUsed
+    wr32(pah + 20, src_used);                   // cbSrcLengthUsed
+    wr32(pah + 36, dst_used);                   // cbDstLengthUsed
     wr32(pah + 4, rd32(pah + 4) | 0x00010000u); // ACMSTREAMHEADER_STATUSF_DONE
     set_eax(c, 0);
 }
