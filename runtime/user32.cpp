@@ -2411,6 +2411,14 @@ bool parse_dlg_template(uint32_t p, uint32_t size, DlgTemplate *t) {
         if (!q)
             return false;
     }
+    // The first DLGITEMTEMPLATE is DWORD-aligned in the resource, exactly like
+    // every following one (which parse_dlg_item aligns). Without this, a font
+    // typeface whose UTF-16 length is not a multiple of four (e.g. "MS Sans
+    // Serif", 13 chars + NUL = 28 bytes) leaves the item cursor two bytes early,
+    // so the first few controls get the previous field's data as their geometry
+    // and class — Petz 5's adoption-pledge dialog (template 164) lost its Adopt
+    // button that way.
+    q = (q + 3) & ~3u;
     for (uint16_t i = 0; i < count; ++i) {
         DlgItemTemplate item;
         if (!parse_dlg_item(q, end, extended, &item, &q))
