@@ -80,6 +80,31 @@ int32_t g_click_x = 0, g_click_y = 0;
 uint32_t g_click_interval = 150; // frames between clicks; one dialog per click
 uint32_t g_clicked = 0;
 
+// The same seam as a script. RECOMP_CLICKS is a ';'-separated list of steps,
+// each `FRAME:action`:
+//   x,y            click at (x,y)
+//   x1,y1>x2,y2    drag: press at (x1,y1), release at (x2,y2)
+//   move=x,y       move the cursor only (no press), for hover-driven menus
+//   key=VK         press and release the virtual key VK
+// A press is *held* for RECOMP_CLICK_HOLD presented frames (default 8) before
+// the release is posted. That hold is the whole point: the game samples the
+// button state once per frame (PetzApp::PrepareDrawFrame copies its
+// down/up flags into ShlGlobals), so a press and release delivered between two
+// frames is invisible to it. A real click holds the button for many frames.
+struct ClickStep {
+    enum Kind { Click, Drag, Key, Move };
+    uint32_t frame = 0;
+    Kind kind = Click;
+    int x = 0, y = 0, x2 = 0, y2 = 0;
+    uint32_t vk = 0;
+};
+std::vector<ClickStep> g_clicks;
+size_t g_next_click = 0;
+uint32_t g_click_hold = 8;
+bool g_press_active = false;
+uint32_t g_press_frame = 0;
+ClickStep g_press_step;
+
 // --- run state -------------------------------------------------------------
 uint32_t g_present_count = 0; // host_present calls
 uint32_t g_frames_written = 0;
@@ -500,6 +525,102 @@ extern "C" void host_input_state(HostInputState *out) {
 
 namespace {
 
+// Parse RECOMP_CLICKS into g_clicks. Unknown or malformed steps are skipped
+// with a line, so a typo in a test script never looks like a game bug.
+void parse_clicks(const char *v) {
+    std::string s(v);
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t semi = s.find(';', start);
+        std::string entry =
+            s.substr(start, semi == std::string::npos ? std::string::npos : semi - start);
+        start = semi == std::string::npos ? s.size() + 1 : semi + 1;
+        while (!entry.empty() && entry.front() == ' ')
+            entry.erase(entry.begin());
+        size_t colon = entry.find(':');
+        if (colon == std::string::npos) {
+            fprintf(stderr, "[host] RECOMP_CLICKS step \"%s\": no ':'\n", entry.c_str());
+            continue;
+        }
+        ClickStep st;
+        st.frame = (uint32_t)strtoul(entry.substr(0, colon).c_str(), nullptr, 0);
+        std::string action = entry.substr(colon + 1);
+        if (action.rfind("key=", 0) == 0) {
+            st.kind = ClickStep::Key;
+            st.vk = (uint32_t)strtoul(action.c_str() + 4, nullptr, 0);
+        } else if (action.rfind("move=", 0) == 0) {
+            st.kind = ClickStep::Move;
+            if (sscanf(action.c_str() + 5, "%d,%d", &st.x, &st.y) != 2) {
+                fprintf(stderr, "[host] RECOMP_CLICKS move \"%s\": want move=x,y\n",
+                        action.c_str());
+                continue;
+            }
+        } else if (action.find('>') != std::string::npos) {
+            st.kind = ClickStep::Drag;
+            if (sscanf(action.c_str(), "%d,%d>%d,%d", &st.x, &st.y, &st.x2, &st.y2) != 4) {
+                fprintf(stderr, "[host] RECOMP_CLICKS drag \"%s\": want x1,y1>x2,y2\n",
+                        action.c_str());
+                continue;
+            }
+        } else {
+            st.kind = ClickStep::Click;
+            if (sscanf(action.c_str(), "%d,%d", &st.x, &st.y) != 2) {
+                fprintf(stderr, "[host] RECOMP_CLICKS click \"%s\": want x,y\n", action.c_str());
+                continue;
+            }
+            st.x2 = st.x;
+            st.y2 = st.y;
+        }
+        g_clicks.push_back(st);
+    }
+}
+
+// Advance the script. One press is held at a time; the release is posted once
+// g_click_hold presented frames have gone by, so the game sees the press on at
+// least one frame boundary. See the ClickStep comment.
+void run_click_script() {
+    if (g_press_active && g_present_count - g_press_frame >= g_click_hold) {
+        if (g_press_step.kind == ClickStep::Key) {
+            host_set_key_state((int)g_press_step.vk, false);
+            host_post_key_message(0x0101 /* WM_KEYUP */, g_press_step.vk, 0);
+        } else {
+            host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_press_step.x2, g_press_step.y2);
+            host_post_mouse_message(0x0202 /* WM_LBUTTONUP */, 0, g_press_step.x2, g_press_step.y2);
+        }
+        printf("[host] scripted release %s at (%d,%d) after %u frames\n",
+               g_press_step.kind == ClickStep::Key ? "key" : "click", g_press_step.x2,
+               g_press_step.y2, g_present_count);
+        fflush(stdout);
+        g_press_active = false;
+    }
+    while (!g_press_active && g_next_click < g_clicks.size() &&
+           g_present_count >= g_clicks[g_next_click].frame) {
+        g_press_step = g_clicks[g_next_click++];
+        g_press_frame = g_present_count;
+        if (g_press_step.kind == ClickStep::Move) {
+            host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_press_step.x, g_press_step.y);
+            printf("[host] scripted move to (%d,%d) after %u frames\n", g_press_step.x,
+                   g_press_step.y, g_present_count);
+            fflush(stdout);
+            continue;
+        }
+        g_press_active = true;
+        if (g_press_step.kind == ClickStep::Key) {
+            host_set_key_state((int)g_press_step.vk, true);
+            host_post_key_message(0x0100 /* WM_KEYDOWN */, g_press_step.vk, 0);
+            printf("[host] scripted key VK=%u down after %u frames\n", g_press_step.vk,
+                   g_present_count);
+        } else {
+            host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_press_step.x, g_press_step.y);
+            host_post_mouse_message(0x0201 /* WM_LBUTTONDOWN */, 1, g_press_step.x, g_press_step.y);
+            printf("[host] scripted press %s at (%d,%d) after %u frames\n",
+                   g_press_step.kind == ClickStep::Drag ? "drag" : "click", g_press_step.x,
+                   g_press_step.y, g_present_count);
+        }
+        fflush(stdout);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The caps. boot.cpp calls this about once a millisecond from inside the
 // guest's own clock reads, which is the point at which a real process yields
@@ -510,6 +631,7 @@ void headless_tick() {
     // This is also the only thing that moves a play cursor here, so it runs
     // before the caps are looked at and on every turn.
     audio_pump();
+    run_click_script();
     if (g_click_frame && g_present_count >= g_click_frame &&
         g_present_count - g_click_frame >= g_clicked * g_click_interval) {
         ++g_clicked;
@@ -642,6 +764,10 @@ int main(int argc, char **argv) {
         g_click_frame = (uint32_t)strtoul(v, nullptr, 0);
     if (const char *v = recomp_env("CLICK_INTERVAL"))
         g_click_interval = (uint32_t)strtoul(v, nullptr, 0);
+    if (const char *v = recomp_env("CLICK_HOLD"))
+        g_click_hold = (uint32_t)strtoul(v, nullptr, 0);
+    if (const char *v = recomp_env("CLICKS"))
+        parse_clicks(v);
 
     mkdir_p(g_frames_dir);
 

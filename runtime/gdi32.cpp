@@ -84,6 +84,14 @@ void win32_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp) {
         }
     }
 }
+// True when the screen size is a real selected mode (the guest's SetDisplayMode
+// or a host swap chain), not the runtime's fallback desktop.
+bool win32_has_display_mode() {
+    if (surface_owns_screen())
+        return true;
+    uint32_t w = 0, h = 0, bpp = 0;
+    return dxgi_display_mode(&w, &h, &bpp) || ddraw_display_mode(&w, &h, &bpp);
+}
 // Runtime-only hosts offer their fallback desktop as a single mode. Linking
 // DirectDraw replaces this with its full, configurable supported-mode table.
 extern "C" __attribute__((weak)) bool ddraw_enum_display_mode(uint32_t index, uint32_t *w,
@@ -1355,6 +1363,27 @@ void gdi_present_windows(bool refresh) {
         win32_display_mode(&width, &height, &bpp);
         w = int(width);
         h = int(height);
+        // A windowed program on a host that never selected a display mode: the
+        // fallback desktop is a size no one is using, and the program's windows
+        // sit in a corner of the composed frame (Catz 5 sizes its play window to
+        // 640x480 and sat in the top-left of a 1024x768 frame). Fit the frame to
+        // the visible top-level windows, which are what the program is actually
+        // showing. GetSystemMetrics keeps reporting the fallback desktop, so a
+        // program that checks for a minimum resolution still sees one.
+        if (!win32_has_display_mode() && !recomp_env("SMOKE_DRAWABLE")) {
+            uint32_t fit_w = 0, fit_h = 0;
+            for (auto &kv : user32::windows()) {
+                const user32::Window &win = kv.second;
+                if (win.parent || !win.visible || win.w <= 0 || win.h <= 0)
+                    continue;
+                fit_w = std::max(fit_w, uint32_t(win.x + win.w));
+                fit_h = std::max(fit_h, uint32_t(win.y + win.h));
+            }
+            if (fit_w > 0 && fit_h > 0 && fit_w <= uint32_t(w) && fit_h <= uint32_t(h)) {
+                w = int(fit_w);
+                h = int(fit_h);
+            }
+        }
     }
     if (w <= 0 || h <= 0 || uint64_t(w) * h > GUEST_SIZE / 4) {
         ddraw_gdi_end_primary(primary);

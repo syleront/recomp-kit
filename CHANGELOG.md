@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Drive a headless run with a script instead of one fixed click: `RECOMP_CLICKS`
+  takes a `;`-separated list of `FRAME:x,y` clicks, `FRAME:x1,y1>x2,y2` drags,
+  `FRAME:move=x,y` hovers and `FRAME:key=VK` key presses, and each press is held
+  for `RECOMP_CLICK_HOLD` presented frames so a guest that samples the button
+  once per frame sees it. The old `RECOMP_CLICK_AT`/`RECOMP_CLICK_FRAME` seam is
+  unchanged.
+- Present the frame a windowed program is actually showing when the host never
+  selected a display mode: the composed frame fits the visible top-level windows
+  instead of the fallback desktop, so a program whose window is smaller than the
+  fallback no longer sits in a corner of a larger black frame. USER32 metrics
+  keep reporting the fallback desktop.
+
 - Recover auxiliary-module entry points structurally when translating a module
   (`translate.py --module`): a relocated dword landing in a code section and a
   `FF 25 <IAT slot>` import thunk are admitted as structural entries, so a

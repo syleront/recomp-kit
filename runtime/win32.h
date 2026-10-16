@@ -59,6 +59,8 @@ uint32_t get_last_error();
 extern "C" bool ddraw_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp);
 // Selected DirectDraw mode, otherwise the host virtual desktop.
 void win32_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp);
+// True when that size is a real selected mode rather than the fallback desktop.
+bool win32_has_display_mode();
 // Notify an exclusive DirectDraw window after the accepted mode is published,
 // including transitions back to an unchanged size after video playback.
 void win32_refresh_display_window(X86 *c, uint32_t hwnd, uint32_t w, uint32_t h, uint32_t bpp);
