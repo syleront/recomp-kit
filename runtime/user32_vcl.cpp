@@ -1091,47 +1091,114 @@ void set_menu_item_bitmaps(X86 *c) {
     }
     set_eax(c, m != nullptr);
 }
-// LoadMenuA reads an RT_MENU template out of hInstance. Only the top level of
-// the template is walked; MF_POPUP submenu templates nested inside a resource
-// are not entered, so a popup becomes an empty submenu.
-void parse_menu_template(uint32_t p, uint32_t end, Menu &menu) {
-    uint32_t q = p + 4; // MENUHEADER: wVersion, cbHeaderSize
-    while (q + 4 <= end) {
-        uint32_t flags = rd16(q), id = rd16(q + 2);
-        q += 4;
-        if (!flags)
-            break;
+// LoadMenuA reads an RT_MENU template out of hInstance and builds the whole
+// menu tree. Two on-disk layouts exist, told apart by MENUHEADER.wVersion:
+//   * version 0, the classic MENUITEMTEMPLATE. Each item is a WORD mtOption,
+//     a WORD mtID, then a NUL-terminated UTF-16 string; mtID is *absent* for
+//     an MF_POPUP item. An MF_POPUP item is followed immediately by its own
+//     level (no header), and MF_END closes the current level.
+//   * version 1, MENUEX. The header is WORD wVersion, WORD wOffset (to the
+//     first item), DWORD dwHelpId. Each item is DWORD dwType, DWORD dwState,
+//     DWORD menuId, WORD wFlags, a NUL-terminated string, then padding to the
+//     next DWORD. MF_END closes the level; MF_POPUP nests the next level.
+// Both are decoded recursively so a popup is a real submenu the menu APIs can
+// walk, which is how Petz 5's Go To menu finds its built-in scenes.
+uint32_t parse_menu_level(uint32_t p, uint32_t end, Menu &menu) {
+    while (p + 2 <= end) {
+        uint16_t flags = rd16(p);
+        p += 2;
         MenuItem item;
-        item.type = flags & 0x1f;
-        item.state = flags & 0xe0;
-        item.id = id;
-        std::string text;
-        while (q + 2 <= end && rd16(q)) {
-            uint16_t unit = rd16(q);
-            text += unit < 0x80 ? char(unit) : '?';
-            q += 2;
+        // MENUITEMTEMPLATE mtOption packs the MENUITEMINFO fType bits
+        // (MF_BITMAP|MF_MENUBARBREAK|MF_MENUBREAK|MF_OWNERDRAW|MF_SEPARATOR)
+        // together with the state bits; MF_END (0x80) is a template marker and
+        // must not leak into either. Petz 5 tests fType & MF_SEPARATOR (0x800)
+        // to tell a separator from a scene.
+        item.type = flags & 0x964;
+        item.state = flags & 0x0b;
+        if (!(flags & 0x10)) { // mtID is absent for an MF_POPUP item
+            if (p + 2 > end)
+                break;
+            item.id = rd16(p);
+            p += 2;
         }
-        if (q + 2 <= end)
-            q += 2; // the terminating NUL
+        std::string text;
+        while (p + 2 <= end && rd16(p)) {
+            uint16_t unit = rd16(p);
+            text += unit < 0x80 ? char(unit) : '?';
+            p += 2;
+        }
+        if (p + 2 <= end)
+            p += 2; // the terminating NUL
         item.text = text;
-        if (flags & 0x10) { // MF_POPUP
+        if (flags & 0x10) { // MF_POPUP: the nested level follows the string
             uint32_t sub = new_menu();
             item.submenu = sub;
             item.id = 0;
+            p = parse_menu_level(p, end, menus[sub]);
+        } else if (text.empty()) {
+            // Windows (and Wine) turn a string item with no text into a
+            // separator: MF_SEPARATOR plus MF_GRAYED|MF_DISABLED. Petz 5's Go
+            // To resource writes its separators this way and detects them with
+            // fType & MF_SEPARATOR.
+            item.type |= 0x800;
+            item.state |= 0x3;
         }
         menu.items.push_back(item);
+        if (flags & 0x80) // MF_END closes this level
+            break;
     }
+    return p;
+}
+uint32_t parse_menuex_level(uint32_t p, uint32_t end, Menu &menu) {
+    while (p + 14 <= end) {
+        uint32_t type = rd32(p), state = rd32(p + 4), id = rd32(p + 8);
+        uint16_t flags = rd16(p + 12);
+        p += 14;
+        std::string text;
+        while (p + 2 <= end && rd16(p)) {
+            uint16_t unit = rd16(p);
+            text += unit < 0x80 ? char(unit) : '?';
+            p += 2;
+        }
+        if (p + 2 <= end)
+            p += 2; // the terminating NUL
+        MenuItem item;
+        item.type = type; // MENUEX dwType is already the MENUITEMINFO fType
+        item.state = state;
+        item.id = id;
+        item.text = text;
+        if (flags & 0x10) { // MF_POPUP
+            p = (p + 3) & ~3u; // MENUEX items are DWORD-aligned
+            uint32_t sub = new_menu();
+            item.submenu = sub;
+            item.id = 0;
+            p = parse_menuex_level(p, end, menus[sub]);
+        } else if (text.empty() && !(item.type & 0x800)) {
+            item.type |= 0x800; // an empty MENUEX item is a separator too
+            item.state |= 0x3;
+        }
+        menu.items.push_back(item);
+        if (flags & 0x80) // MF_END closes this level
+            break;
+    }
+    return p;
 }
 void load_menu_a(X86 *c) {
     std::string why;
     uint32_t entry = resource_find_in(arg(c, 0), 4 /* RT_MENU */, arg(c, 1), true, &why);
     uint32_t bytes = 0, p = entry ? resource_data(entry, &bytes, &why) : 0;
-    if (!p) {
+    if (!p || bytes < 4) {
         set_eax(c, 0);
         return;
     }
+    uint32_t end = p + bytes;
     uint32_t handle = new_menu();
-    parse_menu_template(p, p + bytes, menus[handle]);
+    // Both layouts have a 4-byte header (version, offset); the offset is counted
+    // from the end of those four bytes, so items begin at p + 4 + offset.
+    if (rd16(p) == 1) // MENUEX (extended)
+        parse_menuex_level(p + 4 + rd16(p + 2), end, menus[handle]);
+    else // classic MENUITEMTEMPLATE
+        parse_menu_level(p + 4 + rd16(p + 2), end, menus[handle]);
     set_eax(c, handle);
 }
 // Private clipboard ownership never reaches the host clipboard. GlobalAlloc
