@@ -578,6 +578,15 @@ int os_strcasecmp(const char *a, const char *b) {
     return _stricmp(a, b);
 }
 
+// The PC sampler is POSIX-only for now; a run on Windows says so and is not
+// profiled, rather than pretending to have samples.
+int os_sample_start(void) {
+    return 0;
+}
+void os_sample_dump(void *out_file) {
+    (void)out_file;
+}
+
 int os_setenv(const char *name, const char *value) {
     return _putenv_s(name, value) == 0 ? 0 : -1;
 }

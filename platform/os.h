@@ -139,6 +139,20 @@ void os_write_stderr_raw(const char *s, size_t n);
 void os_exit_immediately(int code);
 
 // ---------------------------------------------------------------------------
+// Sampling profiler: where the calling thread's time went, measured in-process.
+// ---------------------------------------------------------------------------
+// Arms a statistical program-counter sampler for the calling thread. The
+// platform interrupts the thread periodically and records where it was, so a
+// profile can be taken where an external profiler cannot run (no window server,
+// no ptrace, a 20-thread process `sample` gets 2 samples from). Off until
+// called. Returns 1 when armed, 0 where the platform has no facility.
+int os_sample_start(void);
+// Stops the sampler and prints the ranked hot addresses, resolved to a symbol
+// where the platform can, each as `samples self% symbol pc`. `out_file` is a
+// `FILE *` (void here so the header needs no stdio).
+void os_sample_dump(void *out_file);
+
+// ---------------------------------------------------------------------------
 // Time.
 // ---------------------------------------------------------------------------
 uint64_t os_monotonic_ns(void); // never goes backwards; arbitrary origin

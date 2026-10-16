@@ -748,6 +748,15 @@ bool loader_load(const char *exe_path) {
             atexit([] { imports_dump_report(stderr); });
         }
     }
+    // RECOMP_IMPORT_TIME=1 prints the time each import's dispatch spent, so a
+    // run's win32 surface can be ranked without a host sampling profiler.
+    if (recomp_env("IMPORT_TIME")) {
+        static bool timed = false;
+        if (!timed) {
+            timed = true;
+            atexit([] { imports_dump_time(stderr); });
+        }
+    }
 
     if (!patch_iat(file, opt_off, opt_magic, g_base, g_size))
         return false;

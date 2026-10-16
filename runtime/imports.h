@@ -148,6 +148,10 @@ extern const size_t g_gdi32_shim_count;
 
 // Per-import call counts, for the runtime tests and end-of-run diagnostics.
 void imports_dump_stats(FILE *out);
+// Per-import wall time, ranked by total time inside the dispatch, with the
+// time inside the shim itself beside it. Meaningful only after a run under
+// RECOMP_IMPORT_TIME=1; the collection has no other observer.
+void imports_dump_time(FILE *out);
 // Per-DLL implemented / logging-only / unknown-argc breakdown of every
 // allocated trampoline, and the names in each of the latter two groups.
 void imports_dump_coverage(FILE *out);

@@ -5,6 +5,7 @@
 #include "seh.h"
 #include "profile.h"
 #include "mods_seam.h"
+#include "../platform/os.h"
 
 // Defined in kernel32.cpp with the scheduler.
 void sched_checkpoint();
@@ -13,6 +14,7 @@ void sched_checkpoint();
 #include <map>
 #include <set>
 #include <cctype>
+#include <chrono>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -26,9 +28,29 @@ struct Tramp {
     uint8_t argc = 0;
     void (*fn)(X86 *) = nullptr;
     uint32_t calls = 0;
+    // Wall time, in nanoseconds, an import's shim spent inside itself (`self`)
+    // and inside the whole dispatch, dispatch overhead included (`total`).
+    // Filled only under RECOMP_IMPORT_TIME; see imports_dump_time.
+    uint64_t prof_self_ns = 0;
+    uint64_t prof_total_ns = 0;
     // Entered without a scheduling checkpoint (see atomic_import).
     bool atomic = false;
 };
+
+// RECOMP_IMPORT_TIME=1 accumulates per-import wall time and prints the top
+// entries at exit. It is off by default, and off it costs one predictable
+// branch per import call. It exists because `sample` is unreliable on the real
+// app: this attributes the win32 surface directly, with no host stack to read.
+const bool g_import_time = [] {
+    const char *v = recomp_env("IMPORT_TIME");
+    return v && *v && *v != '0';
+}();
+
+uint64_t import_now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 // Imports whose callers have just set up state the call reads back, with no
 // import in between: a thread switch at their entry checkpoint would let
@@ -286,6 +308,26 @@ void imports_dump_stats(FILE *out) {
         fprintf(out, "  %8u  %-40s %s\n", t->calls, t->desc.c_str(), t->fn ? "" : "(logging only)");
 }
 
+void imports_dump_time(FILE *out) {
+    std::vector<const Tramp *> v;
+    uint64_t total = 0;
+    for (const Tramp &t : tramps())
+        if (t.prof_total_ns) {
+            v.push_back(&t);
+            total += t.prof_total_ns;
+        }
+    std::sort(v.begin(), v.end(),
+              [](const Tramp *a, const Tramp *b) { return a->prof_total_ns > b->prof_total_ns; });
+    fprintf(out, "import time (total %.3f s over %zu imports, RECOMP_IMPORT_TIME):\n", total / 1e9,
+            v.size());
+    for (const Tramp *t : v) {
+        uint32_t calls = t->calls ? t->calls : 1;
+        fprintf(out, "  %8.1f ms  self %7.1f ms  %6.1f us/call  %8u calls  %s\n",
+                t->prof_total_ns / 1e6, t->prof_self_ns / 1e6, t->prof_total_ns / 1e3 / calls,
+                t->calls, t->desc.c_str());
+    }
+}
+
 void imports_coverage(uint32_t *implemented, uint32_t *logging_only, uint32_t *unknown_argc) {
     uint32_t impl = 0, log_only = 0, unknown = 0;
     for (const Tramp &t : tramps()) {
@@ -403,6 +445,7 @@ void imports_call_leaves_surfaces() {
 bool imports_dispatch(X86 *c, uint32_t target) {
     if (!imports_is_trampoline(target))
         return false;
+    uint64_t prof_t0 = g_import_time ? import_now_ns() : 0;
     // A bounded scheduling checkpoint. Cooperative threads must not depend on
     // the guest happening to call a blocking API: the frame limiter spins on
     // GetTickCount and would otherwise starve the service threads for as long
@@ -438,6 +481,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     uint32_t ret_addr = rd32(c->r[R_ESP]);
     LOGV("-> %s (esp=%08x ret=%08x)", desc, c->r[R_ESP], ret_addr);
     recomp_seh_validate_chain(c, "import enter", desc);
+    uint64_t prof_t1 = g_import_time ? import_now_ns() : 0;
 
     // The arguments as they are NOW, before the shim runs: a stdcall shim pops
     // them, so after the call they are gone and this is the only point they
@@ -469,6 +513,7 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     // Read after the shim ran, so the pointer is into the table as it is now.
     if (g_return_observer)
         g_return_observer(desc, c->r[R_EAX]);
+    uint64_t prof_t2 = g_import_time ? import_now_ns() : 0;
     LOGV("<- %s (eax=%08x)", desc, c->r[R_EAX]);
 
     uint32_t pop = 4;
@@ -488,6 +533,11 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     c->r[R_ESP] += pop;
     c->eip = ret_addr;
     recomp_seh_validate_chain(c, "import leave", desc);
+    if (g_import_time) {
+        Tramp &tr = tramps()[idx];
+        tr.prof_self_ns += prof_t2 - prof_t1;
+        tr.prof_total_ns += import_now_ns() - prof_t0;
+    }
     return true;
 }
 

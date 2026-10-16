@@ -19,6 +19,16 @@
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <time.h>
+// Darwin gates ucontext.h behind _XOPEN_SOURCE; scope the define to this one
+// include so the other platform headers keep their default feature set. The
+// sampling profiler reads the interrupted program counter from here.
+#ifdef __APPLE__
+#define _XOPEN_SOURCE 700
+#include <ucontext.h>
+#undef _XOPEN_SOURCE
+#else
+#include <ucontext.h>
+#endif
 #include <unistd.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -392,6 +402,127 @@ void os_sleep_us(uint64_t us) {
 
 int os_strcasecmp(const char *a, const char *b) {
     return strcasecmp(a, b);
+}
+
+// --- Sampling profiler -----------------------------------------------------
+// A CPU-time interval timer (ITIMER_PROF) delivers SIGPROF only while the
+// process is actually running, and the handler records the interrupted program
+// counter in a lock-free (single writer) open-addressed table. A wall-clock
+// timer, or Mach thread_get_state with a suspend/resume per sample, both charge
+// the profile for time the process spent blocked; ITIMER_PROF does not. The
+// signal is process-directed, so a sample that lands on another thread is
+// counted and dropped rather than attributed to this one (os_sample_dump
+// reports how many). Resolution is done at dump time with dladdr.
+namespace {
+struct PcSample {
+    uintptr_t pc;
+    uint32_t count;
+};
+// Power of two. A program counter that cannot find a slot is dropped, which is
+// the right trade for a profiler: the table only has to be large enough for the
+// hot set.
+const uint32_t kPcTableSize = 1u << 16;
+PcSample *pc_table() {
+    static PcSample *t = (PcSample *)calloc(kPcTableSize, sizeof(PcSample));
+    return t;
+}
+sig_atomic_t g_sample_total = 0;
+sig_atomic_t g_sample_off_thread = 0;
+int g_sample_armed = 0;
+pthread_t g_sample_target;
+
+void pc_record(uintptr_t pc) {
+    PcSample *t = pc_table();
+    if (!t)
+        return;
+    uint32_t h = (uint32_t)((pc >> 2) * 2654435761u) & (kPcTableSize - 1);
+    for (uint32_t i = 0; i < 64; ++i) {
+        PcSample &e = t[(h + i) & (kPcTableSize - 1)];
+        if (e.pc == pc) {
+            ++e.count;
+            return;
+        }
+        if (e.pc == 0) {
+            e.pc = pc;
+            e.count = 1;
+            return;
+        }
+    }
+}
+void sigprof_handler(int, siginfo_t *, void *ctx) {
+    if (pthread_self() != g_sample_target) {
+        ++g_sample_off_thread;
+        return;
+    }
+    ucontext_t *uc = (ucontext_t *)ctx;
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+    pc_record((uintptr_t)uc->uc_mcontext->__ss.__pc);
+#elif defined(__APPLE__)
+    pc_record((uintptr_t)uc->uc_mcontext->__ss.__rip);
+#elif defined(__x86_64__)
+    pc_record((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+#else
+    pc_record((uintptr_t)uc->uc_mcontext.pc);
+#endif
+    ++g_sample_total;
+}
+int pc_desc_compare(const void *a, const void *b) {
+    uint32_t ca = ((const PcSample *)a)->count, cb = ((const PcSample *)b)->count;
+    return ca < cb ? 1 : (ca > cb ? -1 : 0);
+}
+} // namespace
+
+int os_sample_start(void) {
+    if (g_sample_armed)
+        return 1;
+    if (!pc_table())
+        return 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sigprof_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPROF, &sa, nullptr) != 0)
+        return 0;
+    g_sample_target = pthread_self();
+    struct itimerval it;
+    memset(&it, 0, sizeof it);
+    it.it_interval.tv_usec = 1000; // 1 kHz of process CPU time
+    it.it_value = it.it_interval;
+    if (setitimer(ITIMER_PROF, &it, nullptr) != 0)
+        return 0;
+    g_sample_armed = 1;
+    return 1;
+}
+
+void os_sample_dump(void *out_file) {
+    FILE *out = (FILE *)out_file;
+    if (!g_sample_armed || !out)
+        return;
+    struct itimerval off;
+    memset(&off, 0, sizeof off);
+    setitimer(ITIMER_PROF, &off, nullptr);
+    g_sample_armed = 0;
+    PcSample *t = pc_table();
+    // Pack the used entries, then rank by count.
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < kPcTableSize; ++i)
+        if (t[i].pc)
+            t[used++] = t[i];
+    qsort(t, used, sizeof(PcSample), pc_desc_compare);
+    uint32_t total = g_sample_total ? (uint32_t)g_sample_total : 1;
+    fprintf(out,
+            "profile: %d CPU-time PC samples on the sampling thread (%d on other threads), "
+            "%u distinct\n",
+            (int)g_sample_total, (int)g_sample_off_thread, used);
+    for (uint32_t i = 0; i < used && i < 40; ++i) {
+        Dl_info info;
+        const char *sym = "?";
+        if (dladdr((void *)t[i].pc, &info) && info.dli_sname)
+            sym = info.dli_sname;
+        fprintf(out, "profile: %6.2f%% %8u %s pc=%#lx\n", 100.0 * t[i].count / total, t[i].count,
+                sym, (unsigned long)t[i].pc);
+    }
 }
 
 int os_setenv(const char *name, const char *value) {

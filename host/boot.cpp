@@ -571,6 +571,12 @@ void boot_run() {
     g_t0 = now_seconds();
     os_thread_prefer_performance();
     g_guest_thread = os_thread_self();
+    // RECOMP_SAMPLE=1 arms the in-process PC sampler on the guest thread; the
+    // ranked hot addresses print at exit. It is the only profiler that works
+    // here: `sample` gets a couple of samples from this 20-thread process.
+    if (recomp_env("SAMPLE"))
+        if (os_sample_start())
+            atexit([] { os_sample_dump(stderr); });
     g_guest_thread_known = true;
     g_bail_armed = true;
     if (g_opt.deadline_seconds > 0.0 || g_opt.close_watchdog_grace > 0.0) {
