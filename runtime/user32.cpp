@@ -2547,7 +2547,12 @@ void u_DialogBoxParamA(X86 *c) {
         w->update_pending = true;
     }
     dialog_running[hwnd] = true;
-    host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, init, 0);
+    // WM_INITDIALOG carries the dialog's creation parameter in lParam (wParam
+    // is the control to focus, which create_dialog_window already picked); the
+    // engine used to pass it in wParam, so a DLGPROC that reads lParam — the
+    // More Scenes list (FUN_00410410, selector 0x2cea) and the adoption pledge
+    // (template 164, the pet bitmap) — saw zero.
+    host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, 0, init);
     while (dialog_running.count(hwnd) && dialog_running[hwnd]) {
         host_pump_timers(c);
         pump_window_timers();
@@ -2624,7 +2629,7 @@ void u_CreateDialogParamA(X86 *c) {
         set_eax(c, 0);
         return;
     }
-    host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, init, 0);
+    host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, 0, init);
     set_eax(c, hwnd);
 }
 
