@@ -3962,7 +3962,56 @@ static void test_callbacks(X86 *c) {
     g_callback_hits = 0;
     check(call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 1,
           "a WNDPROC that ignores WM_PAINT leaves the region dirty and is asked again");
+    // A text or enabled-state change is a visible change Windows repaints on
+    // its own: SetWindowText/SetDlgItemText and EnableWindow do not need an
+    // explicit InvalidateRect from the program (the Petz Profile refills its
+    // statics exactly this way after Pick A Pet). ValidateRect clears the update
+    // region, so each mutation below starts from a clean window.
+    call_import(c, "USER32.dll", "ValidateRect", {pwnd, 0});
+    g_callback_hits = 0;
+    check(call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 0,
+          "a validated window has nothing to paint");
+    call_import(c, "USER32.dll", "SetWindowTextA", {pwnd, put_str("caption")});
+    g_callback_hits = 0;
+    check(call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 1,
+          "SetWindowTextA invalidates the window it renamed");
+    call_import(c, "USER32.dll", "ValidateRect", {pwnd, 0});
+    g_callback_hits = 0;
+    check(call_import(c, "USER32.dll", "EnableWindow", {pwnd, 0}) == 0 &&
+              call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 1,
+          "disabling a window invalidates it so the greyed state is drawn");
+    call_import(c, "USER32.dll", "ValidateRect", {pwnd, 0});
+    g_callback_hits = 0;
+    check(call_import(c, "USER32.dll", "EnableWindow", {pwnd, 1}) == 1 &&
+              call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 1,
+          "re-enabling a window invalidates it as well, and reports the old state");
+    while (call_import(c, "USER32.dll", "PeekMessageA", {msg, pwnd, 0x0003, 0x0005, 1})) {
+    }
     call_import(c, "USER32.dll", "DestroyWindow", {pwnd});
+
+    // A control paints into its parent's surface, so a parent's background fill
+    // must not be the last thing written over a control: the pump has to paint a
+    // window's pending ancestors before it. The child is created FIRST here, so
+    // window-handle order alone would pick it before its parent.
+    for (auto &kv : user32::windows())
+        kv.second.update_pending = false;
+    uint32_t order_child =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, clsname, put_str("child"), 0x50000000u /*WS_CHILD|WS_VISIBLE*/, 0, 0, 64,
+                     24, 0, 0, 0x400000, 0});
+    uint32_t order_parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                        {0, clsname, put_str("parent"), 0x10000000u /*WS_VISIBLE*/,
+                                         0, 0, 200, 120, 0, 0, 0x400000, 0});
+    if (user32::Window *cw = user32::find_window(order_child))
+        cw->parent = order_parent;
+    check(order_child && order_parent && order_child < order_parent,
+          "a child with a lower handle than its parent, both invalidated");
+    call_import(c, "USER32.dll", "InvalidateRect", {order_child, 0, 1});
+    call_import(c, "USER32.dll", "InvalidateRect", {order_parent, 0, 1});
+    user32::Window *first = user32::first_paint_window();
+    check(first && first->hwnd == order_parent,
+          "the pending parent is painted before the pending child");
+    call_import(c, "USER32.dll", "DestroyWindow", {order_parent});
 
     // The stock interface font is a real proportional face, not the fixed 8x16
     // cells: Petz 5's own menu and pane paint selects

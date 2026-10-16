@@ -580,6 +580,8 @@ void u_ShowWindow(X86 *c) {
     set_eax(c, was ? 1 : 0);
     if (!was && w->visible)
         became_visible(w, cmd != 4 && cmd != 7 && cmd != 8); // SW_*NOACTIVATE keeps stacking
+    else if (was && !w->visible)
+        repaint_exposed_windows(); // hiding exposes what the window covered
 }
 
 // UpdateWindow sends WM_PAINT directly to the window procedure, synchronously,
@@ -917,8 +919,12 @@ void u_GetWindowLongA(X86 *c) {
 
 void u_SetWindowTextA(X86 *c) {
     Window *w = find_window(arg(c, 0));
-    if (w)
+    if (w) {
         w->title_utf8 = gm_str(arg(c, 1));
+        // SetWindowText sends WM_SETTEXT; a caption or control text change
+        // repaints the window, exactly as DefWindowProc's WM_SETTEXT does.
+        w->update_pending = true;
+    }
     set_eax(c, 1);
 }
 
@@ -952,6 +958,12 @@ bool msg_matches(const Msg &m, uint32_t filter_hwnd, uint32_t min_msg, uint32_t 
 // queued item consumed by PM_REMOVE. Only validation (normally BeginPaint)
 // makes it disappear. Hidden child hierarchies never receive synthesized paint.
 // The first window Windows would synthesise a WM_PAINT for, or null.
+//
+// A window's pending ANCESTORS come first. A control paints into its top-level
+// window's surface, so painting a control before its parent lets the parent's
+// background fill land on top of it; Windows has no such ordering because a
+// control owns its pixels. Returning the highest pending ancestor keeps the
+// parent's chrome and erase ahead of everything it contains.
 Window *first_paint_window() {
     for (auto &kv : windows()) {
         Window *w = &kv.second;
@@ -964,7 +976,15 @@ Window *first_paint_window() {
             ancestor = find_window(ancestor->parent);
         if (!ancestor || !ancestor->visible || hops > windows().size())
             continue;
-        return w;
+        // Walk back up while an ancestor is itself waiting to be painted. The
+        // ancestor need not be a WS_CHILD window: a control's parent is the
+        // dialog, which is not one.
+        Window *highest = w;
+        for (Window *up = find_window(w->parent); up && up->visible; up = find_window(up->parent)) {
+            if (up->update_pending && up->w > 0 && up->h > 0)
+                highest = up;
+        }
+        return highest;
     }
     return nullptr;
 }
@@ -1166,8 +1186,13 @@ void def_window_proc(X86 *c, bool wide) {
     Window *w = find_window(hwnd);
     switch (msg) {
     case 0x000c: // WM_SETTEXT
-        if (w)
+        if (w) {
             w->title_utf8 = wide ? gm_wstr(arg(c, 3)) : gm_str(arg(c, 3));
+            // Windows repaints a window whose text changed (the caption, or a
+            // static/button/edit's own client), which is what a program that
+            // fills a dialog with SetDlgItemTextA then shows expects.
+            w->update_pending = true;
+        }
         set_eax(c, w ? 1 : 0);
         return;
     case 0x000d: // WM_GETTEXT
@@ -2525,6 +2550,32 @@ skip_caption:
     gdi_release_window_dc(hwnd, hdc);
 }
 
+// One window the way the modal pump paints it: chrome and erase first, its own
+// WM_PAINT, then every visible child in z-order (recursively). A control has no
+// surface of its own - its DC writes into the top-level window's surface - so
+// without the children being repainted here, a parent's background fill would
+// be the last thing written over a control that happened to be painted first.
+// Windows does not have the ordering at all (each control owns its pixels);
+// repainting the subtree makes the frame the same whatever order the
+// invalidations arrived in, and one call now clears the whole subtree's update
+// regions instead of one window per pump pass.
+void paint_window_tree(X86 *c, uint32_t hwnd) {
+    paint_dialog_chrome(c, hwnd);
+    if (!find_window(hwnd))
+        return;
+    host_dispatch_to_wndproc(c, hwnd, 0x000f /* WM_PAINT */, 0, 0);
+    if (!find_window(hwnd))
+        return;
+    for (uint32_t child : window_z_order(hwnd)) {
+        Window *cw = find_window(child);
+        if (!cw || !cw->visible || !(cw->style & 0x40000000u) || cw->w <= 0 || cw->h <= 0)
+            continue;
+        paint_window_tree(c, child);
+        if (!find_window(hwnd))
+            return;
+    }
+}
+
 // A filled disc by horizontal spans (an integer midpoint form, no libm): the
 // radio glyph needs a ring and a dot and the runtime has no ellipse helper a
 // control paint can reach without an import.
@@ -3646,9 +3697,9 @@ void u_DialogBoxParamA(X86 *c) {
         // engine that only drains the queue never paints anything.
         if (Window *pw = first_paint_window()) {
             // The dialog's own frame and client background are painted before
-            // its client WM_PAINT, standing in for WM_NCPAINT/WM_ERASEBKGND.
-            paint_dialog_chrome(c, pw->hwnd);
-            host_dispatch_to_wndproc(c, pw->hwnd, 0x000f /* WM_PAINT */, 0, 0);
+            // its client WM_PAINT, standing in for WM_NCPAINT/WM_ERASEBKGND, and
+            // its children follow it (paint_window_tree).
+            paint_window_tree(c, pw->hwnd);
             continue;
         }
         if (!g_message_waiter) {

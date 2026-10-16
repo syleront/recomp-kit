@@ -133,6 +133,9 @@ void reorder_window(uint32_t hwnd, uint32_t after);
 void pump_mouse_input(X86 *c);
 void forget_window_services(uint32_t hwnd);
 bool destroy_window(X86 *c, uint32_t hwnd);
+// Ask every visible window to repaint: what a hidden or destroyed window
+// covered has to be drawn again (there is no damage region here).
+void repaint_exposed_windows();
 void client_origin(uint32_t hwnd, int32_t *x, int32_t *y);
 // A window's OUTER (frame) origin: like client_origin but without the
 // non-client insets. Equal to client_origin on every window without a frame.
@@ -161,6 +164,16 @@ bool close_box_request(X86 *c, uint32_t hwnd);
 // client WM_PAINT, exactly as the modal pump does. Exposed so a test can render
 // a dialog to an offscreen surface without running the pump.
 void paint_dialog_chrome(X86 *c, uint32_t hwnd);
+// Paint one window the way the modal pump does: its chrome and background
+// erase, its own WM_PAINT, and then its visible children in z-order. A control
+// has no surface of its own - its DC writes into the top-level window's surface
+// - so a parent's background fill would otherwise be the last thing written over
+// a control that was painted first. Windows never has that problem (a control
+// owns its pixels), which is why the runtime repaints the children right after
+// the parent: the result no longer depends on the order invalidations arrived
+// in. The pump's paint order (see first_paint_window) puts a window's pending
+// ancestors before it as well.
+void paint_window_tree(X86 *c, uint32_t hwnd);
 // Registers the dialog control classes ("button", "edit", "listbox", ...) on
 // first use. The message loop calls it before a dialog is created; a direct
 // CreateWindowExA of a control class has to as well.

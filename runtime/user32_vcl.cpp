@@ -219,6 +219,16 @@ void pump_window_timers() {
         t.due = now + t.interval;
     }
 }
+// Windows repaints whatever a hidden or destroyed window was covering. There is
+// no damage region here - a window paints whole - so every other visible window
+// is asked to repaint. Without this a popup menu that closes while nothing else
+// invalidates keeps its pixels in the host's last presented frame: the frame is
+// only recomposed when some window is dirty.
+void repaint_exposed_windows() {
+    for (auto &kv : windows())
+        if (kv.second.visible)
+            kv.second.update_pending = true;
+}
 // Snapshot children before callbacks: WM_DESTROY/WM_NCDESTROY can recursively
 // destroy another window, change parentage or create a new window.
 bool destroy_window(X86 *c, uint32_t hwnd) {
@@ -255,6 +265,7 @@ bool destroy_window(X86 *c, uint32_t hwnd) {
     if (g_main_hwnd == hwnd)
         g_main_hwnd = windows().empty() ? 0 : windows().begin()->first;
     destroying.erase(hwnd);
+    repaint_exposed_windows();
     return true;
 }
 void client_origin(uint32_t hwnd, int32_t *x, int32_t *y) {
@@ -487,7 +498,14 @@ void enable_window(X86 *c) {
     Window *w = find_window(arg(c, 0));
     bool disabled = w && !w->enabled;
     if (w) {
-        w->enabled = arg(c, 1) != 0;
+        bool enable = arg(c, 1) != 0;
+        // Windows repaints the window when the enabled state changes: the
+        // greyed caption or bevel of a disabled control has to appear (and go
+        // away again), which is a visible state a program sets without ever
+        // calling InvalidateRect.
+        if (enable != w->enabled)
+            w->update_pending = true;
+        w->enabled = enable;
         if (w->enabled)
             w->style &= ~0x08000000u;
         else
@@ -2128,8 +2146,7 @@ int32_t run_popup_menu(X86 *c, uint32_t hmenu, uint32_t flags, int32_t x, int32_
         if (dispatched)
             continue;
         if (Window *pw = first_paint_window()) {
-            paint_dialog_chrome(c, pw->hwnd);
-            host_dispatch_to_wndproc(c, pw->hwnd, 0x000f /* WM_PAINT */, 0, 0);
+            paint_window_tree(c, pw->hwnd);
             continue;
         }
         if (!g_message_waiter) {
