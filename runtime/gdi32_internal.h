@@ -41,6 +41,27 @@ struct Object {
     std::array<uint8_t, 92> logfont{};
     Rect rect{};
 };
+// A DC prepared for many pixel reads and writes. Resolving a DC's storage
+// (borrowed DIB or window surface), the origin delta and the client bounds is
+// the same for every pixel of a blit, so it is done once here instead of per
+// pixel - the per-pixel walk of the window hierarchy was what made a software
+// blit cost as much as the whole frame. `dib` stays opaque: it points at
+// gdi32.cpp's guest DIB storage. Valid only while no window or DC is created
+// or moved, which holds for the duration of a blit under the baton.
+struct PixelTarget {
+    DeviceContext *dc = nullptr;
+    void *dib = nullptr; // guest DIB storage, or null when the DC names a window
+    Surface *surface = nullptr;
+    int64_t w = 0, h = 0;
+    int64_t off_x = 0, off_y = 0; // added to a DC coordinate to reach storage
+    Rect bounds{};                // client bounds in DC coordinates (no DIB)
+};
+bool prepare_target(uint32_t dc, PixelTarget *target);
+bool read_target(const PixelTarget &target, int64_t x, int64_t y, uint32_t *pixel,
+                 bool preserve_alpha = false);
+bool write_target(const PixelTarget &target, int64_t x, int64_t y, uint32_t pixel,
+                  bool blend = false);
+
 std::map<uint32_t, DeviceContext> &dcs();
 DeviceContext *dc_of(uint32_t dc);
 std::map<uint32_t, Object> &objects();

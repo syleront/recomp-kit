@@ -74,6 +74,13 @@ bool blit(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src
         return true;
     if (uint64_t(right - left) * (bottom - top) > GUEST_SIZE / 4)
         return false;
+    // The source's and destination's per-DC state is the same for every pixel
+    // of the blit, so resolve it once. This is the difference between a frame
+    // that fits its 50 ms timer and one that misses it: the per-pixel path
+    // walked the window hierarchy and (before) heap-allocated on each access.
+    PixelTarget src_t, dst_t;
+    if (!prepare_target(src, &src_t) || !prepare_target(dst, &dst_t))
+        return false;
     struct Sample {
         uint32_t p = 0;
         bool valid = false;
@@ -88,7 +95,7 @@ bool blit(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src
             int64_t py = sh < 0 ? int64_t(sy) - 1 - iy * std::abs(int64_t(sh)) / height
                                 : int64_t(sy) + iy * sh / height;
             auto &sample = copy[size_t((yy - top) * (right - left) + xx - left)];
-            sample.valid = read_pixel(src, px, py, &sample.p);
+            sample.valid = read_target(src_t, px, py, &sample.p);
         }
     // Colour and monochrome are converted, not colour-matched: blitting into a
     // 1-bit bitmap turns every pixel of the source's background colour white
@@ -118,7 +125,7 @@ bool blit(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src
         for (int64_t xx = left; xx < right; ++xx) {
             auto &sample = copy[size_t((yy - top) * (right - left) + xx - left)];
             uint32_t old;
-            if (!sample.valid || !read_pixel(dst, xx, yy, &old))
+            if (!sample.valid || !read_target(dst_t, xx, yy, &old))
                 continue;
             unsigned index = (rop >> 16) & 255;
             if (mask) {
@@ -129,7 +136,7 @@ bool blit(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src
                     continue;
                 index = set ? index : (rop >> 24) & 255;
             }
-            write_pixel(dst, xx, yy, raster(index, pattern, sample.p, old));
+            write_target(dst_t, xx, yy, raster(index, pattern, sample.p, old));
         }
     return true;
 }
@@ -216,11 +223,16 @@ void patblt(X86 *c) {
     Rect clip = clip_box(dc);
     int64_t r = int64_t(si(c, 1)) + si(c, 3), b = int64_t(si(c, 2)) + si(c, 4);
     uint32_t p = brush(dc);
+    PixelTarget target;
+    if (!prepare_target(dc, &target)) {
+        set_eax(c, 0);
+        return;
+    }
     for (int64_t y = std::max(si(c, 2), clip.t); y < std::min<int64_t>(b, clip.b); ++y)
         for (int64_t x = std::max(si(c, 1), clip.l); x < std::min<int64_t>(r, clip.r); ++x) {
             uint32_t old;
-            if (read_pixel(dc, x, y, &old))
-                write_pixel(dc, x, y, raster((arg(c, 5) >> 16) & 255, p, 0, old));
+            if (read_target(target, x, y, &old))
+                write_target(target, x, y, raster((arg(c, 5) >> 16) & 255, p, 0, old));
         }
     set_eax(c, 1);
 }

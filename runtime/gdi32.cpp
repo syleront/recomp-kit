@@ -293,12 +293,15 @@ bool gdi_draw_image(uint32_t dc, const GdiImage &image, int32_t x, int32_t y, in
     if (!dc_size(dc, &dw, &dh))
         return false;
     Rect clip = clip_box(dc);
+    PixelTarget target;
+    if (!prepare_target(dc, &target))
+        return false;
     for (int64_t yy = std::max<int64_t>(0, int64_t(clip.t) - y);
          yy < std::min<int64_t>({h, image.height, int64_t(clip.b) - y}); ++yy)
         for (int64_t xx = std::max<int64_t>(0, int64_t(clip.l) - x);
              xx < std::min<int64_t>({w, image.width, int64_t(clip.r) - x}); ++xx)
-            write_pixel(dc, int64_t(x) + xx, int64_t(y) + yy,
-                        image.pixels[size_t(yy) * image.width + xx], true);
+            write_target(target, int64_t(x) + xx, int64_t(y) + yy,
+                         image.pixels[size_t(yy) * image.width + xx], true);
     return true;
 }
 bool gdi_focus_rect(uint32_t dc, int32_t l, int32_t t, int32_t r, int32_t b) {
@@ -972,22 +975,21 @@ uint32_t raw_dib(const Dib &d, uint32_t at, int x) {
            : d.bpp == 24 ? rd8(at) | rd8(at + 1) << 8 | rd8(at + 2) << 16
                          : rd32(at);
 }
-// One path handles both borrowed DirectDraw pixels and owned guest DIBs.
-bool pixel(uint32_t hdc, int64_t x, int64_t y, uint32_t *p, bool write, bool blend,
-           bool preserve_alpha = false) {
-    auto *dc = dc_of(hdc);
-    if (!dc)
-        return false;
-    offset(*dc, &x, &y);
+// One path handles both borrowed DirectDraw pixels and owned guest DIBs. The
+// per-DC work (storage, origin delta, client bounds) is resolved by
+// prepare_target once; this is the inner loop a blit calls per pixel.
+bool pixel_at_impl(const PixelTarget &target, int64_t x, int64_t y, uint32_t *p, bool write,
+                   bool blend, bool preserve_alpha) {
+    DeviceContext *dc = target.dc;
+    x += target.off_x;
+    y += target.off_y;
     if (dc->clipped &&
         std::none_of(dc->clip.begin(), dc->clip.end(), [&](Rect r) { return contains(r, x, y); }))
         return false;
-    Dib *d = dib_in_dc(hdc);
-    Surface *s = d ? nullptr : surface_of(*dc);
-    int64_t w = d ? d->width : s ? s->w : 0;
-    int64_t h = d ? std::abs(int64_t(d->height)) : s ? s->h : 0;
-    if (x < 0 || y < 0 || x >= w || y >= h ||
-        (!d && !contains(client_bounds(*dc, int(w), int(h)), x, y)))
+    Dib *d = static_cast<Dib *>(target.dib);
+    Surface *s = target.surface;
+    int64_t w = target.w, h = target.h;
+    if (x < 0 || y < 0 || x >= w || y >= h || (!d && !contains(target.bounds, x, y)))
         return false;
     if (write && !d && std::any_of(dc->excluded.begin(), dc->excluded.end(), [&](Rect r) {
             return contains(r, x, y);
@@ -1072,6 +1074,38 @@ bool pixel(uint32_t hdc, int64_t x, int64_t y, uint32_t *p, bool write, bool ble
     return true;
 }
 } // namespace
+// Resolve everything a pixel operation needs from its DC once. `surface_of`
+// may resize the window surface here, which is why nothing else may move a
+// window between this and the last read_target/write_target that uses it.
+bool prepare_target(uint32_t hdc, PixelTarget *target) {
+    auto *dc = dc_of(hdc);
+    if (!dc)
+        return false;
+    target->dc = dc;
+    Dib *d = dib_in_dc(hdc);
+    target->dib = d;
+    target->surface = d ? nullptr : surface_of(*dc);
+    target->w = d ? d->width : target->surface ? target->surface->w : 0;
+    target->h = d ? std::abs(int64_t(d->height)) : target->surface ? target->surface->h : 0;
+    target->off_x = int64_t(dc->viewport_x) - dc->org_x;
+    target->off_y = int64_t(dc->viewport_y) - dc->org_y;
+    if (dc->window && dc->window != dc->surface) {
+        int32_t wx = 0, wy = 0, sx = 0, sy = 0;
+        user32::client_origin(dc->window, &wx, &wy);
+        user32::client_origin(dc->surface, &sx, &sy);
+        target->off_x += int64_t(wx) - sx;
+        target->off_y += int64_t(wy) - sy;
+    }
+    target->bounds = d ? Rect{} : client_bounds(*dc, int(target->w), int(target->h));
+    return true;
+}
+bool read_target(const PixelTarget &target, int64_t x, int64_t y, uint32_t *pixel,
+                 bool preserve_alpha) {
+    return pixel_at_impl(target, x, y, pixel, false, false, preserve_alpha);
+}
+bool write_target(const PixelTarget &target, int64_t x, int64_t y, uint32_t pixel, bool blend) {
+    return pixel_at_impl(target, x, y, &pixel, true, blend, false);
+}
 bool dc_is_monochrome(uint32_t dc) {
     auto *d = dib_in_dc(dc);
     return d && d->bpp == 1;
@@ -1097,10 +1131,13 @@ bool mask_bit(uint32_t bitmap, int64_t x, int64_t y, bool *set) {
     return true;
 }
 bool read_pixel(uint32_t dc, int64_t x, int64_t y, uint32_t *p, bool preserve_alpha) {
-    return pixel(dc, x, y, p, false, false, preserve_alpha);
+    PixelTarget target;
+    return prepare_target(dc, &target) &&
+           pixel_at_impl(target, x, y, p, false, false, preserve_alpha);
 }
 bool write_pixel(uint32_t dc, int64_t x, int64_t y, uint32_t p, bool blend) {
-    return pixel(dc, x, y, &p, true, blend);
+    PixelTarget target;
+    return prepare_target(dc, &target) && pixel_at_impl(target, x, y, &p, true, blend, false);
 }
 bool drawable(uint32_t dc, int64_t x, int64_t y) {
     uint32_t p;
@@ -1148,9 +1185,14 @@ Rect clip_box(uint32_t hdc) {
 }
 void fill(uint32_t dc, Rect r, uint32_t p) {
     Rect clip = clip_box(dc);
+    // One preparation for the whole rectangle: a fill is a rectangle's worth
+    // of pixels against one DC.
+    PixelTarget target;
+    if (!prepare_target(dc, &target))
+        return;
     for (int64_t y = std::max(r.t, clip.t); y < std::min(r.b, clip.b); ++y)
         for (int64_t x = std::max(r.l, clip.l); x < std::min(r.r, clip.r); ++x)
-            write_pixel(dc, x, y, p);
+            write_target(target, x, y, p);
 }
 } // namespace gdi
 

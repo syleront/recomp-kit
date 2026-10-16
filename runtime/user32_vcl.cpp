@@ -209,8 +209,26 @@ bool destroy_window(X86 *c, uint32_t hwnd) {
 }
 void client_origin(uint32_t hwnd, int32_t *x, int32_t *y) {
     *x = *y = 0;
-    std::set<uint32_t> seen;
-    while (hwnd && seen.insert(hwnd).second) {
+    // A window's origin is its own and every ancestor's position summed. This
+    // runs on the per-pixel GDI path (client_bounds, offset) where every
+    // window blit paid for it, and a std::set here was a heap allocation per
+    // call - enough to make a software blit miss the game's frame timer. The
+    // ancestor chain is a handful of windows deep, so a small fixed ring of
+    // visited handles stops a malformed cycle without allocating.
+    constexpr size_t kMaxWindowChain = 64;
+    uint32_t seen[kMaxWindowChain];
+    size_t seen_n = 0;
+    while (hwnd) {
+        bool repeat = false;
+        for (size_t i = 0; i < seen_n; ++i)
+            if (seen[i] == hwnd) {
+                repeat = true;
+                break;
+            }
+        if (repeat)
+            break;
+        if (seen_n < kMaxWindowChain)
+            seen[seen_n++] = hwnd;
         Window *w = find_window(hwnd);
         if (!w)
             break;
@@ -1167,7 +1185,7 @@ uint32_t parse_menuex_level(uint32_t p, uint32_t end, Menu &menu) {
         item.state = state;
         item.id = id;
         item.text = text;
-        if (flags & 0x10) { // MF_POPUP
+        if (flags & 0x10) {    // MF_POPUP
             p = (p + 3) & ~3u; // MENUEX items are DWORD-aligned
             uint32_t sub = new_menu();
             item.submenu = sub;
