@@ -139,16 +139,28 @@ void ensure_system_classes();
 // parent's WM_CTLCOLORSTATIC brush, then the text). Shared with the dialog
 // engine's control_proc.
 void paint_control(X86 *c, uint32_t hwnd, uint32_t into);
-// Paints an EDIT control: the parent's WM_CTLCOLOREDIT brush (COLOR_WINDOW
-// when the dialog answers nothing) inside its sunken border, then the control's
-// own text. The dialog engine's control_proc calls it for an "edit" window.
+// Paints an EDIT control: the parent's WM_CTLCOLOREDIT brush (or
+// WM_CTLCOLORSTATIC for a read-only edit; COLOR_WINDOW when the dialog answers
+// nothing) inside its sunken border, then the control's own text in the
+// dialog's WM_SETFONT face. The dialog engine's control_proc calls it for an
+// "edit" window.
 void paint_edit(X86 *c, uint32_t hwnd, uint32_t into);
+// Builds a dialog and its controls from a DLGTEMPLATE that is already in guest
+// memory (address `tmpl`, `size` bytes), applying the template's DS_SETFONT
+// face to the dialog and each control. The resource entry points share this
+// path; the separate seam lets a test exercise the font application directly.
+uint32_t create_dialog_from_template(X86 *c, uint32_t hinst, uint32_t parent, uint32_t proc,
+                                     uint32_t tmpl, uint32_t size);
 } // namespace user32
 
 // The close box's rule (DefDlgProc): WM_COMMAND IDCANCEL, then WM_CLOSE when
 // the dialog procedure does not end the dialog. A global so the input layer
 // reaches it without the dialog engine's maps.
 bool close_box_request(X86 *c, uint32_t hwnd);
+// Paints a framed dialog's non-client chrome and client background before its
+// client WM_PAINT, exactly as the modal pump does. Exposed so a test can render
+// a dialog to an offscreen surface without running the pump.
+void paint_dialog_chrome(X86 *c, uint32_t hwnd);
 // Registers the dialog control classes ("button", "edit", "listbox", ...) on
 // first use. The message loop calls it before a dialog is created; a direct
 // CreateWindowExA of a control class has to as well.

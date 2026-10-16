@@ -353,10 +353,7 @@ namespace gdi {
 // its TEXTMETRIC; the runtime measures the same font it will draw the dialog
 // with. False when the face has no measurable font (a raster face such as
 // System), so the caller keeps the 8x16 bitmap cell.
-bool font_dialog_units(const std::string &face, int32_t point_size, int32_t weight,
-                       int32_t *ave_width, int32_t *cell_height) {
-    if (face.empty() || point_size <= 0)
-        return false;
+Object dialog_font_object(const std::string &face, int32_t point_size, int32_t weight) {
     Object font;
     font.kind = Object::Font;
     int32_t height = -int32_t((int64_t(point_size) * 96 + 36) / 72); // MulDiv(pt, 96, 72)
@@ -365,7 +362,13 @@ bool font_dialog_units(const std::string &face, int32_t point_size, int32_t weig
     memcpy(font.logfont.data() + 16, &w, 4);
     for (size_t i = 0; i < 31 && i < face.size(); ++i)
         font.logfont[28 + 2 * i] = uint8_t(face[i]);
-    Pen pen = pen_from_font(font);
+    return font;
+}
+bool font_dialog_units(const std::string &face, int32_t point_size, int32_t weight,
+                       int32_t *ave_width, int32_t *cell_height) {
+    if (face.empty() || point_size <= 0)
+        return false;
+    Pen pen = pen_from_font(dialog_font_object(face, point_size, weight));
     if (!pen.face || pen.metrics.average <= 0 || pen.metrics.height <= 0)
         return false;
     *ave_width = int32_t(pen.metrics.average);
