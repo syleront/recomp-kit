@@ -36,6 +36,54 @@ uint32_t raster(uint32_t code, uint32_t p, uint32_t s, uint32_t d) {
             out |= (i & 4 ? p : ~p) & (i & 2 ? s : ~s) & (i & 1 ? d : ~d);
     return out | 0xff000000;
 }
+// The ROP3 codes a blit actually uses, so its inner loop does not expand the
+// eight-term truth table per pixel. Each is the same value the loop above
+// produces (SRCCOPY = S, SRCINVERT = S^D, NOTSRCCOPY = ~S, SRCAND = S&D,
+// SRCPAINT = S|D, WHITENESS = 1, BLACKNESS = 0). Returns false for a code with
+// no fast form, when the caller falls back to raster().
+bool raster_common(uint32_t code, uint32_t s, uint32_t d, uint32_t *out) {
+    switch (code) {
+    case 0xcc:
+        *out = s | 0xff000000u;
+        return true;
+    case 0x66:
+        *out = (s ^ d) | 0xff000000u;
+        return true;
+    case 0x33:
+        *out = (~s) | 0xff000000u;
+        return true;
+    case 0x88:
+        *out = (s & d) | 0xff000000u;
+        return true;
+    case 0xee:
+        *out = (s | d) | 0xff000000u;
+        return true;
+    case 0xff:
+        *out = 0xffffffffu;
+        return true;
+    case 0x00:
+        *out = 0xff000000u;
+        return true;
+    default:
+        return false;
+    }
+}
+// The common codes whose result does not depend on the destination, so the
+// inner loop can skip read_target (and its clipping check) for every pixel.
+bool rop_ignores_dst(uint32_t code) {
+    return code == 0xcc || code == 0x33 || code == 0x00 || code == 0xff;
+}
+// A blit snapshots its source before writing the destination, because the two
+// may be the same surface (a sprite scrolled in place). The snapshot is reused:
+// a fresh vector per blit was a malloc/free pair per sprite, thousands a second.
+struct BlitSample {
+    uint32_t p = 0;
+    bool valid = false;
+};
+std::vector<BlitSample> &blit_scratch() {
+    static thread_local std::vector<BlitSample> v;
+    return v;
+}
 uint32_t brush(uint32_t dc) {
     uint32_t p = 0;
     auto *d = dc_of(dc);
@@ -81,11 +129,8 @@ bool blit(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src
     PixelTarget src_t, dst_t;
     if (!prepare_target(src, &src_t) || !prepare_target(dst, &dst_t))
         return false;
-    struct Sample {
-        uint32_t p = 0;
-        bool valid = false;
-    };
-    std::vector<Sample> copy(size_t((right - left) * (bottom - top)));
+    std::vector<BlitSample> &copy = blit_scratch();
+    copy.resize(size_t((right - left) * (bottom - top)));
     for (int64_t yy = top; yy < bottom; ++yy)
         for (int64_t xx = left; xx < right; ++xx) {
             int64_t ix = w < 0 ? int64_t(x) - 1 - xx : xx - x,
@@ -121,22 +166,33 @@ bool blit(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src
                 sample.p = 0xff000000u | ((sample.p & 0xffffffu) ? dst_bk : dst_text);
         }
     uint32_t pattern = brush(dst);
+    const unsigned index = (rop >> 16) & 255;
+    // An unmasked blit with a common ROP needs no truth-table expansion, and one
+    // whose result does not depend on the destination needs no destination read.
+    const bool fast_rop = !mask && !to_mono && !from_mono;
+    const bool skip_dst_read = fast_rop && rop_ignores_dst(index);
     for (int64_t yy = top; yy < bottom; ++yy)
         for (int64_t xx = left; xx < right; ++xx) {
             auto &sample = copy[size_t((yy - top) * (right - left) + xx - left)];
-            uint32_t old;
-            if (!sample.valid || !read_target(dst_t, xx, yy, &old))
+            if (!sample.valid)
                 continue;
-            unsigned index = (rop >> 16) & 255;
+            uint32_t old = 0;
+            if (!skip_dst_read && !read_target(dst_t, xx, yy, &old))
+                continue;
+            unsigned code = index;
             if (mask) {
                 bool set = true;
                 // A mask bit outside the bitmap leaves the pixel alone rather
                 // than guessing an operation for it.
                 if (!mask_bit(mask, int64_t(mx) + xx - x, int64_t(my) + yy - y, &set))
                     continue;
-                index = set ? index : (rop >> 24) & 255;
+                code = set ? index : (rop >> 24) & 255;
             }
-            write_target(dst_t, xx, yy, raster(index, pattern, sample.p, old));
+            uint32_t value;
+            if (fast_rop && raster_common(code, sample.p, old, &value))
+                write_target(dst_t, xx, yy, value);
+            else
+                write_target(dst_t, xx, yy, raster(code, pattern, sample.p, old));
         }
     return true;
 }
