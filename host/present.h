@@ -87,6 +87,14 @@ struct HostGameRect host_present_current_game_rect(void);
 // (negative, or past its size): the gate treats such a point as off the game.
 void host_present_point_to_game(struct HostGameRect rect, int32_t x, int32_t y, int32_t *out_x,
                                 int32_t *out_y);
+// The inverse of the presenter's window transform: a window point (in window
+// points) as a pixel of the game rectangle (in drawable pixels). `bw,bh` are
+// the window's size in points and `dw,dh` in drawable pixels. Returns 1 when
+// the point is inside the rectangle; a point in a letterbox bar returns 0 with
+// a coordinate off the rectangle. One function for every input event, so window
+// points, drawable pixels and the game rectangle can never disagree.
+int host_present_window_point_to_frame(int bw, int bh, int dw, int dh, struct HostGameRect rect,
+                                       double px, double py, int32_t *out_x, int32_t *out_y);
 
 // ---------------------------------------------------------------------------
 // Frame dumps, for looking at actual pixels instead of describing them.

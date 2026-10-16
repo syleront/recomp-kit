@@ -137,8 +137,17 @@ void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
         return;
     }
     if (msg >= 0x200 && msg <= 0x209) {
-        host_post_client_mouse_message(host_main_window(), msg, wparam, int16_t(lparam),
-                                       int16_t(lparam >> 16));
+        // A gate hit is already a GUEST SCREEN pixel: the presenter composes
+        // the guest image into a frame rooted at the guest screen origin
+        // (present.h; gdi_present_windows draws the whole screen from 0,0),
+        // and `hit.gx/gy` comes back in that frame. The runtime routes a mouse
+        // message by that screen point and converts it to the client pixels of
+        // the window under it (pump_mouse_input), so this must stay screen
+        // rooted. Feeding it as the CLIENT pixels of host_main_window() instead
+        // added the first window's client origin: Catz 5's first window is an
+        // off-screen 80x80 WS_POPUP helper at (-100,-100), so every event
+        // arrived 100 px up and left of the pointer.
+        host_post_mouse_message(msg, wparam, int16_t(lparam), int16_t(lparam >> 16));
         return;
     }
     uint32_t hwnd = host_main_window();
@@ -229,8 +238,13 @@ void view_point_to_drawable(double px, double py, int32_t *out_x, int32_t *out_y
         x = host_confined_pointer_pixel(px, g_pointer_confinement.x, g_pointer_confinement.w, dw);
         y = host_confined_pointer_pixel(py, g_pointer_confinement.y, g_pointer_confinement.h, dh);
     } else {
-        x = (int32_t)floor(px / bw * dw);
-        y = (int32_t)floor(py / bh * dh);
+        // One inverse of the presenter's transform for every event: window
+        // points -> drawable pixels -> the game rectangle. A letterboxed point
+        // clamps to the nearest edge.
+        host_present_window_point_to_frame(bw, bh, dw, dh, rect, px, py, out_x, out_y);
+        *width = rect.w;
+        *height = rect.h;
+        return;
     }
     host_present_point_to_game(rect, x, y, out_x, out_y);
     *width = rect.w;
@@ -1276,8 +1290,60 @@ controls::Screen controls_screen() {
     return s;
 }
 
+// A synthetic pointer, so the windowed input path can be tested where no
+// window server exists (this environment has none: a real pointer never enters
+// the window and a full-desktop capture is black). RECOMP_MOUSE_SYNTH is a
+// semicolon-separated list of window points "x,y"; one SDL_MOUSEMOTION is
+// pushed every RECOMP_MOUSE_SYNTH_EVERY host turns (default 30), cycling the
+// list, so each move decodes through exactly the path a real move takes. A
+// test seam, like RECOMP_CLICKS on the headless host - not a game's input.
+void synth_pointer_tick() {
+    static const bool wanted = recomp_env("MOUSE_SYNTH") != nullptr;
+    if (!wanted || !g_window)
+        return;
+    struct SynthPoint {
+        int x, y;
+    };
+    static const std::vector<SynthPoint> points = [] {
+        std::vector<SynthPoint> out;
+        const char *spec = recomp_env("MOUSE_SYNTH");
+        for (const char *p = spec; p && *p;) {
+            char *end = nullptr;
+            const long x = strtol(p, &end, 10);
+            if (end == p || *end != ',')
+                break;
+            const long y = strtol(end + 1, &end, 10);
+            out.push_back({int(x), int(y)});
+            if (*end != ';')
+                break;
+            p = end + 1;
+        }
+        return out;
+    }();
+    if (points.empty())
+        return;
+    const char *ev = recomp_env("MOUSE_SYNTH_EVERY");
+    const uint32_t every = ev ? (uint32_t)std::max(1, atoi(ev)) : 30u;
+    static uint32_t turns = 0;
+    static size_t next = 0;
+    if (++turns % every)
+        return;
+    const SynthPoint pt = points[next++ % points.size()];
+    SDL_Event e{};
+    e.type = SDL_EVENT_MOUSE_MOTION;
+    e.motion.windowID = SDL_GetWindowID(g_window);
+    e.motion.x = (float)pt.x;
+    e.motion.y = (float)pt.y;
+    SDL_PushEvent(&e);
+    int bw = 0, bh = 0, dw = 0, dh = 0;
+    window_sizes(&bw, &bh, &dw, &dh);
+    fprintf(stderr, "[synth] mouse motion window (%d,%d) of %dx%d points\n", pt.x, pt.y, bw, bh);
+    fflush(stderr);
+}
+
 // The housekeeping every turn does once the events are in.
 void after_events() {
+    synth_pointer_tick();
     {
         // Time-based gestures (a long press) fire from the clock, not an event,
         // and deferred clicks go out once the game's cursor has caught up and

@@ -6144,6 +6144,56 @@ static void test_host_mouse_routing() {
         call_import(&c, "USER32.dll", "DestroyWindow", {w});
 }
 
+// A gate hit is a guest SCREEN point (the presenter composes the guest image
+// into a frame rooted at the screen origin), and the runtime routes it by that
+// point. Feeding it as the CLIENT pixels of the window the host believes is the
+// main one shifts the whole event: Catz 5's first window is an off-screen 80x80
+// WS_POPUP helper at (-100,-100), so the windowed build delivered every click
+// 100 px up and left of the pointer. This pins the two coordinate spaces and
+// the offset the removed call added; the window host now delivers screen
+// pixels.
+static void test_host_mouse_is_screen_rooted() {
+    section("a gate hit is a screen point, not the first window's client");
+    X86 c;
+    loader_init_context(&c);
+    uint32_t s = 0x00314000, msg = s + 0x200;
+    uint32_t proc = imports_alloc_trampoline(
+        "TEST", "ScreenRootProc", [](X86 *cc) { set_eax(cc, arg(cc, 1) == 0x81 ? 1 : 0); }, 4);
+    memset(g_mem + s, 0, 40);
+    wr32(s + 4, proc);
+    gm_put_wstr(s + 0x100, "ScreenRoot", 32);
+    wr32(s + 36, s + 0x100);
+    uint32_t cls = call_import(&c, "USER32.dll", "RegisterClassW", {s});
+    auto create = [&](uint32_t ex, uint32_t style, int x, int y, int w, int h) {
+        return call_import(&c, "USER32.dll", "CreateWindowExW",
+                           {ex, s + 0x100, 0, style, uint32_t(x), uint32_t(y), uint32_t(w),
+                            uint32_t(h), 0, 0, IMAGE_BASE, 0});
+    };
+    // The game's first top-level window is the off-screen helper; the frame it
+    // draws in is a second window at the origin.
+    uint32_t helper = create(8, 0x80000000u, -100, -100, 80, 80);
+    uint32_t render = create(0, 0x10000000u, 0, 0, 640, 480);
+    check(cls != 0 && helper && render,
+          "the helper and the render window exist (cls=%08x h=%08x r=%08x)", cls, helper, render);
+    // The gate hit (320,240) is a screen point: it must reach the render window
+    // at client (320,240), and GetCursorPos must keep the same screen point.
+    host_post_mouse_message(0x200, 0, 320, 240);
+    check(call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x209, 1}) == 1 &&
+              rd32(msg) == render && rd32(msg + 12) == ((240u << 16) | 320u) &&
+              rd32(msg + 20) == 320 && rd32(msg + 24) == 240,
+          "a screen-rooted hit reaches the render window's client unchanged");
+    call_import(&c, "USER32.dll", "GetCursorPos", {s + 0x300});
+    check(rd32(s + 0x300) == 320 && rd32(s + 0x304) == 240, "GetCursorPos keeps the screen point");
+    // The removed call took the point as the helper's client pixels and so
+    // added the helper's origin: the same input arrives up-left by (100,100).
+    host_post_client_mouse_message(helper, 0x200, 0, 320, 240);
+    check(call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x209, 1}) == 1 &&
+              rd32(msg) == render && rd32(msg + 12) == ((140u << 16) | 220u),
+          "the client-space call is the same event offset by the helper's origin");
+    call_import(&c, "USER32.dll", "DestroyWindow", {render});
+    call_import(&c, "USER32.dll", "DestroyWindow", {helper});
+}
+
 static void test_user32_services() {
     section("menus, scrollbars, clipboard, resources and drawing");
     X86 c;
@@ -6815,6 +6865,7 @@ int main(int argc, char **argv) {
     test_user32_vcl();
     test_user32_window_model();
     test_host_mouse_routing();
+    test_host_mouse_is_screen_rooted();
     test_user32_services();
     X86 *c = loader_context();
     if (child)

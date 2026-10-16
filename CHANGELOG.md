@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Deliver a windowed mouse event in guest screen pixels: the SDL host used to
+  add the first top-level window's client origin to the input gate's hit, which
+  shifted every click by that window's position (an off-screen helper meant all
+  clicks landed 100 px up-left). The gate's point is already screen-rooted, so
+  the runtime routes it and converts to the client pixels of the window under
+  it. The window→game-rectangle inversion is now one function,
+  `host_present_window_point_to_frame`. `RECOMP_MOUSE_SYNTH` pushes synthetic
+  motion through the real path for testing where no window server exists.
 - Drive a headless run with a script instead of one fixed click: `RECOMP_CLICKS`
   takes a `;`-separated list of `FRAME:x,y` clicks, `FRAME:x1,y1>x2,y2` drags,
   `FRAME:move=x,y` hovers and `FRAME:key=VK` key presses, and each press is held

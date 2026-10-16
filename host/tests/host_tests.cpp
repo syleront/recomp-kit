@@ -1052,6 +1052,67 @@ static void test_point_to_guest() {
     CHECK_EQ(y, 384);
 }
 
+// The window-to-game-rectangle inverse every windowed mouse event runs
+// through: the presenter's transform has to be inverted exactly, at 1x, at a
+// HiDPI 2x, through a letterbox, and through a rectangle that does not start
+// at the origin (a captioned window's client, or the portrait top inset).
+static void test_window_point_to_frame() {
+    int32_t x = -1, y = -1;
+    // 1x: a 640x480 window is a 640x480 drawable and the whole game rectangle.
+    CHECK_EQ(
+        host_present_window_point_to_frame(640, 480, 640, 480, {0, 0, 640, 480}, 320, 240, &x, &y),
+        1);
+    CHECK_EQ(x, 320);
+    CHECK_EQ(y, 240);
+    CHECK_EQ(host_present_window_point_to_frame(640, 480, 640, 480, {0, 0, 640, 480}, 0, 0, &x, &y),
+             1);
+    CHECK_EQ(x, 0);
+    CHECK_EQ(y, 0);
+
+    // 2x HiDPI: 640x480 points, 1280x960 pixels. The window point doubles into
+    // a drawable pixel, so a window point at the frame's middle is fro = 640.
+    CHECK_EQ(host_present_window_point_to_frame(640, 480, 1280, 960, {0, 0, 1280, 960}, 320, 240,
+                                                &x, &y),
+             1);
+    CHECK_EQ(x, 640);
+    CHECK_EQ(y, 480);
+    CHECK_EQ(host_present_window_point_to_frame(640, 480, 1280, 960, {0, 0, 1280, 960}, 639, 479,
+                                                &x, &y),
+             1);
+    CHECK_EQ(x, 1278);
+    CHECK_EQ(y, 958);
+
+    // Letterboxed: a 400x600 window showing a 640x480 game, the game rectangle
+    // inset to 1170x878 at y=141 in a 1170x2532 drawable. A window point maps
+    // into the rectangle, not the window.
+    const HostGameRect portrait = {0, 141, 1170, 878};
+    CHECK_EQ(host_present_window_point_to_frame(400, 600, 1170, 2532, portrait, 200, 200, &x, &y),
+             1);
+    CHECK_EQ(x, 585); // 200/400*1170
+    CHECK_EQ(y, 703); // 200/600*2532 - 141
+    // A point in the top bar is outside, with a y off the rectangle; the gate
+    // treats an off-rectangle point as off the game.
+    CHECK_EQ(host_present_window_point_to_frame(400, 600, 1170, 2532, portrait, 200, 10, &x, &y),
+             0);
+    CHECK_EQ(y, -99); // 10/600*2532 - 141
+    // A point in the bottom bar is past the rectangle's last row.
+    CHECK_EQ(host_present_window_point_to_frame(400, 600, 1170, 2532, portrait, 200, 590, &x, &y),
+             0);
+    CHECK_EQ(y, 2348); // 590/600*2532 - 141
+
+    // A rectangle offset into the drawable (a captioned window's client, or a
+    // safe-area inset) maps to its own origin, not the drawable's.
+    CHECK_EQ(host_present_window_point_to_frame(640, 480, 1280, 960, {0, 40, 1280, 880}, 320, 260,
+                                                &x, &y),
+             1);
+    CHECK_EQ(x, 640);
+    CHECK_EQ(y, 480);
+    CHECK_EQ(host_present_window_point_to_frame(640, 480, 1280, 960, {0, 40, 1280, 880}, 320, 40,
+                                                &x, &y),
+             1);
+    CHECK_EQ(y, 40);
+}
+
 static void test_message_translation() {
     // The wParam of a mouse message: the buttons, and Shift and Control.
     CHECK_EQ(host_mouse_wparam(0, 0), 0);
@@ -9900,6 +9961,7 @@ int main(int argc, char **argv) {
         {"smoke script", test_script_parsing},
         {"mouse move path", test_mouse_move_reaches_the_guest},
         {"point to guest", test_point_to_guest},
+        {"window point to frame", test_window_point_to_frame},
         {"audio arithmetic", test_audio_maths},
         {"frame rate meter", test_rate_meter},
         {"audio stop re-entry", test_audio_completion_during_stop},

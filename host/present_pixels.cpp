@@ -189,6 +189,35 @@ extern "C" void host_present_point_to_game(struct HostGameRect rect, int32_t x, 
         *out_y = y - rect.y;
 }
 
+// The inverse of the presenter's window transform, in one place. A window
+// point (an SDL event's x,y, in window POINTS) becomes a pixel of the game
+// rectangle (present.h), which is what every input path hit-tests against:
+// window points -> drawable pixels (the HiDPI points:pixels ratio) -> the game
+// rectangle in drawable pixels. `rect` carries the letterbox/pillarbox fit and
+// any top inset, so the result can fall outside it. Returns 1 when the point is
+// inside the rectangle; a point in a bar returns 0 with a coordinate off the
+// rectangle, which the gate treats as off the game. The gate then maps the
+// rectangle pixel onto the guest screen and the runtime converts a screen point
+// to the client pixels of the window under it.
+extern "C" int host_present_window_point_to_frame(int bw, int bh, int dw, int dh,
+                                                  struct HostGameRect rect, double px, double py,
+                                                  int32_t *out_x, int32_t *out_y) {
+    if (out_x)
+        *out_x = 0;
+    if (out_y)
+        *out_y = 0;
+    if (bw <= 0 || bh <= 0 || dw <= 0 || dh <= 0 || rect.w <= 0 || rect.h <= 0)
+        return 0;
+    const double dx = px / bw * dw, dy = py / bh * dh;
+    const bool inside = dx >= rect.x && dy >= rect.y && dx < double(rect.x) + rect.w &&
+                        dy < double(rect.y) + rect.h;
+    if (out_x)
+        *out_x = int32_t(std::floor(dx)) - rect.x;
+    if (out_y)
+        *out_y = int32_t(std::floor(dy)) - rect.y;
+    return inside ? 1 : 0;
+}
+
 extern "C" struct HostWindowSize host_window_size_for(int gw, int gh, int uw, int uh,
                                                       double density) {
     HostWindowSize s = {gw, gh, gw, gh};
