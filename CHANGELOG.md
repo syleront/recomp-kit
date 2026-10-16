@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Reach the host filesystem for a path chosen in a system file dialog. A chosen
+  path is a real host path, but the guest hands it straight back to
+  `CopyFileA`/`CreateFileA` and the overlay used to re-root it under the writable
+  root, so the file landed at a mangled path. `GetSaveFileNameA`/`GetOpenFileNameA`
+  now present the chosen path to the guest as a drive-style Windows path (`Z:` is
+  the host root, as Wine's `Z:` drive is) so the guest's own string handling
+  works, and register the host path (and its directory) as a grant. A granted
+  path reaches the host unchanged for reads, writes, copies, moves, deletes and
+  attributes; a non-granted path is re-rooted exactly as before.
 - Show the platform's own system dialogs instead of faking them. A new
   `platform/os.h` seam (`os_file_dialog`, `os_message_box`, `os_help`) carries a
   picker, an alert and a help request across the runtime/host boundary; the

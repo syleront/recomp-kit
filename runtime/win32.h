@@ -130,6 +130,18 @@ std::vector<uint32_t> win32_stack_return_candidates(uint32_t esp, uint32_t bytes
 std::string win32_host_path(const std::string &guest_path, bool for_create = false);
 // Reverse mapping used by GetModuleFileNameA/GetFullPathNameA.
 std::string win32_guest_path(const std::string &host_path);
+// A path a system file dialog chose is a real host path, not a guest one. The
+// dialog presents it to the guest as a drive-style Windows path ("Z:\...") so
+// the guest's own string handling works, and registers it here. Every later
+// file shim then hands that path straight back to the host unchanged instead
+// of re-rooting it under the writable root (TD-098). The file and its
+// directory are granted, so a sibling created in that directory resolves too.
+void win32_grant_host_path(const std::string &host_path);
+// The guest-visible Windows path for a chosen host path: the synthetic drive
+// "Z:" is the host root, as Wine's Z: drive is. Empty for a non-absolute path.
+std::string win32_guest_path_for_host(const std::string &host_path);
+// Forget every grant (tests change the overlay between cases).
+void win32_clear_host_grants();
 // Query an open file without moving its guest descriptor. False for non-file
 // or closed handles and failed position queries; outputs are then unchanged.
 bool win32_file_handle_position(uint32_t handle, std::string *host_path, int64_t *offset);

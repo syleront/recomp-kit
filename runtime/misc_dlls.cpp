@@ -313,6 +313,30 @@ void common_dialog(X86 *c, bool save) {
         size_t n = 0;
         while (n + 1 < buf.size() && buf[n])
             ++n;
+        // A path the platform chose is a real host path. Present it to the
+        // guest as a drive-style Windows path (Z: is the host root) and tell
+        // the overlay, so the guest can hand it straight back to CopyFileA/
+        // CreateFileA and it reaches the host unchanged instead of being
+        // re-rooted under the writable root (TD-098). A truncated path (r==-2)
+        // is left as the platform wrote it; the caller only sees the error.
+        if (r == 1) {
+            std::string chosen(buf.data(), n);
+            win32_grant_host_path(chosen); // a no-op unless it is absolute
+            std::string guest = win32_guest_path_for_host(chosen);
+            if (!guest.empty() && guest.size() + 1 <= buf.size()) {
+                memcpy(buf.data(), guest.c_str(), guest.size() + 1);
+                n = guest.size();
+                size_t base = 0, dot = 0;
+                for (size_t i = 0; i < n; ++i)
+                    if (guest[i] == '/' || guest[i] == '\\')
+                        base = i + 1;
+                for (size_t i = base; i < n; ++i)
+                    if (guest[i] == '.')
+                        dot = i;
+                file_offset = (int)base;
+                file_extension = (int)dot;
+            }
+        }
         memcpy(g_mem + lpstrFile, buf.data(), n + 1);
         wr16(ofn + 56, (uint16_t)file_offset);
         wr16(ofn + 58, (uint16_t)file_extension);

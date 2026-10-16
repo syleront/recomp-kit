@@ -13,6 +13,7 @@
 #include "../discovery.h"
 #include "../memory.h"
 #include "../win32.h"
+#include "../native_seam.h"
 #include "../user32_internal.h"
 #include "../../platform/os.h"
 #include "game_config.h"
@@ -3141,10 +3142,12 @@ static void test_common_dialogs(X86 *c) {
           "lpstrFilter split into a description and its patterns");
     check(g_cap_dialog.flags == 0x80eu && g_cap_dialog.filter_index == 1,
           "Flags and nFilterIndex reached the presenter");
-    check(gm_str(file_buf, 260) == "/captured/Chosen.pet",
-          "the chosen path was written into lpstrFile");
-    check(rd16(ofn + 56) == 10 && rd16(ofn + 58) == 16,
+    check(gm_str(file_buf, 260) == "Z:\\captured\\Chosen.pet",
+          "the chosen host path is written as a drive-style guest path");
+    check(rd16(ofn + 56) == 12 && rd16(ofn + 58) == 18,
           "nFileOffset/nFileExtension point at the name and the extension");
+    check(win32_host_path_op(gm_str(file_buf, 260), WIN32_FILE_READ) == "/captured/Chosen.pet",
+          "and the granted path maps straight back to the host path");
     check(call_import(c, "comdlg32.dll", "CommDlgExtendedError", {}) == 0,
           "a success leaves CommDlgExtendedError at 0");
     os_set_file_dialog_presenter(nullptr);
@@ -3154,9 +3157,9 @@ static void test_common_dialogs(X86 *c) {
     memcpy(g_mem + file_buf, "Pouncer.pet", 12);
     check(call_import(c, "comdlg32.dll", "GetSaveFileNameA", {ofn}) == 1,
           "GetSaveFileNameA returns TRUE from the env result");
-    check(gm_str(file_buf, 260) == "/env/FromEnv.pet",
-          "RECOMP_FILE_DIALOG_RESULT became the chosen path");
-    check(rd16(ofn + 56) == 5 && rd16(ofn + 58) == 12,
+    check(gm_str(file_buf, 260) == "Z:\\env\\FromEnv.pet",
+          "RECOMP_FILE_DIALOG_RESULT became the chosen drive-style path");
+    check(rd16(ofn + 56) == 7 && rd16(ofn + 58) == 14,
           "the fallback sets nFileOffset/nFileExtension");
 
     // A cancel is FALSE with no error, exactly as Windows leaves it.
@@ -3191,6 +3194,9 @@ static void test_common_dialogs(X86 *c) {
     os_setenv("RECOMP_FILE_DIALOG_RESULT", "/env/Open.me");
     check(call_import(c, "comdlg32.dll", "GetOpenFileNameA", {ofn}) == 1,
           "GetOpenFileNameA returns TRUE from the env result");
+    check(gm_str(file_buf, 260) == "Z:\\env\\Open.me" &&
+              win32_host_path_op(gm_str(file_buf, 260), WIN32_FILE_READ) == "/env/Open.me",
+          "an opened file's drive-style path reads back from the host path");
     os_unsetenv("RECOMP_FILE_DIALOG_RESULT");
 
     // The message box: the button set, labels, default and icon, and the id
@@ -4917,6 +4923,77 @@ static void test_exit_process_stops_workers(X86 *c) {
           "after ExitProcess no guest code ran on a worker and every worker ended "
           "(child exit %d)",
           code);
+}
+
+// TD-098: a path a native file dialog chose must reach the host exactly, not
+// be re-rooted under the writable root. The dialog presents it to the guest as
+// a drive-style path ("Z:\...") and grants it; the overlay hands the host path
+// back for reads, writes, copies, deletes and attributes.
+static void test_host_path_grants(X86 *c) {
+    section("granted host paths (file dialog results)");
+    win32_clear_host_grants();
+    const std::string chosen = "/Users/Someone/My Documents/Chosen File.pet";
+    const std::string dir = "/Users/Someone/My Documents";
+
+    // The guest-visible form is a normal Windows absolute path: a drive, a
+    // backslash separator and the extension intact.
+    check(win32_guest_path_for_host(chosen) == "Z:\\Users\\Someone\\My Documents\\Chosen File.pet",
+          "a chosen host path becomes a drive-style guest path");
+    check(win32_guest_path_for_host("relative/path.pet").empty(),
+          "a relative path has no drive-style form");
+
+    win32_grant_host_path(chosen);
+
+    // The guest hands the Z: path straight back: it reaches the host unchanged.
+    check(win32_host_path_op("Z:\\Users\\Someone\\My Documents\\Chosen File.pet",
+                             WIN32_FILE_READ) == chosen,
+          "the granted file reads from the host path, spaces and all");
+    check(win32_host_path_op("Z:\\Users\\Someone\\My Documents\\Chosen File.pet",
+                             WIN32_FILE_WRITE) == chosen,
+          "and writes to it");
+    // The host path spelled directly (as a presenter may hand it) also matches.
+    check(win32_host_path_op(chosen, WIN32_FILE_READ) == chosen,
+          "the host path itself is granted too");
+    // A sibling in the chosen directory resolves into the host directory.
+    check(win32_host_path_op("Z:\\Users\\Someone\\My Documents\\Sibling.pet", WIN32_FILE_WRITE) ==
+              dir + "/Sibling.pet",
+          "a sibling in the granted directory maps into the host directory");
+    check(win32_host_path_op("Z:\\Users\\Someone\\My Documents", WIN32_FILE_LIST) == dir,
+          "the granted directory itself resolves");
+    // Case-insensitive, as every guest path is.
+    check(win32_host_path_op("z:\\users\\someone\\my documents\\chosen file.pet",
+                             WIN32_FILE_READ) == chosen,
+          "the grant matches case-insensitively");
+
+    // A non-granted absolute path is still re-rooted exactly as before: the
+    // resolver sees its normalised relative form, never the host path.
+    g_seam_root = "build/recomp/grant-seam";
+    remove_tree(g_seam_root);
+    mkdir_p(g_seam_root + "/write");
+    win32_set_file_ops(test_resolver, test_lister);
+    g_seam_calls.clear();
+    std::string other = win32_host_path_op("/Users/Someone/Other/y.pet", WIN32_FILE_WRITE);
+    check(other == g_seam_root + "/write/Users/Someone/Other/y.pet",
+          "a non-granted absolute path is re-rooted under the writable root");
+    check(!g_seam_calls.empty() && g_seam_calls.back().first == "Users/Someone/Other/y.pet",
+          "the resolver sees it as a normalised relative path");
+
+    // recomp_writable_path answers a grant without an overlay, and a
+    // non-granted path still needs the resolver.
+    win32_set_file_ops(nullptr, nullptr);
+    char out[512];
+    check(recomp_writable_path("Z:\\Users\\Someone\\My Documents\\Chosen File.pet", out,
+                               sizeof out) == 1 &&
+              std::string(out) == chosen,
+          "recomp_writable_path answers a granted path with no overlay");
+    check(recomp_writable_path("/Users/Someone/Other/y.pet", out, sizeof out) == 0,
+          "and still refuses a non-granted write with no overlay");
+
+    win32_clear_host_grants();
+    check(win32_host_path_op("Z:\\Users\\Someone\\My Documents\\Chosen File.pet",
+                             WIN32_FILE_READ) != chosen,
+          "clearing the grants drops the mapping");
+    remove_tree(g_seam_root);
 }
 
 static void test_mod_seams(X86 *c) {
@@ -7764,6 +7841,7 @@ int main(int argc, char **argv) {
     test_midi(c);
     test_windows(c);
     test_common_dialogs(c);
+    test_host_path_grants(c);
     test_synchronous_geometry(c);
     test_listbox_ownerdraw_hit(c);
     test_dialog_dlu_mapping(c);

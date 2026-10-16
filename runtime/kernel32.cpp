@@ -393,6 +393,101 @@ std::string normalised_relative(const std::string &guest_path) {
     return serialise_relative(normalise_components(guest_path));
 }
 
+// ---------------------------------------------------------------------------
+// Granted host paths (TD-098).
+//
+// A path chosen in a native file dialog is a REAL host path, not a guest path
+// under the writable root. The dialog presents it to the guest as a drive
+// style Windows path ("Z:\Users\...\x.pet", Z: being the host root, as Wine's
+// Z: drive is) so the guest's own string handling - a drive, a backslash
+// separator, an extension - still works. Both the host path and that guest
+// form reduce to the same normalised relative key, so the overlay remembers
+// the host path under that key and hands it straight back when the guest
+// returns it to CopyFileA/CreateFileA/GetFileAttributesA/DeleteFileA. The
+// chosen file and its directory are granted; a sibling created in that
+// directory resolves too. Nothing here names a game.
+// ---------------------------------------------------------------------------
+struct HostGrant {
+    std::string key; // lower(normalised relative form)
+    std::string host;
+    bool directory;
+};
+static std::vector<HostGrant> &host_grants() {
+    static std::vector<HostGrant> v;
+    return v;
+}
+static std::string host_grant_key(const std::string &path) {
+    return lower(serialise_relative(normalise_components(path)));
+}
+void win32_grant_host_path(const std::string &host_path) {
+    std::string host = host_path;
+    while (host.size() > 1 && (host.back() == '/' || host.back() == '\\'))
+        host.pop_back();
+    // Only an absolute host path is a grant; a relative one has no host root.
+    if (host.empty() || (host[0] != '/' && host[0] != '\\'))
+        return;
+    std::string key = host_grant_key(host);
+    if (key.empty())
+        return;
+    auto &grants = host_grants();
+    auto add = [&grants](const std::string &k, const std::string &h, bool dir) {
+        for (const HostGrant &g : grants)
+            if (g.key == k && g.host == h)
+                return;
+        grants.push_back({k, h, dir});
+    };
+    add(key, host, false);
+    // The directory, so a sibling the game creates there resolves too.
+    size_t slash = host.find_last_of("/\\");
+    if (slash != std::string::npos && slash > 0) {
+        std::string dir = host.substr(0, slash);
+        std::string dkey = host_grant_key(dir);
+        if (!dkey.empty())
+            add(dkey, dir, true);
+    }
+}
+void win32_clear_host_grants() {
+    host_grants().clear();
+}
+std::string win32_guest_path_for_host(const std::string &host_path) {
+    if (host_path.empty() || (host_path[0] != '/' && host_path[0] != '\\'))
+        return std::string();
+    std::string out = "Z:";
+    for (char ch : host_path) {
+        if (ch == '/')
+            out += '\\';
+        else
+            out += ch;
+    }
+    return out;
+}
+// The host path a normalised relative path was granted, or false. An exact
+// file grant wins; a directory grant maps the path's remainder onto the host
+// directory, keeping the guest's own spelling for the new components.
+static bool host_grant_lookup(const std::string &rel, std::string *out) {
+    std::string key = lower(rel);
+    auto &grants = host_grants();
+    for (const HostGrant &g : grants)
+        if (!g.directory && g.key == key) {
+            *out = g.host;
+            return true;
+        }
+    for (const HostGrant &g : grants) {
+        if (!g.directory)
+            continue;
+        if (g.key == key) {
+            *out = g.host;
+            return true;
+        }
+        if (key.size() > g.key.size() && key.compare(0, g.key.size(), g.key) == 0 &&
+            key[g.key.size()] == '/') {
+            *out = g.host + rel.substr(g.key.size());
+            return true;
+        }
+    }
+    return false;
+}
+
 // The case-insensitive walk through the game directory, unchanged.
 static std::string resolve_in_game_dir(const std::vector<std::string> &norm, bool for_create) {
     std::string host = g_game_dir;
@@ -420,6 +515,11 @@ std::string win32_host_path_op(const std::string &guest_path, int op) {
     if (guest_path.empty())
         return std::string();
     std::vector<std::string> norm = normalise_components(guest_path);
+    // A path a system dialog chose is handed back to the host unchanged,
+    // whatever operation is about to touch it (TD-098).
+    std::string granted;
+    if (host_grant_lookup(serialise_relative(norm), &granted))
+        return granted;
     if (g_file_resolve) {
         std::string rel = serialise_relative(norm);
         char out[1024];
@@ -440,11 +540,21 @@ std::string win32_host_path_op(const std::string &guest_path, int op) {
 }
 
 extern "C" int recomp_writable_path(const char *guest_path, char *out, size_t out_len) {
-    // Only the resolver's answer: without an overlay a write would fall
-    // through to the game directory, which a native override must not touch.
-    if (!guest_path || !out || !out_len || !g_file_resolve)
+    if (!guest_path || !out || !out_len)
         return 0;
     const std::string rel = serialise_relative(normalise_components(guest_path));
+    // A granted path is a real host path: answer it even with no overlay.
+    std::string granted;
+    if (host_grant_lookup(rel, &granted)) {
+        if (granted.size() >= out_len)
+            return 0;
+        memcpy(out, granted.c_str(), granted.size() + 1);
+        return 1;
+    }
+    // Only the resolver's answer: without an overlay a write would fall
+    // through to the game directory, which a native override must not touch.
+    if (!g_file_resolve)
+        return 0;
     return g_file_resolve(rel.c_str(), WIN32_FILE_WRITE, out, out_len) ? 1 : 0;
 }
 extern "C" int recomp_readable_path(const char *guest_path, char *out, size_t out_len) {
