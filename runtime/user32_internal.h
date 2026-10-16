@@ -64,6 +64,10 @@ struct Window {
     // give a different height per row, cached in list_item_heights.
     int32_t list_item_height = 0;
     std::vector<int32_t> list_item_heights;
+    // Dialog base units, in pixels per 4 DLU across and per 8 DLU down, from the
+    // template's DS_SETFONT face. Zero on a non-dialog window; MapDialogRect
+    // then uses the 8x16 bitmap-cell default, matching a fontless template.
+    int32_t dlg_base_x = 0, dlg_base_y = 0;
 };
 
 struct Msg {
@@ -96,6 +100,15 @@ bool paint_pending();
 void window_created(uint32_t hwnd);
 // Give the keyboard focus to a window (the dialog engine's first tab stop).
 void set_focus_window(uint32_t hwnd);
+// Dialog base units: the pixels a dialog unit spans, in quarters across and
+// eighths down, from a DS_SETFONT face and point size. `dialog_map_unit` is the
+// same scaling (Windows' MulDiv rounding) the template engine lays a dialog out
+// with. Exposed so the mapping can be tested apart from the template decoder.
+struct DlgBaseUnit {
+    int32_t x = 8, y = 16;
+};
+DlgBaseUnit dialog_base_units(const std::string &face, int32_t pointsize, int32_t weight);
+int32_t dialog_map_unit(int32_t dlu, int32_t base, int32_t denom);
 // Siblings in back-to-front stacking order, respecting WS_EX_TOPMOST.
 std::vector<uint32_t> window_z_order(uint32_t parent);
 void reorder_window(uint32_t hwnd, uint32_t after);

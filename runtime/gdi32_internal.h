@@ -5,6 +5,7 @@
 #include "imports.h"
 #include <array>
 #include <map>
+#include <string>
 namespace gdi {
 struct Surface {
     int w = 0, h = 0;
@@ -86,6 +87,12 @@ void fill(uint32_t dc, Rect r, uint32_t pixel);
 void line(uint32_t dc, int32_t x, int32_t y, int32_t x1, int32_t y1);
 void register_draw();
 void register_text();
+// The dialog base units of a DS_SETFONT face: the font's average character
+// width (a dialog unit is a quarter of it across) and cell height (an eighth of
+// it down), measured from the same font the runtime draws with. False when the
+// face has no measurable font, so the caller keeps the 8x16 bitmap cell.
+bool font_dialog_units(const std::string &face, int32_t point_size, int32_t weight,
+                       int32_t *ave_width, int32_t *cell_height);
 uint32_t draw_text(uint32_t dc, uint32_t text, uint32_t count, uint32_t rect, uint32_t flags);
 } // namespace gdi
 uint32_t gdi_window_dc(uint32_t window);

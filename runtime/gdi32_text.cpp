@@ -155,17 +155,16 @@ struct Pen {
                     write_pixel(hdc, xx, yy, 0xff000000u | fg);
     }
 };
-Pen pen_of(uint32_t hdc) {
+// Resolve one LOGFONT object's face: a face the program registered, else the
+// bundled stand-in for a Windows interface face, else no TrueType face at all
+// (the caller then uses the 8x16 bitmap cells). Shared by the DC query below
+// and the dialog-font measurement below it.
+Pen pen_from_font(const Object &font) {
     Pen pen;
-    pen.cells = font_scale(hdc);
-    auto *dc = dc_of(hdc);
-    auto it = objects().find(dc ? dc->font : 0);
-    if (it == objects().end() || it->second.kind != Object::Font)
-        return pen;
+    pen.cells = std::max<int64_t>(1, std::abs(int32_t(font_word(font, 0))) / 16);
     std::string family;
     for (size_t i = 0; i < 32; ++i) {
-        uint16_t unit =
-            uint16_t(it->second.logfont[28 + 2 * i] | (it->second.logfont[29 + 2 * i] << 8));
+        uint16_t unit = uint16_t(font.logfont[28 + 2 * i] | (font.logfont[29 + 2 * i] << 8));
         if (!unit)
             break;
         family.push_back(unit < 128 ? char(unit) : '?');
@@ -176,7 +175,7 @@ Pen pen_of(uint32_t hdc) {
     if (!pen.face) {
         // A face every Windows has and the program never supplied: what it
         // gets with no font of its own set, from the VCL's default font.
-        const int32_t weight = int32_t(font_word(it->second, 16));
+        const int32_t weight = int32_t(font_word(font, 16));
         pen.face = truetype_windows_substitute(family, weight);
         if (pen.face)
             log_once(("gdi-font:" + family).c_str(),
@@ -186,9 +185,19 @@ Pen pen_of(uint32_t hdc) {
     }
     if (!pen.face)
         return pen;
-    pen.scale = truetype_scale(pen.face, int32_t(font_word(it->second, 0)));
+    pen.scale = truetype_scale(pen.face, int32_t(font_word(font, 0)));
     pen.metrics = truetype_metrics(pen.face, pen.scale);
     return pen;
+}
+Pen pen_of(uint32_t hdc) {
+    auto *dc = dc_of(hdc);
+    auto it = objects().find(dc ? dc->font : 0);
+    if (it == objects().end() || it->second.kind != Object::Font) {
+        Pen pen;
+        pen.cells = font_scale(hdc);
+        return pen;
+    }
+    return pen_from_font(it->second);
 }
 void get_metrics(X86 *c) {
     auto *dc = dc_of(arg(c, 0));
@@ -336,6 +345,33 @@ void unsupported(X86 *c) {
 }
 } // namespace
 namespace gdi {
+// The dialog base units of a DS_SETFONT face. A dialog unit (DLU) is a quarter
+// of the font's average character width horizontally and an eighth of its cell
+// height vertically, so these two numbers are all a template needs to lay
+// itself out. Windows builds the dialog font from the template's point size at
+// the screen DPI (96 here: a negative lfHeight is the em in pixels) and reads
+// its TEXTMETRIC; the runtime measures the same font it will draw the dialog
+// with. False when the face has no measurable font (a raster face such as
+// System), so the caller keeps the 8x16 bitmap cell.
+bool font_dialog_units(const std::string &face, int32_t point_size, int32_t weight,
+                       int32_t *ave_width, int32_t *cell_height) {
+    if (face.empty() || point_size <= 0)
+        return false;
+    Object font;
+    font.kind = Object::Font;
+    int32_t height = -int32_t((int64_t(point_size) * 96 + 36) / 72); // MulDiv(pt, 96, 72)
+    memcpy(font.logfont.data(), &height, 4);
+    int32_t w = weight > 0 ? weight : 400;
+    memcpy(font.logfont.data() + 16, &w, 4);
+    for (size_t i = 0; i < 31 && i < face.size(); ++i)
+        font.logfont[28 + 2 * i] = uint8_t(face[i]);
+    Pen pen = pen_from_font(font);
+    if (!pen.face || pen.metrics.average <= 0 || pen.metrics.height <= 0)
+        return false;
+    *ave_width = int32_t(pen.metrics.average);
+    *cell_height = int32_t(pen.metrics.height);
+    return true;
+}
 // DrawText's basic VCL layout uses the same fixed font as ExtTextOutW.
 // Measurement must use that font too; CALCRECT never mutates canvas pixels.
 uint32_t draw_text(uint32_t hdc, uint32_t text, uint32_t count, uint32_t rp, uint32_t flags) {

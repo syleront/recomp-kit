@@ -60,6 +60,33 @@ std::string lower(std::string s) {
     return s;
 }
 
+// Windows' MulDiv rounding (half away from zero); a dialog unit is one quarter
+// of the font's average character width across, one eighth of its cell height
+// down, and the template's DLUs are the numerator.
+int32_t dialog_map_unit(int32_t dlu, int32_t base, int32_t denom) {
+    if (!denom)
+        return 0;
+    int64_t product = int64_t(dlu) * base;
+    int64_t magnitude = product < 0 ? -product : product;
+    int64_t d = denom < 0 ? -denom : denom;
+    int64_t result = (magnitude + d / 2) / d;
+    return int32_t(product < 0 ? -result : result);
+}
+// The base units a template's DS_SETFONT face maps its DLUs with. The runtime
+// measures the same substituted font it draws the dialog with; a raster face it
+// cannot measure, or a template with no font, uses the 8x16 bitmap cell.
+DlgBaseUnit dialog_base_units(const std::string &face, int32_t pointsize, int32_t weight) {
+    DlgBaseUnit base;
+    int32_t ave = 0, height = 0;
+    if (gdi::font_dialog_units(face, pointsize, weight, &ave, &height)) {
+        if (ave > 0)
+            base.x = ave;
+        if (height > 0)
+            base.y = height;
+    }
+    return base;
+}
+
 // Class names arrive either as a pointer to a string or as an atom (< 0x10000).
 std::string class_key(uint32_t p, bool wide) {
     if (p && p < 0x10000) {
@@ -1989,19 +2016,24 @@ void u_IsDlgButtonChecked(X86 *c) {
     }
     set_eax(c, deliver_message(c, child, 0x00f0 /* BM_GETCHECK */, 0, 0, false));
 }
-// Maps dialog units to pixels with the fixed 8x16 system font the runtime
-// measures everything with: baseunitX is 8, baseunitY is 16.
+// Maps dialog units to pixels with the dialog's own base units: a quarter of
+// the DS_SETFONT face's average character width across, an eighth of its cell
+// height down. A window that is not a dialog, or whose template had no font,
+// keeps the 8x16 bitmap cell the runtime measures everything else with.
 void u_MapDialogRect(X86 *c) {
     uint32_t hwnd = arg(c, 0), p = arg(c, 1);
     int32_t r[4];
-    if (!find_window(hwnd) || !as_rect(p, r)) {
+    Window *w = find_window(hwnd);
+    if (!w || !as_rect(p, r)) {
         set_eax(c, 0);
         return;
     }
-    wr32(p + 0, uint32_t((r[0] * 8) / 4));
-    wr32(p + 4, uint32_t((r[1] * 16) / 8));
-    wr32(p + 8, uint32_t((r[2] * 8) / 4));
-    wr32(p + 12, uint32_t((r[3] * 16) / 8));
+    int32_t bx = w->dlg_base_x > 0 ? w->dlg_base_x : 8;
+    int32_t by = w->dlg_base_y > 0 ? w->dlg_base_y : 16;
+    wr32(p + 0, uint32_t(dialog_map_unit(r[0], bx, 4)));
+    wr32(p + 4, uint32_t(dialog_map_unit(r[1], by, 8)));
+    wr32(p + 8, uint32_t(dialog_map_unit(r[2], bx, 4)));
+    wr32(p + 12, uint32_t(dialog_map_unit(r[3], by, 8)));
     set_eax(c, 1);
 }
 
@@ -2091,6 +2123,51 @@ int32_t listbox_item_from_y(X86 *c, Window *w, int32_t y) {
         top += h;
     }
     return -1;
+}
+
+// The largest first-visible index that still fills the client. Scrolling down
+// stops when the last row reaches the bottom, exactly like a listbox with a
+// scrollbar, so the box never scrolls past its content.
+int32_t listbox_max_top(X86 *c, Window *w) {
+    int64_t spanned = 0;
+    int32_t t = int32_t(w->list_items.size());
+    while (t > 0) {
+        int32_t rh = listbox_item_height(c, w, t - 1);
+        if (rh <= 0)
+            rh = 1;
+        if (spanned + rh > w->h)
+            break;
+        spanned += rh;
+        --t;
+    }
+    return t;
+}
+// Keep the selected row inside the client. The view is an index, so it moves a
+// whole row at a time; this is the keyboard selection's scroll.
+void listbox_scroll_into_view(X86 *c, Window *w) {
+    if (w->list_sel < 0)
+        return;
+    if (w->list_sel < w->list_top) {
+        w->list_top = w->list_sel;
+        return;
+    }
+    int64_t bottom = 0;
+    for (int32_t i = w->list_top; i <= w->list_sel && i < int32_t(w->list_items.size()); ++i) {
+        int32_t rh = listbox_item_height(c, w, i);
+        bottom += rh > 0 ? rh : 1;
+    }
+    while (bottom > w->h && w->list_top < w->list_sel) {
+        int32_t rh = listbox_item_height(c, w, w->list_top);
+        bottom -= rh > 0 ? rh : 1;
+        ++w->list_top;
+    }
+}
+// A listbox scrolls its view by whole rows: the offset is the first visible
+// index, so SB_THUMBTRACK has no exact equivalent and is treated as a line.
+void listbox_scroll_to(X86 *c, Window *w, int32_t top) {
+    int32_t max_top = listbox_max_top(c, w);
+    w->list_top = top < 0 ? 0 : (top > max_top ? max_top : top);
+    w->update_pending = true;
 }
 
 // An owner-draw listbox (LBS_OWNERDRAWFIXED / LBS_OWNERDRAWVARIABLE) does not
@@ -2208,14 +2285,79 @@ void control_proc(X86 *c) {
         set_eax(c, 0);
         return;
     }
-    case 0x0100: // WM_KEYDOWN: backspace edits, everything else is ignored
-        if (w && w->cls == "edit" && arg(c, 2) == 8) {
+    case 0x0100: { // WM_KEYDOWN: listbox navigation, backspace edits
+        uint32_t vk = arg(c, 2);
+        if (w && w->cls == "listbox") {
+            int32_t n = int32_t(w->list_items.size());
+            int32_t sel = w->list_sel;
+            bool moved = true;
+            switch (vk) {
+            case 0x26: // VK_UP
+                sel = sel <= 0 ? 0 : sel - 1;
+                break;
+            case 0x28: // VK_DOWN
+                sel = sel < 0 ? 0 : (sel + 1 < n ? sel + 1 : n - 1);
+                break;
+            case 0x21: // VK_PRIOR
+                sel = sel < 0 ? 0 : sel - 5;
+                break;
+            case 0x22: // VK_NEXT
+                sel = sel < 0 ? 0 : sel + 5;
+                break;
+            case 0x24: // VK_HOME
+                sel = 0;
+                break;
+            case 0x23: // VK_END
+                sel = n - 1;
+                break;
+            default:
+                moved = false;
+                break;
+            }
+            if (moved && n > 0) {
+                w->list_sel = sel < 0 ? 0 : (sel >= n ? n - 1 : sel);
+                listbox_scroll_into_view(c, w);
+                w->update_pending = true;
+                if (w->parent)
+                    host_dispatch_to_wndproc(c, w->parent, 0x0111 /* WM_COMMAND */, w->id & 0xffffu,
+                                             hwnd); // LBN_SELCHANGE
+            }
+            set_eax(c, 0);
+            return;
+        }
+        if (w && w->cls == "edit" && vk == 8) {
             if (!w->title_utf8.empty())
                 w->title_utf8.pop_back();
             w->update_pending = true;
         }
         set_eax(c, 0);
         return;
+    }
+    case 0x0115: { // WM_VSCROLL
+        if (w && w->cls == "listbox") {
+            uint32_t code = arg(c, 2) & 0xffff;
+            int32_t top = w->list_top;
+            if (code == 0) // SB_LINEUP
+                --top;
+            else if (code == 1) // SB_LINEDOWN
+                ++top;
+            else if (code == 2 || code == 6) // SB_PAGEUP / SB_TOP
+                top = 0;
+            else if (code == 3 || code == 7) // SB_PAGEDOWN / SB_BOTTOM
+                top = listbox_max_top(c, w);
+            listbox_scroll_to(c, w, top);
+        }
+        set_eax(c, 0);
+        return;
+    }
+    case 0x020a: { // WM_MOUSEWHEEL: one notch is three rows (the system default)
+        if (w && w->cls == "listbox") {
+            int32_t delta = int16_t((arg(c, 2) >> 16) & 0xffff);
+            listbox_scroll_to(c, w, w->list_top + (delta > 0 ? -3 : 3));
+        }
+        set_eax(c, 0);
+        return;
+    }
     case 0x0180: // LB_ADDSTRING
         if (w) {
             w->list_items.push_back(gm_str(arg(c, 3)));
@@ -2638,7 +2780,7 @@ std::string dlg_control_class(const DlgItemTemplate &it) {
     }
     return it.cls.empty() ? "static" : user32::lower(it.cls);
 }
-uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it) {
+uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it, const DlgBaseUnit &base) {
     uint32_t hwnd = g_next_hwnd;
     g_next_hwnd += 4;
     Window w;
@@ -2653,10 +2795,12 @@ uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it) {
         cls != classes().end() && cls->second.wndproc ? cls->second.wndproc : control_proc_addr();
     w.style = it.style;
     w.exstyle = it.exstyle;
-    w.x = it.x;
-    w.y = it.y;
-    w.w = it.cx;
-    w.h = it.cy;
+    // A template stores every control rectangle in dialog units; it is pixels
+    // only after the dialog's font base units scale it (Windows MulDiv).
+    w.x = dialog_map_unit(it.x, base.x, 4);
+    w.y = dialog_map_unit(it.y, base.y, 8);
+    w.w = dialog_map_unit(it.cx, base.x, 4);
+    w.h = dialog_map_unit(it.cy, base.y, 8);
     w.title_utf8 = it.text;
     w.parent = parent;
     w.id = it.id;
@@ -2682,10 +2826,43 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
     w.wndproc = proc;
     w.style = t.style;
     w.exstyle = t.exstyle;
-    w.x = t.x;
-    w.y = t.y;
-    w.w = t.cx;
-    w.h = t.cy;
+    // Everything in the template is in dialog units, sized by the DS_SETFONT
+    // face; the pixel size is what the window and its controls are placed with.
+    DlgBaseUnit base;
+    if ((t.style & 0x40 /*DS_SETFONT / DS_SHELLFONT*/) && t.pointsize > 0)
+        base = dialog_base_units(t.font, t.pointsize, t.weight);
+    w.dlg_base_x = base.x;
+    w.dlg_base_y = base.y;
+    w.w = dialog_map_unit(t.cx, base.x, 4);
+    w.h = dialog_map_unit(t.cy, base.y, 8);
+    if (t.style & 0x800 /*DS_CENTER*/) {
+        // Windows centres a DS_CENTER dialog in the working area of the monitor
+        // that holds the owner. The port reports a 1024x768 desktop
+        // (GetSystemMetrics, which the game's resolution check requires) but
+        // presents only the game's window, so it centres on the owner instead,
+        // keeping the dialog on the presented frame (TD-061).
+        int32_t ow = 0, oh = 0;
+        if (const Window *owner = find_window(parent)) {
+            ow = owner->w;
+            oh = owner->h;
+        } else {
+            uint32_t dw = 1024, dh = 768, bpp = 32;
+            win32_display_mode(&dw, &dh, &bpp);
+            ow = int32_t(dw);
+            oh = int32_t(dh);
+        }
+        w.x = (ow - w.w) / 2;
+        w.y = (oh - w.h) / 2;
+        // A dialog larger than its owner would centre off the top-left; keep it
+        // on screen rather than lose it (the port cannot drag a window back).
+        if (w.x < 0)
+            w.x = 0;
+        if (w.y < 0)
+            w.y = 0;
+    } else {
+        w.x = dialog_map_unit(t.x, base.x, 4);
+        w.y = dialog_map_unit(t.y, base.y, 8);
+    }
     w.cls = "#32770";
     w.title_utf8 = t.title;
     w.parent = parent;
@@ -2697,7 +2874,7 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
     windows()[hwnd] = w;
     window_created(hwnd);
     for (const DlgItemTemplate &item : t.items)
-        dlg_create_child(hwnd, item);
+        dlg_create_child(hwnd, item, base);
     // The dialog manager gives the keyboard to the first tab stop, which is
     // where the host's keystrokes go (an edit control in a naming dialog).
     for (const auto &kv : windows())
