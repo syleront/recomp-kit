@@ -63,6 +63,7 @@ void paint_control(X86 *c, uint32_t hwnd, uint32_t into) {
     if (!dc)
         return;
     const uint32_t caller_font = dc->font;
+    const int caller_bk_mode = dc->bk_mode;
     if (font)
         dc->font = font;
     // The parent chooses the colours: it sets them on the DC and returns the
@@ -90,6 +91,13 @@ void paint_control(X86 *c, uint32_t hwnd, uint32_t into) {
     }
     if (have_pixel)
         gdi::fill(hdc, {0, 0, width, height}, pixel);
+    // The caption is drawn transparent over the background just filled (or over
+    // whatever is underneath when the parent chose no brush). With the DC's
+    // default opaque mode and its white background colour, every glyph cell
+    // would otherwise be painted white - the white box a DS_SETFONT dialog
+    // showed around each string. The caller's DC gets its mode back.
+    if (auto *paint_dc = gdi::dc_of(hdc))
+        paint_dc->bk_mode = 1; // TRANSPARENT
     uint32_t units = text.empty() ? 0 : wide_units(text);
     if (flags && units && units < (UINT32_MAX - 32) / 2) {
         if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
@@ -102,8 +110,10 @@ void paint_control(X86 *c, uint32_t hwnd, uint32_t into) {
     }
     if (!into)
         gdi_release_window_dc(hwnd, hdc);
-    else if (auto *caller = gdi::dc_of(hdc)) // the caller's DC keeps its own font
+    else if (auto *caller = gdi::dc_of(hdc)) { // the caller's DC keeps its own state
         caller->font = caller_font;
+        caller->bk_mode = caller_bk_mode;
+    }
 }
 
 namespace {

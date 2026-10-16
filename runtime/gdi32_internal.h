@@ -93,6 +93,11 @@ void register_text();
 // face has no measurable font, so the caller keeps the 8x16 bitmap cell.
 bool font_dialog_units(const std::string &face, int32_t point_size, int32_t weight,
                        int32_t *ave_width, int32_t *cell_height);
+// The LOGFONT object a DS_SETFONT face describes: the point size at 96 dpi as a
+// negative em height, then the weight and typeface. font_dialog_units measures
+// this same object, so a dialog's layout and the font it draws its text with can
+// never disagree. Select it into the dialog and its controls (WM_SETFONT).
+Object dialog_font_object(const std::string &face, int32_t point_size, int32_t weight);
 uint32_t draw_text(uint32_t dc, uint32_t text, uint32_t count, uint32_t rect, uint32_t flags);
 } // namespace gdi
 uint32_t gdi_window_dc(uint32_t window);

@@ -4,12 +4,14 @@
 #include "../memory.h"
 #include "../win32.h"
 #include "../gdi32_internal.h"
+#include "../user32_internal.h"
 #include "test_font_ttf.h"
 #include "../../platform/os.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 static int g_checks = 0, g_failures = 0;
 static bool check(bool ok, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -839,11 +841,17 @@ static void test_static_control() {
     uint32_t dib =
         call_import(&c, "GDI32.dll", "CreateDIBSection", {mem, s + 0xc00, 0, s + 0xc40, 0, 0});
     call_import(&c, "GDI32.dll", "SelectObject", {mem, dib});
+    // A static draws its caption transparent in the DC's text colour (black
+    // here), so fill a known white background first and count the ink. The old
+    // opaque glyph background was the white box a DS_SETFONT dialog showed.
+    uint32_t dib_bits = rd32(s + 0xc40);
+    for (uint32_t i = 0; i < 48 * 16; ++i)
+        wr32(dib_bits + 4 * i, 0x00ffffffu);
     call_import(&c, "USER32.dll", "SendMessageW", {child, 0x0f, mem, 0});
     int in_memory = 0, on_window = 0;
     for (uint32_t y = 0; y < 16; ++y)
         for (uint32_t x = 0; x < 48; ++x)
-            in_memory += call_import(&c, "GDI32.dll", "GetPixel", {mem, x, y}) != 0;
+            in_memory += call_import(&c, "GDI32.dll", "GetPixel", {mem, x, y}) == 0;
     uint32_t window_dc = call_import(&c, "USER32.dll", "GetDC", {parent});
     for (uint32_t y = 8; y < 24; ++y)
         for (uint32_t x = 8; x < 56; ++x)
@@ -863,13 +871,25 @@ static void test_static_control() {
     // SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE, with SWP_SHOWWINDOW.
     call_import(&c, "USER32.dll", "SetWindowPos", {child, 0, 0, 0, 0, 0, 0x57});
     check(visible(), "SetWindowPos with SWP_SHOWWINDOW makes the control visible");
+    // Fill the window's surface white so the transparent black ink is
+    // measurable there too, then UpdateWindow paints the caption.
+    uint32_t white = call_import(&c, "GDI32.dll", "CreateSolidBrush", {0x00ffffffu});
+    uint32_t white_rect = s + 0xd00;
+    wr32(white_rect, 0);
+    wr32(white_rect + 4, 0);
+    wr32(white_rect + 8, 64);
+    wr32(white_rect + 12, 32);
+    uint32_t fill_dc = call_import(&c, "USER32.dll", "GetDC", {parent});
+    call_import(&c, "USER32.dll", "FillRect", {fill_dc, white_rect, white});
+    call_import(&c, "USER32.dll", "ReleaseDC", {parent, fill_dc});
+    call_import(&c, "GDI32.dll", "DeleteObject", {white});
     call_import(&c, "USER32.dll", "UpdateWindow", {child});
     uint32_t dc = call_import(&c, "USER32.dll", "GetDC", {parent});
     auto painted = [&](uint32_t x0, uint32_t x1) {
         int n = 0;
         for (uint32_t y = 8; y < 24; ++y)
             for (uint32_t x = x0; x < x1; ++x)
-                n += call_import(&c, "GDI32.dll", "GetPixel", {dc, x, y}) != 0;
+                n += call_import(&c, "GDI32.dll", "GetPixel", {dc, x, y}) == 0;
         return n;
     };
     // "Hi" is 16 pixels wide, so centred in 48 it covers x 24..40.
@@ -1138,6 +1158,201 @@ static void test_windows_face_substitute() {
     call_import(&c, "USER32.dll", "ReleaseDC", {hwnd, dc});
     call_import(&c, "USER32.dll", "DestroyWindow", {hwnd});
 }
+// A moving scratch allocator for a test that builds guest structures.
+static uint32_t g_scratch = 0;
+static uint32_t scratch_block(uint32_t bytes) {
+    uint32_t a = g_scratch;
+    memset(g_mem + a, 0, bytes);
+    g_scratch += (bytes + 15) & ~15u;
+    return a;
+}
+
+// Append one classic DLGITEMTEMPLATE at `p` (DWORD-aligned) and return the
+// offset after it. An ordinal class is 0xFFFF,<id>; the creation-data word is
+// always 0.
+static uint32_t template_item(uint32_t p, uint32_t style, uint32_t exstyle, int16_t x, int16_t y,
+                              int16_t cx, int16_t cy, uint16_t id, uint16_t cls_ordinal,
+                              const char *text) {
+    wr32(p + 0, style);
+    wr32(p + 4, exstyle);
+    wr16(p + 8, uint16_t(x));
+    wr16(p + 10, uint16_t(y));
+    wr16(p + 12, uint16_t(cx));
+    wr16(p + 14, uint16_t(cy));
+    wr16(p + 16, id);
+    uint32_t q = p + 18;
+    wr16(q, 0xffff);
+    wr16(q + 2, cls_ordinal);
+    q += 4;
+    q += 2 * (gm_put_wstr(q, text, 128) + 1);
+    wr16(q, 0); // no creation data
+    q += 2;
+    return (q + 3) & ~3u;
+}
+
+// Optional: render the dialog to an offscreen frame and write it as a PPM, so a
+// developer can eyeball the template font and layout without running the game.
+// Enabled with RECOMP_FONTS_PREVIEW=<path>.
+static void render_dialog_preview(X86 *c, uint32_t dlg, const char *path) {
+    paint_dialog_chrome(c, dlg);
+    for (const auto &kv : user32::windows())
+        if (kv.second.parent == dlg)
+            host_dispatch_to_wndproc(c, kv.first, 0x000f /* WM_PAINT */, 0, 0);
+    const int W = 1024, H = 768; // the desktop fallback the dialog centres on
+    std::vector<uint32_t> frame(size_t(W) * H, 0xff000000u);
+    gdi_composite_windows(frame.data(), W, H);
+    int32_t ox = 0, oy = 0;
+    user32::window_origin(dlg, &ox, &oy);
+    user32::Window *dw = user32::find_window(dlg);
+    if (!dw)
+        return;
+    int cw = dw->w + dw->nc_left + dw->nc_right, ch = dw->h + dw->nc_top + dw->nc_bottom;
+    if (ox < 0) {
+        cw += ox;
+        ox = 0;
+    }
+    if (oy < 0) {
+        ch += oy;
+        oy = 0;
+    }
+    cw = std::min(cw, W - ox);
+    ch = std::min(ch, H - oy);
+    if (cw <= 0 || ch <= 0)
+        return;
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return;
+    fprintf(f, "P6\n%d %d\n255\n", cw, ch);
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x) {
+            uint32_t p = frame[size_t(oy + y) * W + size_t(ox + x)];
+            unsigned char rgb[3] = {uint8_t(p >> 16), uint8_t(p >> 8), uint8_t(p)};
+            fwrite(rgb, 1, 3, f);
+        }
+    fclose(f);
+}
+
+// A DS_SETFONT dialog selects its template face into the dialog and every
+// control (the dialog manager's WM_SETFONT). The base units the template is
+// laid out with are measured from that same font, so a caption measured with
+// the font it draws with fits the control's DLU-mapped box, and WM_GETFONT
+// answers with the template font on a control the engine created.
+static void test_dialog_setfont() {
+    X86 cx;
+    loader_init_context(&cx);
+    X86 *c = &cx;
+    printf("\nUSER32 dialog DS_SETFONT application\n");
+    g_scratch = 0x00340000; // guest scratch for the template and strings
+    ensure_dialog_classes();
+    uint32_t proc = imports_resolve("USER32.dll", "DefWindowProcW");
+
+    uint32_t tmpl = scratch_block(768);
+    uint32_t q = tmpl + 22; // menu + class words precede the title
+    q += 2 * (gm_put_wstr(q, "Font Test", 32) + 1);
+    wr16(q, 8); // DS_SETFONT point size
+    q += 2;
+    q += 2 * (gm_put_wstr(q, "MS Sans Serif", 32) + 1);
+    q = (q + 3) & ~3u;
+    // WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 50x14 DLU at (7,7).
+    q = template_item(q, 0x50010000u, 0, 7, 7, 50, 14, 1001, 0x80, "Pick A Pet");
+    // WS_CHILD|WS_VISIBLE|SS_CENTER, a long static 120x20 DLU at (7,30).
+    q = template_item(q, 0x50000001u, 0, 7, 30, 120, 20, 1002, 0x82,
+                      "You can also change the owner name if you want.");
+    // WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER edit, 120x14 DLU at (7,60).
+    q = template_item(q, 0x50010080u, 0, 7, 60, 120, 14, 1003, 0x81, "");
+    uint32_t size = q - tmpl;
+    // WS_POPUP|WS_VISIBLE|WS_CAPTION|WS_SYSMENU|DS_SETFONT|DS_CENTER, 3 controls.
+    wr32(tmpl + 0, 0x90c80840u);
+    wr32(tmpl + 4, 0);
+    wr16(tmpl + 8, 3);
+    wr16(tmpl + 10, 0);
+    wr16(tmpl + 12, 0);
+    wr16(tmpl + 14, 200);
+    wr16(tmpl + 16, 100);
+    wr16(tmpl + 18, 0); // menu
+    wr16(tmpl + 20, 0); // class
+    // The title was already written at tmpl+22.
+
+    uint32_t dlg = user32::create_dialog_from_template(c, 0, 0, proc, tmpl, size);
+    check(dlg != 0, "create a DS_SETFONT dialog from a template");
+    user32::Window *dw = user32::find_window(dlg);
+    check(dw && dw->font != 0, "the dialog carries a template font (%08x)", dw ? dw->font : 0);
+    uint32_t button = call_import(c, "USER32.dll", "GetDlgItem", {dlg, 1001});
+    uint32_t edit = call_import(c, "USER32.dll", "GetDlgItem", {dlg, 1003});
+    check(button != 0 && edit != 0, "the template's button and edit exist");
+    uint32_t got =
+        call_import(c, "USER32.dll", "SendMessageA", {button, 0x31 /*WM_GETFONT*/, 0, 0});
+    check(got != 0 && got == (dw ? dw->font : 0),
+          "WM_GETFONT on a control returns the dialog's DS_SETFONT font");
+    // The font object is the DS_SETFONT face, an 8 pt em at 96 dpi (a negative
+    // lfHeight of 11 pixels, MulDiv(8, 96, 72)).
+    auto fit = gdi::objects().find(got);
+    bool is_font = fit != gdi::objects().end() && fit->second.kind == gdi::Object::Font;
+    std::string face;
+    if (is_font)
+        for (int i = 0; i < 31; ++i) {
+            uint16_t unit =
+                uint16_t(fit->second.logfont[28 + 2 * i] | (fit->second.logfont[29 + 2 * i] << 8));
+            if (!unit)
+                break;
+            face.push_back(char(unit));
+        }
+    int32_t lf_height = 0;
+    if (is_font)
+        memcpy(&lf_height, fit->second.logfont.data(), 4);
+    check(is_font && face == "MS Sans Serif" && lf_height == -11,
+          "the template font is \"%s\" at lfHeight %d", face.c_str(), lf_height);
+    // The layout measured the same face: the dialog's base units are the
+    // 8 pt MS Sans Serif metrics, not the 8x16 bitmap cell.
+    user32::DlgBaseUnit base = user32::dialog_base_units("MS Sans Serif", 8, 400);
+    check(dw && dw->dlg_base_x == base.x && dw->dlg_base_y == base.y,
+          "the dialog was laid out with the DS_SETFONT font metrics (%d x %d)",
+          dw ? dw->dlg_base_x : -1, dw ? dw->dlg_base_y : -1);
+    // A caption measured with the font it draws with fits the button's
+    // DLU-mapped pixel box: the reason the old bitmap font clipped "Pick A Pet".
+    uint32_t mem = call_import(c, "GDI32.dll", "CreateCompatibleDC", {0});
+    call_import(c, "GDI32.dll", "SelectObject", {mem, got});
+    uint32_t pick = scratch_block(16);
+    memcpy(g_mem + pick, "Pick A Pet", 11);
+    uint32_t ext = scratch_block(8);
+    check(call_import(c, "GDI32.dll", "GetTextExtentPoint32A", {mem, pick, 10, ext}) &&
+              int32_t(rd32(ext)) > 0,
+          "the caption measures with the template font (%d px)", int32_t(rd32(ext)));
+    int32_t caption_w = int32_t(rd32(ext));
+    int32_t button_w = button ? user32::find_window(button)->w : 0;
+    check(caption_w > 0 && caption_w <= button_w, "the caption fits the button (%d <= %d)",
+          caption_w, button_w);
+    call_import(c, "GDI32.dll", "DeleteDC", {mem});
+
+    // A template without DS_SETFONT keeps the bitmap default: the controls get
+    // no WM_SETFONT and WM_GETFONT answers 0, exactly as before.
+    uint32_t plain = scratch_block(256);
+    uint32_t r = plain + 22;
+    r += 2 * (gm_put_wstr(r, "Plain", 32) + 1);
+    r = (r + 3) & ~3u;
+    r = template_item(r, 0x50000000u, 0, 0, 0, 10, 5, 2001, 0x82, "plain");
+    wr32(plain + 0, 0x90000000u); // WS_POPUP|WS_VISIBLE, no DS_SETFONT
+    wr32(plain + 4, 0);
+    wr16(plain + 8, 1);
+    wr16(plain + 10, 0);
+    wr16(plain + 12, 0);
+    wr16(plain + 14, 20);
+    wr16(plain + 16, 10);
+    wr16(plain + 18, 0);
+    wr16(plain + 20, 0);
+    uint32_t plain_dlg = user32::create_dialog_from_template(c, 0, 0, proc, plain, r - plain);
+    uint32_t plain_child = call_import(c, "USER32.dll", "GetDlgItem", {plain_dlg, 2001});
+    check(plain_dlg && plain_child &&
+              call_import(c, "USER32.dll", "SendMessageA", {plain_child, 0x31, 0, 0}) == 0,
+          "a fontless template leaves the control with no WM_SETFONT font");
+
+    if (const char *preview = getenv("RECOMP_FONTS_PREVIEW"))
+        render_dialog_preview(c, dlg, preview);
+
+    call_import(c, "USER32.dll", "DestroyWindow", {dlg});
+    call_import(c, "USER32.dll", "DestroyWindow", {plain_dlg});
+}
+
 int main(int argc, char **argv) {
     mem_init();
     imports_init();
@@ -1153,6 +1368,7 @@ int main(int argc, char **argv) {
         test_msimg32();
         test_dib_rows_and_regions();
         test_static_control();
+        test_dialog_setfont();
         test_clip_children();
         test_draw_theme_parent_background();
         test_draw_theme_text_ex();

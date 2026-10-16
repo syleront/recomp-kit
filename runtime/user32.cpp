@@ -86,6 +86,28 @@ DlgBaseUnit dialog_base_units(const std::string &face, int32_t pointsize, int32_
     }
     return base;
 }
+// The font object a DS_SETFONT template selects into its dialog and controls.
+// Built from the same face and point size dialog_base_units measures, so the
+// layout and the drawn glyphs agree, and cached by those three fields because
+// the object is immutable and dialogs are created repeatedly (Petz 5 opens one
+// per screen). Zero when the face has no measurable font, so the caller keeps
+// the 8x16 bitmap default and nothing changes for a template the runtime cannot
+// measure.
+uint32_t dialog_font(const std::string &face, int32_t pointsize, int32_t weight) {
+    if (face.empty() || pointsize <= 0)
+        return 0;
+    int32_t ave = 0, height = 0;
+    if (!gdi::font_dialog_units(face, pointsize, weight, &ave, &height))
+        return 0;
+    static std::map<std::string, uint32_t> cache;
+    std::string key = face + "|" + std::to_string(pointsize) + "|" + std::to_string(weight);
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second;
+    uint32_t handle = gdi::make_object(gdi::dialog_font_object(face, pointsize, weight));
+    cache[key] = handle;
+    return handle;
+}
 
 // Class names arrive either as a pointer to a string or as an atom (< 0x10000).
 std::string class_key(uint32_t p, bool wide) {
@@ -1148,6 +1170,20 @@ void def_window_proc(X86 *c, bool wide) {
         return;
     case 0x000e: // WM_GETTEXTLENGTH
         set_eax(c, w ? (wide ? wide_units(w->title_utf8) : uint32_t(w->title_utf8.size())) : 0);
+        return;
+    // WM_SETFONT/WM_GETFONT belong to every window class, not only STATIC: the
+    // dialog engine selects the template font into its controls and a program
+    // that asks a control which font it draws with must get that font back.
+    case 0x0030: // WM_SETFONT
+        if (w) {
+            w->font = arg(c, 2);
+            if (arg(c, 3)) // redraw requested
+                w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0031: // WM_GETFONT
+        set_eax(c, w ? w->font : 0);
         return;
     case 0x000f: // DefWindowProc validates an otherwise unhandled paint.
         if (w)
@@ -2461,8 +2497,12 @@ void paint_dialog_chrome(X86 *c, uint32_t hwnd) {
         const int32_t text_right = sysmenu ? right - 3 - box - 4 : right - 4;
         if (units && units < (UINT32_MAX - 32) / 2 && text_right > 4) {
             if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
-                dc->text_color = 0x00ffffff;
-                dc->bk_mode = 1; // TRANSPARENT
+                if (auto *title_dc = gdi::dc_of(hdc)) {
+                    title_dc->text_color = 0x00ffffff;
+                    title_dc->bk_mode = 1; // TRANSPARENT
+                    if (w->font)
+                        title_dc->font = w->font; // the dialog's DS_SETFONT face
+                }
                 wr32(block + 0, 4);
                 wr32(block + 4, uint32_t(-t));
                 wr32(block + 8, uint32_t(text_right));
@@ -2480,14 +2520,126 @@ skip_caption:
     gdi_release_window_dc(hwnd, hdc);
 }
 
+// A filled disc by horizontal spans (an integer midpoint form, no libm): the
+// radio glyph needs a ring and a dot and the runtime has no ellipse helper a
+// control paint can reach without an import.
+void fill_disc(uint32_t hdc, int32_t cx, int32_t cy, int32_t r, uint32_t color) {
+    for (int32_t dy = -r; dy <= r; ++dy) {
+        int32_t x = r;
+        while (x > 0 && int64_t(x) * x + int64_t(dy) * dy > int64_t(r) * r)
+            --x;
+        gdi::fill(hdc, {cx - x, cy + dy, cx + x + 1, cy + dy + 1}, color);
+    }
+}
+// Button styles whose check state lives in the window's userdata rather than
+// the pressed flag: checkbox, auto-checkbox, radio, 3-state, auto-3-state,
+// auto-radio (BS_TYPEMASK values 2,3,4,5,6,9).
+bool is_check_button(uint32_t style) {
+    const uint32_t bs = style & 0x0fu;
+    return bs == 2 || bs == 3 || bs == 4 || bs == 5 || bs == 6 || bs == 9;
+}
+// A checkbox or radio button: a 13 px glyph (a box, or a circle) at the left of
+// the caption (the right, with BS_LEFTTEXT), filled when checked, and the
+// caption drawn in the control's font. A checkbox gets the parent's
+// WM_CTLCOLORSTATIC colour protocol, as on Windows.
+void paint_checkbox(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    const bool radio = ((w->style & 0x0fu) == 0x4u || (w->style & 0x0fu) == 0x9u);
+    const uint32_t checked = (w->userdata & 3u) != 0;
+    const bool left_text = (w->style & 0x20u) != 0; // BS_LEFTTEXT
+    const std::string text = w->title_utf8;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk_mode = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
+    // Background: the parent's WM_CTLCOLORSTATIC brush, else the dialog face.
+    uint32_t pixel = 0;
+    bool have = false;
+    if (w->parent) {
+        uint32_t brush =
+            host_dispatch_to_wndproc(c, w->parent, 0x0138 /* WM_CTLCOLORSTATIC */, hdc, hwnd);
+        have = brush && gdi::brush_color(brush, &pixel);
+        if (!have) {
+            if (Window *pw = find_window(w->parent); pw && pw->cls == "#32770") {
+                uint32_t b = host_dispatch_to_wndproc(c, w->parent, 0x0131 /* WM_CTLCOLORDLG */,
+                                                      hdc, w->parent);
+                have = b && gdi::brush_color(b, &pixel);
+                if (!have)
+                    pixel = gdi::argb(0x00c8d0d4), have = true;
+            }
+        }
+    }
+    if (have)
+        gdi::fill(hdc, {0, 0, width, height}, pixel);
+    if (auto *paint_dc = gdi::dc_of(hdc)) {
+        paint_dc->bk_mode = 1; // TRANSPARENT over the background
+        paint_dc->text_color = 0x00000000;
+    }
+    const int32_t g = 13, gy = (height - 13) / 2, gx = left_text ? width - 13 : 0;
+    const uint32_t white = 0x00ffffff, dk = gdi::argb(0x00000000), lo = gdi::argb(0x00808080);
+    if (radio) {
+        fill_disc(hdc, gx + g / 2, gy + g / 2, g / 2, lo);
+        fill_disc(hdc, gx + g / 2, gy + g / 2, g / 2 - 1, white);
+        if (checked)
+            fill_disc(hdc, gx + g / 2, gy + g / 2, g / 2 - 3, dk);
+    } else {
+        gdi::fill(hdc, {gx, gy, gx + g, gy + g}, white);
+        gdi::fill(hdc, {gx, gy, gx + g, gy + 1}, lo); // sunken top/left
+        gdi::fill(hdc, {gx, gy, gx + 1, gy + g}, lo);
+        gdi::fill(hdc, {gx, gy + g - 1, gx + g, gy + g}, white); // light bottom/right
+        gdi::fill(hdc, {gx + g - 1, gy, gx + g, gy + g}, white);
+        if (checked) {
+            gdi::line(hdc, gx + 3, gy + 6, gx + 5, gy + 9);
+            gdi::line(hdc, gx + 5, gy + 9, gx + 10, gy + 3);
+        }
+    }
+    const int32_t tx = left_text ? 0 : gx + g + 4;
+    uint32_t units = text.empty() ? 0 : wide_units(text);
+    if (units && units < (UINT32_MAX - 32) / 2) {
+        if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+            wr32(block + 0, uint32_t(tx));
+            wr32(block + 4, 0);
+            wr32(block + 8, uint32_t(width));
+            wr32(block + 12, uint32_t(height));
+            gm_put_wstr(block + 16, text, units + 1);
+            gdi::draw_text(hdc, block + 16, units, block,
+                           0x0 /*DT_LEFT*/ | 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/ |
+                               0x800 /*DT_NOPREFIX*/);
+            heap_free(block);
+        }
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk_mode;
+    }
+}
 // A push button in a dialog: a COLOR_BTNFACE face with a raised 3D bevel, a
 // sunken one while the press is held, and the caption centred. BS_DEFPUSHBUTTON
-// (style 1) also gets the dark default-button border. Other button styles
-// (checkbox, radio, group box) fall back to the STATIC caption path.
+// (style 1) also gets the dark default-button border. Checkboxes and radios get
+// the glyph path above; other button styles fall back to the STATIC caption
+// path.
 void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
     if (!w)
         return;
+    if (is_check_button(w->style)) {
+        paint_checkbox(c, hwnd, into);
+        return;
+    }
     if ((w->style & 0x0fu) > 1u) {
         paint_control(c, hwnd, into);
         return;
@@ -2506,8 +2658,22 @@ void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
             gdi_release_window_dc(hwnd, hdc);
         return;
     }
-    const uint32_t face = gdi::argb(0x00c8d0d4), hi = gdi::argb(0x00ffffff),
-                   lo = gdi::argb(0x00808080), dk = gdi::argb(0x00000000);
+    const uint32_t caller_font = dc->font;
+    const int caller_bk_mode = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font; // the dialog's WM_SETFONT face, or the control's own
+    // A dialog may choose the button's face with WM_CTLCOLORBTN; the classic
+    // COLOR_BTNFACE is the fallback.
+    uint32_t face = gdi::argb(0x00c8d0d4);
+    if (w->parent) {
+        uint32_t brush =
+            host_dispatch_to_wndproc(c, w->parent, 0x0135 /* WM_CTLCOLORBTN */, hdc, hwnd);
+        uint32_t pixel;
+        if (brush && gdi::brush_color(brush, &pixel))
+            face = pixel;
+    }
+    const uint32_t hi = gdi::argb(0x00ffffff), lo = gdi::argb(0x00808080),
+                   dk = gdi::argb(0x00000000);
     gdi::fill(hdc, {0, 0, width, height}, face);
     // The bevel swaps ends when the button is held down.
     const uint32_t top_left = pressed ? lo : hi, bottom_right = pressed ? hi : dk;
@@ -2524,8 +2690,11 @@ void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
     uint32_t units = text.empty() ? 0 : wide_units(text);
     if (units && units < (UINT32_MAX - 32) / 2) {
         if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
-            dc->text_color = disabled ? 0x00808080 : 0x00000000;
-            dc->bk_mode = 1; // TRANSPARENT
+            if (auto *paint_dc = gdi::dc_of(hdc)) {
+                if (disabled)
+                    paint_dc->text_color = 0x00808080;
+                paint_dc->bk_mode = 1; // TRANSPARENT over the bevel
+            }
             int32_t off = pressed ? 1 : 0;
             wr32(block + 0, off);
             wr32(block + 4, off);
@@ -2540,6 +2709,10 @@ void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
     }
     if (!into)
         gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) { // the caller's DC keeps its own state
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk_mode;
+    }
 }
 
 // A listbox control with strings (LBS_HASSTRINGS): paint the rows top to
@@ -2553,18 +2726,31 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
         w->update_pending = false;
     const int32_t width = w->w, height = w->h;
     uint32_t hdc = into ? into : gdi_window_dc(hwnd);
-    if (!gdi::dc_of(hdc))
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc)
         return;
+    const uint32_t caller_font = dc->font;
+    const int caller_bk_mode = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
     gdi::fill(hdc, {0, 0, width, height}, 0x00ffffff);
     bool drawn = owner_draw_listbox(c, w, hwnd, hdc, width, height);
     if (drawn) {
         if (!into)
             gdi_release_window_dc(hwnd, hdc);
+        else if (auto *caller = gdi::dc_of(hdc)) {
+            caller->font = caller_font;
+            caller->bk_mode = caller_bk_mode;
+        }
         return;
     }
+    if (auto *paint_dc = gdi::dc_of(hdc))
+        paint_dc->bk_mode = 1; // TRANSPARENT: the row background is what was just filled
     int32_t y = 0;
     for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i) {
         int32_t ih = listbox_item_height(c, w, i);
+        if (auto *paint_dc = gdi::dc_of(hdc))
+            paint_dc->text_color = i == w->list_sel ? 0x00ffffff : 0x00000000;
         if (i == w->list_sel)
             gdi::fill(hdc, {0, y, width, y + ih}, 0x00c00000);
         uint32_t units = wide_units(w->list_items[i]);
@@ -2585,6 +2771,59 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
     }
     if (!into)
         gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk_mode;
+    }
+}
+// An edit control: a white field inside a sunken 1 px border, its text in the
+// dialog font, left aligned. Caret and selection are not modelled (TD-049); the
+// field and its text are what the reached naming dialog needs.
+void paint_edit(X86 *c, uint32_t hwnd, uint32_t into) {
+    (void)c;
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc)
+        return;
+    const uint32_t caller_font = dc->font;
+    const int caller_bk_mode = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
+    const uint32_t white = 0x00ffffff, lo = gdi::argb(0x00808080);
+    gdi::fill(hdc, {0, 0, width, height}, white);
+    // Sunken edge: dark on the top/left, the field's own white on the
+    // bottom/right, which is how a classic edit field reads.
+    gdi::fill(hdc, {0, 0, width, 1}, lo);
+    gdi::fill(hdc, {0, 0, 1, height}, lo);
+    if (auto *paint_dc = gdi::dc_of(hdc)) {
+        paint_dc->text_color = 0x00000000;
+        paint_dc->bk_mode = 1; // TRANSPARENT over the white field
+    }
+    uint32_t units = w->title_utf8.empty() ? 0 : wide_units(w->title_utf8);
+    if (units && units < (UINT32_MAX - 32) / 2) {
+        if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+            wr32(block + 0, 3); // a pixel of padding inside the border
+            wr32(block + 4, 2);
+            wr32(block + 8, uint32_t(width - 4));
+            wr32(block + 12, uint32_t(height - 2));
+            gm_put_wstr(block + 16, w->title_utf8, units + 1);
+            gdi::draw_text(hdc, block + 16, units, block,
+                           0x0 /*DT_LEFT*/ | 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/);
+            heap_free(block);
+        }
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk_mode;
+    }
 }
 // Control windows answer the button-state and text messages the dialog helper
 // imports generate; everything else falls through to DefWindowProc.
@@ -2598,6 +2837,8 @@ void control_proc(X86 *c) {
             paint_listbox(c, hwnd, arg(c, 2));
         else if (w && w->cls == "button")
             paint_button(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "edit")
+            paint_edit(c, hwnd, arg(c, 2));
         else
             paint_control(c, hwnd, arg(c, 2));
         set_eax(c, 0);
@@ -2889,7 +3130,10 @@ void control_proc(X86 *c) {
             return;
         }
         if (w) {
-            w->userdata |= 1u;
+            // A checkbox/radio keeps its check state in userdata; a press does
+            // not disturb it (only the push buttons use the pressed bit).
+            if (w->cls != "button" || !is_check_button(w->style))
+                w->userdata |= 1u;
             w->update_pending = true; // the pressed bevel has to be drawn
         }
         set_eax(c, 0);
@@ -2898,7 +3142,19 @@ void control_proc(X86 *c) {
         uint32_t parent = w ? w->parent : 0, id = w ? w->id : 0;
         LOGW("control: WM_LBUTTONUP hwnd=%08x id=%u parent=%08x", hwnd, id, parent);
         if (w) {
-            w->userdata &= ~1u;
+            if (w->cls == "button" && is_check_button(w->style)) {
+                // An auto-checkbox/auto-3-state toggles itself before notifying
+                // (BS_AUTO*), like the button class; the others only repaint.
+                const uint32_t bs = w->style & 0x0fu;
+                if (bs == 3) // BS_AUTOCHECKBOX
+                    w->userdata = w->userdata ? 0u : 1u;
+                else if (bs == 6) // BS_AUTO3STATE
+                    w->userdata = (w->userdata + 1) % 3;
+                else if (bs == 9) // BS_AUTORADIOBUTTON
+                    w->userdata = 1u;
+            } else {
+                w->userdata &= ~1u;
+            }
             if (w->cls == "button")
                 w->update_pending = true; // the bevel returns to raised
         }
@@ -3125,7 +3381,8 @@ std::string dlg_control_class(const DlgItemTemplate &it) {
     }
     return it.cls.empty() ? "static" : user32::lower(it.cls);
 }
-uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it, const DlgBaseUnit &base) {
+uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it, const DlgBaseUnit &base,
+                          uint32_t font) {
     uint32_t hwnd = g_next_hwnd;
     g_next_hwnd += 4;
     Window w;
@@ -3149,6 +3406,7 @@ uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it, const DlgB
     w.title_utf8 = it.text;
     w.parent = parent;
     w.id = it.id;
+    w.font = font; // the dialog's DS_SETFONT face, as WM_SETFONT would set it
     w.thread = guest_current_thread_id();
     w.visible = true;
     w.shown = true;
@@ -3161,7 +3419,7 @@ uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it, const DlgB
 // modal (DialogBoxParamA) and modeless (CreateDialogParamA) entry points. A
 // template without WS_VISIBLE is created hidden, exactly as Windows does, so
 // the caller's ShowWindow is what makes it appear and invalidates it.
-uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
+uint32_t create_dialog_window(X86 *c, uint32_t hinst, uint32_t parent, uint32_t proc,
                               const DlgTemplate &t) {
     ensure_dialog_classes();
     uint32_t hwnd = g_next_hwnd;
@@ -3172,12 +3430,17 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
     w.style = t.style;
     w.exstyle = t.exstyle;
     // Everything in the template is in dialog units, sized by the DS_SETFONT
-    // face; the pixel size is what the window and its controls are placed with.
+    // face; the pixel size is what the window and its controls are placed with,
+    // and the same face is what they draw their text with.
     DlgBaseUnit base;
-    if ((t.style & 0x40 /*DS_SETFONT / DS_SHELLFONT*/) && t.pointsize > 0)
+    uint32_t font = 0;
+    if ((t.style & 0x40 /*DS_SETFONT / DS_SHELLFONT*/) && t.pointsize > 0) {
         base = dialog_base_units(t.font, t.pointsize, t.weight);
+        font = dialog_font(t.font, t.pointsize, t.weight);
+    }
     w.dlg_base_x = base.x;
     w.dlg_base_y = base.y;
+    w.font = font;
     w.w = dialog_map_unit(t.cx, base.x, 4);
     w.h = dialog_map_unit(t.cy, base.y, 8);
     w.cls = "#32770";
@@ -3225,7 +3488,17 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
     windows()[hwnd] = w;
     window_created(hwnd);
     for (const DlgItemTemplate &item : t.items)
-        dlg_create_child(hwnd, item, base);
+        dlg_create_child(hwnd, item, base, font);
+    // The dialog manager selects the template font into every control before
+    // WM_INITDIALOG. The children are the runtime's own control procedures, so
+    // dispatching it is safe and makes WM_GETFONT answer with the template face
+    // (the dialog's own font lives in its Window record; its procedure is the
+    // guest's, and Windows procs are not driven with a message they never asked
+    // for before WM_INITDIALOG).
+    if (font)
+        for (const auto &kv : windows())
+            if (kv.second.parent == hwnd)
+                host_dispatch_to_wndproc(c, kv.first, 0x0030 /* WM_SETFONT */, font, 1);
     // The dialog manager gives the keyboard to the first tab stop, which is
     // where the host's keystrokes go (an edit control in a naming dialog).
     for (const auto &kv : windows())
@@ -3236,6 +3509,19 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
         }
     return hwnd;
 }
+// Decode a dialog template that is already in guest memory and build the window
+// and its controls. DialogBoxParamA/CreateDialogParamA reach the same code
+// through a resource; this entry point lets a test drive the DS_SETFONT font
+// application without a resource. Returns the dialog's handle, or 0.
+namespace user32 {
+uint32_t create_dialog_from_template(X86 *c, uint32_t hinst, uint32_t parent, uint32_t proc,
+                                     uint32_t tmpl, uint32_t size) {
+    DlgTemplate t;
+    if (!tmpl || !size || !parse_dlg_template(tmpl, size, &t))
+        return 0;
+    return create_dialog_window(c, hinst, parent, proc, t);
+}
+} // namespace user32
 // DialogBoxParamA reads the template from hInstance, builds the window and its
 // controls, sends WM_INITDIALOG and pumps until EndDialog. Returns -1 when the
 // template cannot be read or nobody can answer the dialog.
@@ -3257,7 +3543,7 @@ void u_DialogBoxParamA(X86 *c) {
         set_eax(c, 0xffffffffu);
         return;
     }
-    uint32_t hwnd = create_dialog_window(hinst, parent, proc, t);
+    uint32_t hwnd = create_dialog_window(c, hinst, parent, proc, t);
     if (const Window *cw = find_window(hwnd)) {
         const Window *ow = find_window(parent);
         LOGV("DialogBoxParamA: name=%u parent=%08x owner=%dx%d rect=(%d,%d) %dx%d", name, parent,
@@ -3350,7 +3636,7 @@ void u_CreateDialogParamA(X86 *c) {
         set_eax(c, 0);
         return;
     }
-    uint32_t hwnd = create_dialog_window(hinst, parent, proc, t);
+    uint32_t hwnd = create_dialog_window(c, hinst, parent, proc, t);
     if (!hwnd) {
         set_eax(c, 0);
         return;
