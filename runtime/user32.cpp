@@ -1969,11 +1969,54 @@ void u_ScrollWindowEx(X86 *c) {
 void u_CallWindowProcA(X86 *c) {
     set_eax(c, guest_call(c, arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4)));
 }
-// DrawState renders a control-like glyph through a callback. The game uses it
-// for its disabled/checked menu marks; there is no glyph to draw here, so the
-// call succeeds without painting.
+// DrawState renders a control-like glyph through a callback. Petz 5 uses the
+// text form for its disabled menu marks: the current area's Go To item is
+// disabled (so it cannot reload the scene the player is already in) and its
+// label is drawn with DrawStateA(DST_TEXT, DSS_DISABLED) instead of DrawTextA.
+// Windows paints that with an embossed "disabled" look — the glyph in
+// COLOR_3DSHADOW with a COLOR_3DHILIGHT highlight one pixel down and right.
+// Drawing nothing left the item showing its icon but no caption (the blank Go
+// To row between Asia and Snow Scene). Only the text states are drawn; an
+// icon/bitmap DST_ still succeeds without painting.
 void u_DrawStateA(X86 *c) {
-    log_once("DrawStateA", "DrawStateA: glyph not drawn; reporting success");
+    uint32_t hdc = arg(c, 0), data = arg(c, 3), flags = arg(c, 9);
+    auto *dc = gdi::dc_of(hdc);
+    uint32_t type = flags & 0xfu;
+    if (!dc || !data || (type != 1u && type != 2u)) { // DST_TEXT, DST_PREFIXTEXT
+        set_eax(c, 1);
+        return;
+    }
+    const std::string text = gm_str(data);
+    const uint32_t units = wide_units(text);
+    const int32_t x = int32_t(arg(c, 5)), y = int32_t(arg(c, 6));
+    const int32_t cx = int32_t(arg(c, 7)), cy = int32_t(arg(c, 8));
+    if (!units || cx <= 0 || cy <= 0) {
+        set_eax(c, 1);
+        return;
+    }
+    uint32_t block = heap_alloc(16 + 2 * (units + 1), true);
+    if (!block) {
+        set_eax(c, 1);
+        return;
+    }
+    gm_put_wstr(block + 16, text, units + 1);
+    auto draw_at = [&](int32_t ox, int32_t oy) {
+        wr32(block + 0, uint32_t(x + ox));
+        wr32(block + 4, uint32_t(y + oy));
+        wr32(block + 8, uint32_t(x + ox + cx));
+        wr32(block + 12, uint32_t(y + oy + cy));
+        dc->bk_mode = 1; // TRANSPARENT: keep the already-painted item cell
+        gdi::draw_text(hdc, block + 16, units, block, 0x20 /*DT_SINGLELINE*/);
+    };
+    if (flags & 0x20u) { // DSS_DISABLED
+        dc->text_color = 0x00ffffff; // COLOR_3DHILIGHT
+        draw_at(1, 1);
+        dc->text_color = 0x00808080; // COLOR_3DSHADOW
+        draw_at(0, 0);
+    } else {
+        draw_at(0, 0);
+    }
+    heap_free(block);
     set_eax(c, 1);
 }
 // WinHelp opens the old WinHelp engine, which does not exist here. Reporting
@@ -2319,14 +2362,19 @@ void paint_dialog_chrome(X86 *c, uint32_t hwnd) {
         return;
     }
     const int32_t right = cw + r, bottom = ch + b;
-    const uint32_t face = gdi::argb(0x00d4d0c8); // COLOR_BTNFACE
+    // gdi::argb takes a COLORREF (00BBGGRR) and returns the surface's
+    // ARGB. These literals are the COLORREF byte order, so a face named by
+    // its RGB triple (D4 D0 C8) is written 0x00c8d0d4; writing the RGB value
+    // straight in (0x00d4d0c8) would swap red and blue.
+    const uint32_t face = gdi::argb(0x00c8d0d4); // COLOR_BTNFACE, RGB(0xD4,0xD0,0xC8)
     const uint32_t hi = gdi::argb(0x00ffffff);   // COLOR_3DHILIGHT
     const uint32_t lo = gdi::argb(0x00808080);   // COLOR_3DSHADOW
     const uint32_t dk = gdi::argb(0x00000000);   // COLOR_3DDKSHADOW
     // The whole window starts as frame face, then the caption bar on top.
     gdi::fill(hdc, {-l, -t, right, bottom}, face);
     if (caption)
-        gdi::fill(hdc, {-l, -t, right, 0}, gdi::argb(0x000a246a)); // COLOR_ACTIVECAPTION
+        // COLOR_ACTIVECAPTION, the classic navy RGB(0x0A,0x24,0x6A).
+        gdi::fill(hdc, {-l, -t, right, 0}, gdi::argb(0x006a240a));
     // The client background: the brush the dialog proc returns for
     // WM_CTLCOLORDLG, else COLOR_BTNFACE. Sent before the client is filled; the
     // window is re-found afterwards because a guest handler may destroy it.
@@ -2416,7 +2464,7 @@ void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
             gdi_release_window_dc(hwnd, hdc);
         return;
     }
-    const uint32_t face = gdi::argb(0x00d4d0c8), hi = gdi::argb(0x00ffffff),
+    const uint32_t face = gdi::argb(0x00c8d0d4), hi = gdi::argb(0x00ffffff),
                    lo = gdi::argb(0x00808080), dk = gdi::argb(0x00000000);
     gdi::fill(hdc, {0, 0, width, height}, face);
     // The bevel swaps ends when the button is held down.
