@@ -1984,6 +1984,11 @@ int main(int argc, char **argv) {
            window_focused() ? "yes" : "no");
     fflush(stdout);
 
+    // The native system dialogs (platform/os.h's presenters): the game's
+    // comdlg32/USER32 shims reach them. Installed once the window and NSApp
+    // exist and before the guest can ask for one.
+    platform_ui_install_dialogs();
+
     BootOptions options;
     options.name = "windowed";
     options.exe = exe.c_str();

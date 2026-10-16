@@ -204,6 +204,11 @@ elseif(ANDROID)
   set(POP_PLATFORM_UI ${HOST}/sdl/platform_ui_desktop.cpp ${HOST}/launcher/launcher_platform_android.cpp)
 else()
   set(POP_PLATFORM_UI ${HOST}/sdl/platform_ui_desktop.cpp ${HOST}/launcher/launcher_platform_desktop.cpp)
+  if(APPLE)
+    # macOS gets the native NSSavePanel/NSAlert presenters; the shared desktop
+    # file keeps the no-op for Linux and Windows.
+    list(APPEND POP_PLATFORM_UI ${HOST}/sdl/platform_ui_mac.mm)
+  endif()
 endif()
 
 if(TARGET recomp_gen)

@@ -2873,6 +2873,188 @@ static void test_windows(X86 *c) {
           "MB_OKCANCEL | MB_DEFBUTTON2 returns IDCANCEL");
 }
 
+// ---------------------------------------------------------------------------
+// Common dialogs. The Win32 OPENFILENAMEA is parsed into the platform seam's
+// request, the chosen path is written back with the offsets Windows sets, and
+// a cancel is FALSE with no error. A registered presenter observes exactly
+// what the struct carried; the deterministic fallback
+// (RECOMP_FILE_DIALOG_RESULT) is checked without one.
+// ---------------------------------------------------------------------------
+struct CapturedDialog {
+    int called = 0, save = 0, filter_count = 0, filter_index = 0;
+    uint32_t flags = 0;
+    std::string title, dir, ext, initial, f0desc, f0pats;
+};
+static CapturedDialog g_cap_dialog;
+
+extern "C" int capture_file_dialog(OsFileDialog *d) {
+    g_cap_dialog = CapturedDialog{};
+    g_cap_dialog.called = 1;
+    g_cap_dialog.save = d->save;
+    g_cap_dialog.title = d->title ? d->title : "";
+    g_cap_dialog.dir = d->initial_dir ? d->initial_dir : "";
+    g_cap_dialog.ext = d->default_ext ? d->default_ext : "";
+    g_cap_dialog.initial = d->file ? d->file : "";
+    g_cap_dialog.filter_count = d->filter_count;
+    g_cap_dialog.filter_index = d->filter_index;
+    g_cap_dialog.flags = d->flags;
+    if (d->filter_count > 0) {
+        g_cap_dialog.f0desc = d->filters[0].description ? d->filters[0].description : "";
+        g_cap_dialog.f0pats = d->filters[0].patterns ? d->filters[0].patterns : "";
+    }
+    return os_file_dialog_set_result(d, "/captured/Chosen.pet");
+}
+
+struct CapturedBox {
+    int called = 0, count = 0, default_index = -1, icon = 0;
+    std::vector<std::string> labels;
+    std::vector<uint32_t> ids;
+};
+static CapturedBox g_cap_box;
+
+extern "C" int capture_message_box(const OsMessageBox *m) {
+    g_cap_box = CapturedBox{};
+    g_cap_box.called = 1;
+    g_cap_box.count = m->count;
+    g_cap_box.default_index = m->default_index;
+    g_cap_box.icon = m->icon;
+    for (int i = 0; i < m->count; ++i) {
+        g_cap_box.labels.push_back(m->labels[i] ? m->labels[i] : "");
+        g_cap_box.ids.push_back(m->ids[i]);
+    }
+    return 1; // the second button, whatever the set
+}
+
+static uint32_t put_bytes(const void *data, uint32_t n) {
+    uint32_t a = scratch_block(n + 16);
+    memcpy(g_mem + a, data, n);
+    return a;
+}
+
+static void test_common_dialogs(X86 *c) {
+    section("common dialogs");
+    // The filter string the game's Copy builds: "Petz File\0*.pet;\0\0".
+    const char kFilter[] = "Petz File\0*.pet;\0";
+    uint32_t filter = put_bytes(kFilter, sizeof kFilter);
+
+    uint32_t file_buf = scratch_block(260);
+    memcpy(g_mem + file_buf, "Pouncer.pet", 12);
+    uint32_t title = put_str("Select Petz Destination");
+    uint32_t dir = put_str("C:\\Docs");
+    uint32_t ext = put_str("pet");
+    uint32_t ofn = scratch_block(76);
+    wr32(ofn + 0, 76);
+    wr32(ofn + 12, filter);
+    wr32(ofn + 24, 1);
+    wr32(ofn + 28, file_buf);
+    wr32(ofn + 32, 260);
+    wr32(ofn + 44, dir);
+    wr32(ofn + 48, title);
+    wr32(ofn + 52, 0x80eu);
+    wr32(ofn + 60, ext);
+
+    // A registered presenter sees exactly what the OPENFILENAMEA carried.
+    os_set_file_dialog_presenter(capture_file_dialog);
+    check(call_import(c, "comdlg32.dll", "GetSaveFileNameA", {ofn}) == 1,
+          "GetSaveFileNameA returns TRUE with a presenter");
+    check(g_cap_dialog.called && g_cap_dialog.save == 1, "the presenter was asked to save");
+    check(g_cap_dialog.title == "Select Petz Destination", "lpstrTitle reached the presenter");
+    check(g_cap_dialog.dir == "C:\\Docs", "lpstrInitialDir reached the presenter");
+    check(g_cap_dialog.ext == "pet", "lpstrDefExt reached the presenter");
+    check(g_cap_dialog.initial == "Pouncer.pet", "lpstrFile preloaded the name");
+    check(g_cap_dialog.filter_count == 1 && g_cap_dialog.f0desc == "Petz File" &&
+              g_cap_dialog.f0pats == "*.pet;",
+          "lpstrFilter split into a description and its patterns");
+    check(g_cap_dialog.flags == 0x80eu && g_cap_dialog.filter_index == 1,
+          "Flags and nFilterIndex reached the presenter");
+    check(gm_str(file_buf, 260) == "/captured/Chosen.pet",
+          "the chosen path was written into lpstrFile");
+    check(rd16(ofn + 56) == 10 && rd16(ofn + 58) == 16,
+          "nFileOffset/nFileExtension point at the name and the extension");
+    check(call_import(c, "comdlg32.dll", "CommDlgExtendedError", {}) == 0,
+          "a success leaves CommDlgExtendedError at 0");
+    os_set_file_dialog_presenter(nullptr);
+
+    // The deterministic fallback: RECOMP_FILE_DIALOG_RESULT chooses the path.
+    os_setenv("RECOMP_FILE_DIALOG_RESULT", "/env/FromEnv.pet");
+    memcpy(g_mem + file_buf, "Pouncer.pet", 12);
+    check(call_import(c, "comdlg32.dll", "GetSaveFileNameA", {ofn}) == 1,
+          "GetSaveFileNameA returns TRUE from the env result");
+    check(gm_str(file_buf, 260) == "/env/FromEnv.pet",
+          "RECOMP_FILE_DIALOG_RESULT became the chosen path");
+    check(rd16(ofn + 56) == 5 && rd16(ofn + 58) == 12,
+          "the fallback sets nFileOffset/nFileExtension");
+
+    // A cancel is FALSE with no error, exactly as Windows leaves it.
+    os_setenv("RECOMP_FILE_DIALOG_RESULT", "cancel");
+    check(call_import(c, "comdlg32.dll", "GetSaveFileNameA", {ofn}) == 0, "a cancel returns FALSE");
+    check(call_import(c, "comdlg32.dll", "CommDlgExtendedError", {}) == 0,
+          "a cancel leaves CommDlgExtendedError at 0");
+
+    // A path that does not fit nMaxFile: FALSE and FNERR_BUFFERTOOSMALL.
+    os_setenv("RECOMP_FILE_DIALOG_RESULT", "/a/very/long/chosen/name.pet");
+    uint32_t small = scratch_block(8);
+    memcpy(g_mem + small, "x.pet", 6);
+    wr32(ofn + 28, small);
+    wr32(ofn + 32, 8);
+    check(call_import(c, "comdlg32.dll", "GetSaveFileNameA", {ofn}) == 0,
+          "a path that does not fit returns FALSE");
+    check(call_import(c, "comdlg32.dll", "CommDlgExtendedError", {}) == 0x3003,
+          "FNERR_BUFFERTOOSMALL is reported");
+    check(gm_str(small, 8).size() == 7, "lpstrFile holds a truncated prefix");
+
+    // A too-small lStructSize is CDERR_STRUCTSIZE, as on Windows.
+    wr32(ofn + 0, 40);
+    check(call_import(c, "comdlg32.dll", "GetSaveFileNameA", {ofn}) == 0,
+          "a short OPENFILENAMEA returns FALSE");
+    check(call_import(c, "comdlg32.dll", "CommDlgExtendedError", {}) == 0x0001,
+          "CDERR_STRUCTSIZE is reported");
+    wr32(ofn + 0, 76);
+
+    // GetOpenFileNameA differs only in the panel it asks for.
+    wr32(ofn + 28, file_buf);
+    wr32(ofn + 32, 260);
+    os_setenv("RECOMP_FILE_DIALOG_RESULT", "/env/Open.me");
+    check(call_import(c, "comdlg32.dll", "GetOpenFileNameA", {ofn}) == 1,
+          "GetOpenFileNameA returns TRUE from the env result");
+    os_unsetenv("RECOMP_FILE_DIALOG_RESULT");
+
+    // The message box: the button set, labels, default and icon, and the id
+    // the chosen index maps back to.
+    os_set_message_box_presenter(capture_message_box);
+    uint32_t answer = call_import(c, "USER32.dll", "MessageBoxA",
+                                  {0, put_str("Do it?"), put_str("Confirm"), 3 | 0x30});
+    check(g_cap_box.called && g_cap_box.count == 3, "MB_YESNOCANCEL asks for three buttons");
+    check(g_cap_box.labels.size() == 3 && g_cap_box.labels[0] == "Yes" &&
+              g_cap_box.labels[1] == "No" && g_cap_box.labels[2] == "Cancel",
+          "the buttons carry their Win32 labels");
+    check(g_cap_box.ids.size() == 3 && g_cap_box.ids[0] == 6 && g_cap_box.ids[1] == 7 &&
+              g_cap_box.ids[2] == 2,
+          "the buttons carry IDYES/IDNO/IDCANCEL");
+    check(g_cap_box.icon == 2, "MB_ICONWARNING maps to the warning icon");
+    check(answer == 7, "the presenter's second button maps back to IDNO");
+    os_set_message_box_presenter(nullptr);
+
+    // RECOMP_MESSAGEBOX_RESULT answers by name or by id, and an id the set does
+    // not contain falls back to the default button.
+    os_setenv("RECOMP_MESSAGEBOX_RESULT", "IDCANCEL");
+    check(call_import(c, "USER32.dll", "MessageBoxA", {0, put_str("t"), put_str("c"), 1}) == 2,
+          "RECOMP_MESSAGEBOX_RESULT=IDCANCEL answers IDCANCEL");
+    os_setenv("RECOMP_MESSAGEBOX_RESULT", "6");
+    check(call_import(c, "USER32.dll", "MessageBoxA", {0, put_str("t"), put_str("c"), 4}) == 6,
+          "RECOMP_MESSAGEBOX_RESULT=6 answers IDYES");
+    os_setenv("RECOMP_MESSAGEBOX_RESULT", "IDABORT");
+    check(call_import(c, "USER32.dll", "MessageBoxA", {0, put_str("t"), put_str("c"), 4}) == 6,
+          "an id the set does not contain falls back to the default");
+    os_unsetenv("RECOMP_MESSAGEBOX_RESULT");
+
+    // Help is non-fatal and reports success.
+    check(call_import(c, "USER32.dll", "WinHelpA", {0, put_str("Petz5.hlp"), 1, 0}) == 1,
+          "WinHelpA reports success without a help engine");
+    check(call_import(c, "hhctrl.ocx", "HtmlHelpA", {0, put_str("Petz5.chm"), 0, 0}) == 0,
+          "HtmlHelpA returns a NULL HWND without failing");
+}
+
 // A window procedure that answers WM_PAINT the way a real one does: BeginPaint
 // then EndPaint, which is what validates the update region.
 static uint32_t g_painted = 0;
@@ -7407,6 +7589,7 @@ int main(int argc, char **argv) {
     test_native_draw_waits(c);
     test_midi(c);
     test_windows(c);
+    test_common_dialogs(c);
     test_synchronous_geometry(c);
     test_listbox_ownerdraw_hit(c);
     test_dialog_dlu_mapping(c);

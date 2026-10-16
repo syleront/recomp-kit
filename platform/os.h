@@ -167,6 +167,74 @@ uint64_t os_wall_time_us(void); // microseconds since the Unix epoch
 void os_sleep_us(uint64_t us);
 
 // ---------------------------------------------------------------------------
+// System dialogs. The runtime's comdlg32 and USER32 shims reach the platform's
+// own file picker, alert and help through these. A host installs a native
+// presenter; with none installed - a headless host, the unit tests - the
+// deterministic fallback answers from the environment so a scripted run is
+// reproducible:
+//
+//   RECOMP_FILE_DIALOG_RESULT   a path to choose, or "cancel" (the default)
+//   RECOMP_MESSAGEBOX_RESULT    a button id ("6") or one of the ID* names
+//                               (IDOK, IDCANCEL, IDABORT, IDRETRY, IDIGNORE,
+//                               IDYES, IDNO, IDTRYAGAIN, IDCONTINUE)
+// ---------------------------------------------------------------------------
+
+// One entry of a Win32 filter string, already split by the runtime: a
+// description and a semicolon-separated list of wildcard patterns.
+typedef struct OsFileFilter {
+    const char *description; // may be empty
+    const char *patterns;    // "*.pet;*.PET", may be empty
+} OsFileFilter;
+
+typedef struct OsFileDialog {
+    int save;                // 1: save panel, 0: open panel
+    const char *title;       // NULL when the caller named none
+    const char *initial_dir; // NULL when the caller named none
+    const char *default_ext; // NULL when the caller named none
+    char *file;              // in: the initial name; out: the chosen path
+    size_t file_cap;         // bytes at `file`, including the NUL
+    const OsFileFilter *filters;
+    int filter_count;
+    int filter_index;    // 1-based selected filter, or 0
+    uint32_t flags;      // the caller's OFN_* flags
+    int *file_offset;    // out: the name's index in `file`, or NULL
+    int *file_extension; // out: the extension's index in `file`, or NULL
+} OsFileDialog;
+// 1: a file was chosen (`file` holds it), 0: cancelled, -1: no presenter and
+// no deterministic answer to give, -2: chosen but it did not fit `file`
+// (`file` holds a truncated, NUL-terminated prefix).
+int os_file_dialog(OsFileDialog *d);
+// Copy a chosen path into `d->file`, honouring `file_cap`, and fill the offset
+// outputs. 1, or -2 when the path did not fit. Shared by the fallback and by a
+// native presenter, so both compute the offsets the same way.
+int os_file_dialog_set_result(OsFileDialog *d, const char *path);
+typedef int (*OsFileDialogPresenter)(OsFileDialog *d);
+// Install the native presenter. NULL restores the deterministic fallback.
+void os_set_file_dialog_presenter(OsFileDialogPresenter fn);
+
+// A message box reduced to its buttons by the runtime. `labels` and `ids` are
+// parallel arrays of `count` entries; the chosen index is returned, or -1 when
+// there is no presenter and no deterministic answer. `icon`: 0 none, 1 info,
+// 2 warning, 3 error, 4 question.
+typedef struct OsMessageBox {
+    const char *title; // may be NULL
+    const char *text;
+    const char *const *labels;
+    const uint32_t *ids;
+    int count;
+    int default_index;
+    int icon;
+} OsMessageBox;
+int os_message_box(const OsMessageBox *m);
+typedef int (*OsMessageBoxPresenter)(const OsMessageBox *m);
+void os_set_message_box_presenter(OsMessageBoxPresenter fn);
+
+// Help. Always non-fatal: log it, and open `url` in the platform browser only
+// when one is given (a WinHelp file name is not a URL, so nothing opens).
+// `what` tags the log line ("WinHelpA", "HtmlHelpA").
+void os_help(const char *what, const char *file, const char *url);
+
+// ---------------------------------------------------------------------------
 // Strings.
 // ---------------------------------------------------------------------------
 int os_strcasecmp(const char *a, const char *b);

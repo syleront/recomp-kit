@@ -533,6 +533,146 @@ void os_sample_dump(void *out_file) {
     }
 }
 
+// --- System dialogs --------------------------------------------------------
+// The runtime's comdlg32/USER32 shims call these. A native presenter (the
+// macOS host's NSSavePanel/NSAlert, installed with the setters below) answers
+// when one is registered; otherwise a deterministic answer comes from the
+// environment so a headless run and the unit tests are reproducible. Nothing
+// here knows the guest or a game: the runtime has already split the Win32
+// structures into these plain requests.
+static OsFileDialogPresenter g_file_dialog_presenter = nullptr;
+static OsMessageBoxPresenter g_message_box_presenter = nullptr;
+
+void os_set_file_dialog_presenter(OsFileDialogPresenter fn) {
+    g_file_dialog_presenter = fn;
+}
+void os_set_message_box_presenter(OsMessageBoxPresenter fn) {
+    g_message_box_presenter = fn;
+}
+
+int os_file_dialog_set_result(OsFileDialog *d, const char *path) {
+    if (!d || !d->file || d->file_cap == 0 || !path)
+        return -1;
+    size_t n = strlen(path);
+    if (n + 1 > d->file_cap) {
+        // Windows leaves a truncated, NUL-terminated prefix and reports
+        // FNERR_BUFFERTOOSMALL; the runtime turns -2 into that.
+        memcpy(d->file, path, d->file_cap - 1);
+        d->file[d->file_cap - 1] = 0;
+        return -2;
+    }
+    memcpy(d->file, path, n + 1);
+    if (d->file_offset || d->file_extension) {
+        size_t base = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (path[i] == '/' || path[i] == '\\')
+                base = i + 1;
+        size_t dot = 0;
+        for (size_t i = base; i < n; ++i)
+            if (path[i] == '.')
+                dot = i;
+        if (d->file_offset)
+            *d->file_offset = (int)base;
+        if (d->file_extension)
+            *d->file_extension = (int)dot;
+    }
+    return 1;
+}
+
+int os_file_dialog(OsFileDialog *d) {
+    if (!d)
+        return -1;
+    if (g_file_dialog_presenter) {
+        int shown = g_file_dialog_presenter(d);
+        if (shown >= 0)
+            return shown; // -1 means the presenter declined; fall through
+    }
+    const char *answer = recomp_env("FILE_DIALOG_RESULT");
+    const char *kind = d->save ? "save" : "open";
+    if (!answer || !*answer || os_strcasecmp(answer, "cancel") == 0) {
+        fprintf(stderr, "[dialogs] %s: cancelled (no presenter)\n", kind);
+        return 0;
+    }
+    int r = os_file_dialog_set_result(d, answer);
+    fprintf(stderr, "[dialogs] %s: chose \"%s\" (RECOMP_FILE_DIALOG_RESULT)\n", kind,
+            d->file ? d->file : answer);
+    return r;
+}
+
+// The button ids the deterministic fallback recognises by name. They are the
+// generic Win32 dialog result codes, not a game's.
+static uint32_t message_box_id_from_name(const char *name) {
+    struct Entry {
+        const char *name;
+        uint32_t id;
+    };
+    static const Entry kNames[] = {
+        {"IDOK", 1},     {"IDCANCEL", 2},    {"IDABORT", 3},     {"IDRETRY", 4},
+        {"IDIGNORE", 5}, {"IDYES", 6},       {"IDNO", 7},        {"IDCLOSE", 8},
+        {"IDHELP", 9},   {"IDTRYAGAIN", 10}, {"IDCONTINUE", 11},
+    };
+    for (const Entry &e : kNames)
+        if (os_strcasecmp(name, e.name) == 0)
+            return e.id;
+    return 0;
+}
+
+int os_message_box(const OsMessageBox *m) {
+    if (!m || !m->labels || !m->ids || m->count <= 0)
+        return -1;
+    if (g_message_box_presenter) {
+        int shown = g_message_box_presenter(m);
+        if (shown >= 0)
+            return shown; // -1 means the presenter declined; fall through
+    }
+    const char *answer = recomp_env("MESSAGEBOX_RESULT");
+    int index = -1;
+    if (answer && *answer) {
+        uint32_t want = 0;
+        char *end = nullptr;
+        unsigned long number = strtoul(answer, &end, 0);
+        if (end && *end == 0)
+            want = (uint32_t)number;
+        else
+            want = message_box_id_from_name(answer);
+        for (int i = 0; i < m->count; ++i)
+            if (m->ids[i] == want) {
+                index = i;
+                break;
+            }
+    }
+    if (index < 0)
+        index = m->default_index;
+    if (index < 0 || index >= m->count)
+        index = 0;
+    fprintf(stderr, "[dialogs] message box \"%s\": chose id %u (index %d, no presenter)\n",
+            m->text ? m->text : "", m->ids[index], index);
+    return index;
+}
+
+void os_help(const char *what, const char *file, const char *url) {
+    if (url && *url) {
+        fprintf(stderr, "[dialogs] %s: opening \"%s\"\n", what ? what : "help", url);
+        const char *opener =
+#ifdef __APPLE__
+            "/usr/bin/open";
+#else
+            "xdg-open";
+#endif
+        const char *argv[] = {opener, url, nullptr};
+        int64_t pid = 0;
+        if (os_spawn(argv, &pid) == 0) {
+            int code = 0;
+            os_wait(pid, &code);
+        } else {
+            fprintf(stderr, "[dialogs] %s: could not open \"%s\"\n", what ? what : "help", url);
+        }
+        return;
+    }
+    fprintf(stderr, "[dialogs] %s: help is not available in this port (\"%s\")\n",
+            what ? what : "help", file ? file : "");
+}
+
 int os_setenv(const char *name, const char *value) {
     return setenv(name, value, 1);
 }

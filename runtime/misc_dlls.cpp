@@ -210,25 +210,125 @@ void folder_path(X86 *c) {
     set_eax(c, 0);
 }
 // ---------------------------------------------------------------------------
-// comdlg32: common file dialogs. A native picker is out of scope, so every
-// entry reports "the user cancelled": FALSE with CommDlgExtendedError() == 0
-// (no error, which is exactly what a cancel leaves behind), and logs the title
-// and file so a run shows what was asked for.
+// comdlg32: the common file dialogs, mapped onto the platform's own picker
+// (the macOS host's NSSavePanel/NSOpenPanel) through os_file_dialog(). The
+// Win32 OPENFILENAMEA is split into the plain request the seam takes - title,
+// filter pairs, initial directory and name, flags - and the chosen path is
+// written back into lpstrFile within nMaxFile with nFileOffset/nFileExtension
+// set as Windows sets them. A cancel is FALSE with CommDlgExtendedError() == 0,
+// exactly as Windows leaves it; a path that does not fit is FALSE with
+// FNERR_BUFFERTOOSMALL.
 // ---------------------------------------------------------------------------
 uint32_t g_commdlg_error = 0;
-void common_dialog(X86 *c, bool save) {
-    uint32_t ofn = arg(c, 0);
-    std::string title, file;
-    if (ofn && gm_valid(ofn, 60)) {
-        uint32_t t = rd32(ofn + 48), f = rd32(ofn + 28);
-        if (t)
-            title = gm_str(t, 260);
-        if (f)
-            file = gm_str(f, 260);
+
+// The Win32 filter string is pairs of NUL-terminated strings ending with a
+// double NUL: description\0pattern\0...\0\0. The pattern is a
+// semicolon-separated list of wildcards. Split it into the plain form the
+// platform seam takes; malformed input stops at the first empty description.
+int parse_ofn_filter(uint32_t lpstrFilter, OsFileFilter *out, char descs[][128], char pats[][256],
+                     int max) {
+    if (!lpstrFilter || !gm_valid(lpstrFilter, 1))
+        return 0;
+    int count = 0;
+    uint32_t p = lpstrFilter;
+    const uint32_t limit = lpstrFilter + 4096;
+    while (count < max && p < limit) {
+        std::string desc = gm_str(p, 128);
+        if (desc.empty())
+            break; // the double NUL that ends the list
+        p += (uint32_t)desc.size() + 1;
+        std::string pattern = gm_str(p, 256);
+        p += (uint32_t)pattern.size() + 1;
+        snprintf(descs[count], 128, "%s", desc.c_str());
+        snprintf(pats[count], 256, "%s", pattern.c_str());
+        out[count].description = descs[count];
+        out[count].patterns = pats[count];
+        ++count;
     }
-    LOGW("%s(\"%s\", file \"%s\"): no native dialog, reporting cancel",
-         save ? "GetSaveFileNameA" : "GetOpenFileNameA", title.c_str(), file.c_str());
+    return count;
+}
+
+void common_dialog(X86 *c, bool save) {
+    const char *kind = save ? "GetSaveFileNameA" : "GetOpenFileNameA";
+    uint32_t ofn = arg(c, 0);
     g_commdlg_error = 0;
+    if (!ofn || !gm_valid(ofn, 76)) {
+        g_commdlg_error = 0x0002; // CDERR_INITIALIZATION
+        LOGW("%s: no OPENFILENAMEA, reporting initialization failure", kind);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t size = rd32(ofn + 0);
+    if (size < 76) {
+        g_commdlg_error = 0x0001; // CDERR_STRUCTSIZE
+        LOGW("%s: lStructSize %u is too small", kind, size);
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t lpstrFilter = rd32(ofn + 12);
+    uint32_t lpstrFile = rd32(ofn + 28);
+    uint32_t nMaxFile = rd32(ofn + 32);
+    uint32_t lpstrInitialDir = rd32(ofn + 44);
+    uint32_t lpstrTitle = rd32(ofn + 48);
+    uint32_t flags = rd32(ofn + 52);
+    uint32_t lpstrDefExt = rd32(ofn + 60);
+    if (!lpstrFile || nMaxFile == 0 || !gm_valid(lpstrFile, nMaxFile)) {
+        g_commdlg_error = 0x0002; // CDERR_INITIALIZATION
+        LOGW("%s: no writable lpstrFile buffer (nMaxFile %u)", kind, nMaxFile);
+        set_eax(c, 0);
+        return;
+    }
+    std::string initial = gm_str(lpstrFile, nMaxFile);
+    std::string title = lpstrTitle ? gm_str(lpstrTitle, 512) : std::string();
+    std::string dir = lpstrInitialDir ? gm_str(lpstrInitialDir, 520) : std::string();
+    std::string ext = lpstrDefExt ? gm_str(lpstrDefExt, 32) : std::string();
+
+    OsFileFilter filters[8];
+    char descs[8][128], pats[8][256];
+    int filter_count = parse_ofn_filter(lpstrFilter, filters, descs, pats, 8);
+
+    std::vector<char> buf((size_t)nMaxFile, 0);
+    if (!initial.empty())
+        memcpy(buf.data(), initial.c_str(), std::min(initial.size(), buf.size() - 1));
+
+    OsFileDialog d{};
+    d.save = save ? 1 : 0;
+    d.title = title.empty() ? nullptr : title.c_str();
+    d.initial_dir = dir.empty() ? nullptr : dir.c_str();
+    d.default_ext = ext.empty() ? nullptr : ext.c_str();
+    d.file = buf.data();
+    d.file_cap = nMaxFile;
+    d.filters = filters;
+    d.filter_count = filter_count;
+    d.filter_index = (int)rd32(ofn + 24);
+    d.flags = flags;
+    int file_offset = 0, file_extension = 0;
+    d.file_offset = &file_offset;
+    d.file_extension = &file_extension;
+
+    LOGW("%s: title \"%s\", initial \"%s\", %d filter(s), flags 0x%x", kind, title.c_str(),
+         initial.c_str(), filter_count, flags);
+    int r = os_file_dialog(&d);
+    if (r == 1 || r == -2) {
+        size_t n = 0;
+        while (n + 1 < buf.size() && buf[n])
+            ++n;
+        memcpy(g_mem + lpstrFile, buf.data(), n + 1);
+        wr16(ofn + 56, (uint16_t)file_offset);
+        wr16(ofn + 58, (uint16_t)file_extension);
+        wr32(ofn + 24, (uint32_t)d.filter_index);
+        if (r == -2) {
+            g_commdlg_error = 0x3003; // FNERR_BUFFERTOOSMALL
+            LOGW("%s: the chosen path does not fit nMaxFile %u", kind, nMaxFile);
+            set_eax(c, 0);
+            return;
+        }
+        LOGW("%s: chose \"%s\"", kind, buf.data());
+        set_eax(c, 1); // TRUE
+        return;
+    }
+    g_commdlg_error = 0; // a cancel, exactly as Windows leaves it
+    LOGW("%s: cancelled", kind);
     set_eax(c, 0); // FALSE
 }
 void cd_GetOpenFileNameA(X86 *c) {
@@ -239,6 +339,25 @@ void cd_GetSaveFileNameA(X86 *c) {
 }
 void cd_ExtendedError(X86 *c) {
     set_eax(c, g_commdlg_error);
+}
+
+// ---------------------------------------------------------------------------
+// HTML Help (hhctrl.ocx). The engine does not exist here; the platform seam
+// logs the request and never fails the caller. HtmlHelpA/W return an HWND,
+// which is NULL for a request that could not be shown, exactly as it is when
+// the engine is missing on Windows.
+// ---------------------------------------------------------------------------
+void html_help(X86 *c, bool wide) {
+    uint32_t file = arg(c, 1);
+    std::string target = wide ? gm_wstr(file, 1024) : gm_str(file, 1024);
+    os_help("HtmlHelpA", target.c_str(), nullptr);
+    set_eax(c, 0); // NULL HWND
+}
+void hh_HtmlHelpA(X86 *c) {
+    html_help(c, false);
+}
+void hh_HtmlHelpW(X86 *c) {
+    html_help(c, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -820,10 +939,13 @@ const ImportShim shims[] = {
     {"SHELL32.dll", "SHAppBarMessage", 2, zero},
     {"SHELL32.dll", "ShellExecuteW", 6, zero},
     {"URLMON.dll", "URLDownloadToFileW", 5, nullptr},
-    // comdlg32: no native picker; a cancel is reported.
+    // comdlg32: the platform's own file picker through os_file_dialog().
     {"comdlg32.dll", "GetOpenFileNameA", 1, cd_GetOpenFileNameA},
     {"comdlg32.dll", "GetSaveFileNameA", 1, cd_GetSaveFileNameA},
     {"comdlg32.dll", "CommDlgExtendedError", 0, cd_ExtendedError},
+    // hhctrl.ocx: HTML Help, logged and never fatal (a NULL HWND).
+    {"hhctrl.ocx", "HtmlHelpA", 4, hh_HtmlHelpA},
+    {"hhctrl.ocx", "HtmlHelpW", 4, hh_HtmlHelpW},
     // RPCRT4: GUID generation and comparison.
     {"RPCRT4.dll", "UuidCreate", 1, r_UuidCreate},
     {"RPCRT4.dll", "UuidEqual", 3, r_UuidEqual},

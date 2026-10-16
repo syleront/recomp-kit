@@ -63,3 +63,10 @@ void platform_ui_haptic_tap();
 // iOS: a Core Haptics continuous player, intensity max(low, high)/65535.
 // Android: Vibrator.vibrate with an amplitude derived the same way. Desktop: no-op.
 void platform_ui_device_rumble(uint16_t low, uint16_t high);
+
+// Install the platform's native system dialogs (platform/os.h's
+// os_set_file_dialog_presenter / os_set_message_box_presenter) once the app is
+// up. macOS: NSSavePanel/NSOpenPanel and NSAlert, on the main thread. Other
+// platforms: a no-op, which leaves the deterministic fallback in place. Call
+// after SDL_Init has created NSApplication and before the guest boots.
+void platform_ui_install_dialogs();
