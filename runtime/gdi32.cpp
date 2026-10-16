@@ -12,6 +12,7 @@
 #include "../platform/os.h"
 
 #include <map>
+#include <set>
 #include <string.h>
 #include <vector>
 
@@ -478,6 +479,31 @@ void g_GetObjectA(X86 *c) {
     set_eax(c, 0);
 }
 
+// The real font objects behind the two general-purpose stock interface fonts.
+// Windows keeps DEFAULT_GUI_FONT and ANSI_VAR_FONT installed as proportional
+// TrueType faces (MS Shell Dlg / MS Sans Serif, 8 pt); a program that draws or
+// measures with them - Petz 5's own WinMenu paint does, GetStockObject(0x11) -
+// gets that face and its metrics. Answering with an opaque placeholder handle
+// instead left the DC with no face in it, so the text was drawn and measured
+// with the fixed 8x16 bitmap cells: the compact menus and pane labels came out
+// wider and taller than the proportional dialog text they sit beside ("slightly
+// stretched"). The raster and fixed-pitch stock faces (System, Fixedsys,
+// Terminal, OEM) keep the 8x16 cells, which is the closer stand-in for them.
+std::set<uint32_t> &stock_fonts() {
+    static std::set<uint32_t> handles;
+    return handles;
+}
+uint32_t stock_font(uint32_t which) {
+    static std::map<uint32_t, uint32_t> cache;
+    auto it = cache.find(which);
+    if (it != cache.end())
+        return it->second;
+    uint32_t handle = make_object(dialog_font_object("MS Shell Dlg", 8, 400));
+    cache[which] = handle;
+    stock_fonts().insert(handle);
+    return handle;
+}
+
 // DeleteObject(handle): a bitmap gives its pixels back; a palette goes away;
 // a stock object is fine to delete, as on Windows.
 void g_DeleteObject(X86 *c) {
@@ -500,7 +526,7 @@ void g_DeleteObject(X86 *c) {
         set_eax(c, 1);
         return;
     }
-    if (handle < 0x4f100 || handle > 0x4f113)
+    if ((handle < 0x4f100 || handle > 0x4f113) && !stock_fonts().count(handle))
         objects().erase(handle);
     set_eax(c, handle ? 1 : 0);
 }
@@ -1610,6 +1636,11 @@ void pen_indirect(X86 *c) {
 }
 void stock_object(X86 *c) {
     uint32_t i = arg(c, 0);
+    // DEFAULT_GUI_FONT (17) and ANSI_VAR_FONT (12) are real proportional faces.
+    if (i == 17 || i == 12) {
+        set_eax(c, stock_font(i));
+        return;
+    }
     set_eax(c, i <= 19 ? 0x4f100 + i : 0);
 }
 void get_pixel(X86 *c) {

@@ -3962,6 +3962,30 @@ static void test_callbacks(X86 *c) {
     g_callback_hits = 0;
     check(call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 1,
           "a WNDPROC that ignores WM_PAINT leaves the region dirty and is asked again");
+    // A text or enabled-state change is a visible change Windows repaints on
+    // its own: SetWindowText/SetDlgItemText and EnableWindow do not need an
+    // explicit InvalidateRect from the program (the Petz Profile refills its
+    // statics exactly this way after Pick A Pet).
+    // ValidateRect clears the update region, so each mutation below starts from
+    // a clean window and the paint that follows can only come from it.
+    call_import(c, "USER32.dll", "ValidateRect", {pwnd, 0});
+    g_callback_hits = 0;
+    check(call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 0,
+          "a validated window has nothing to paint");
+    call_import(c, "USER32.dll", "SetWindowTextA", {pwnd, put_str("caption")});
+    g_callback_hits = 0;
+    check(call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 1,
+          "SetWindowTextA invalidates the window it renamed");
+    call_import(c, "USER32.dll", "ValidateRect", {pwnd, 0});
+    g_callback_hits = 0;
+    check(call_import(c, "USER32.dll", "EnableWindow", {pwnd, 0}) == 0 &&
+              call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 1,
+          "disabling a window invalidates it so the greyed state is drawn");
+    call_import(c, "USER32.dll", "ValidateRect", {pwnd, 0});
+    g_callback_hits = 0;
+    check(call_import(c, "USER32.dll", "EnableWindow", {pwnd, 1}) == 1 &&
+              call_import(c, "USER32.dll", "UpdateWindow", {pwnd}) == 1 && g_callback_hits == 1,
+          "re-enabling a window invalidates it as well, and reports the old state");
     while (call_import(c, "USER32.dll", "PeekMessageA", {msg, pwnd, 0x0003, 0x0005, 1})) {
     }
     call_import(c, "USER32.dll", "DestroyWindow", {pwnd});

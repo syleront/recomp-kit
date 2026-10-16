@@ -75,6 +75,11 @@ void create_font_named(X86 *c) {
     }
     uint32_t handle = font_from_logfont_a(buf);
     heap_free(buf);
+    // Which face a program asks for, and at what cell, is the first thing a
+    // stretched or wrong-sized caption needs: one line per distinct request.
+    LOGV("CreateFontA face=\"%s\" height=%d width=%d weight=%d escapement=%d italic=%d",
+         face.c_str(), int32_t(arg(c, 0)), int32_t(arg(c, 1)), int32_t(arg(c, 4)),
+         int32_t(arg(c, 2)), int32_t(arg(c, 5)));
     set_eax(c, handle);
 }
 // TEXTMETRICW is 60 bytes on x86: eleven DWORDs, four UTF-16
@@ -183,8 +188,16 @@ Pen pen_from_font(const Object &font) {
                      "with the bundled Open Sans",
                      family.c_str());
     }
-    if (!pen.face)
+    if (!pen.face) {
+        // No TrueType stand-in for this face: the 8x16 cells are drawn at the
+        // requested cell count, so a face asking for a height under 16 px comes
+        // out wider and taller than Windows would draw it (TD-086). Say which
+        // face once so a stretched caption can be traced to its LOGFONT.
+        log_once(("gdi-cells:" + family).c_str(),
+                 "gdi: no stand-in for face \"%s\"; drawing it with the 8x16 cells",
+                 family.c_str());
         return pen;
+    }
     pen.scale = truetype_scale(pen.face, int32_t(font_word(font, 0)));
     pen.metrics = truetype_metrics(pen.face, pen.scale);
     return pen;

@@ -117,14 +117,19 @@ std::unique_ptr<TrueTypeFace> bundled_face(const unsigned char *data, size_t siz
 const TrueTypeFace *truetype_windows_substitute(const std::string &family, int32_t weight) {
     // The sans-serif interface faces a Windows 7 installation has, and the
     // names that resolve to them: the dialog aliases, the raster MS Sans
-    // Serif, and Helvetica through FontSubstitutes. Serif, fixed-pitch and
-    // the system raster fonts (System, Fixedsys, Terminal) are not here -
-    // the 8x16 cells are the closer stand-in for those.
+    // Serif, its smaller sibling Small Fonts (what the VCL pane/menu code asks
+    // for when it wants a compact proportional face), and Helvetica through
+    // FontSubstitutes. Serif, fixed-pitch and the system raster fonts (System,
+    // Fixedsys, Terminal) are not here - the 8x16 cells are the closer stand-in
+    // for those. A face missing from this list falls back to the 8x16 cells
+    // whatever height it asked for, which draws text wider and taller than
+    // Windows (TD-086).
     static const char *const windows_sans[] = {
         "segoe ui",      "tahoma",       "microsoft sans serif",
         "ms sans serif", "ms shell dlg", "ms shell dlg 2",
         "arial",         "verdana",      "calibri",
-        "trebuchet ms",  "helvetica",
+        "trebuchet ms",  "helvetica",    "smallfonts",
+        "small fonts",
     };
     const std::string key = lower_ascii(family);
     if (std::find(std::begin(windows_sans), std::end(windows_sans), key) == std::end(windows_sans))

@@ -575,6 +575,8 @@ void u_ShowWindow(X86 *c) {
     set_eax(c, was ? 1 : 0);
     if (!was && w->visible)
         became_visible(w, cmd != 4 && cmd != 7 && cmd != 8); // SW_*NOACTIVATE keeps stacking
+    else if (was && !w->visible)
+        repaint_exposed_windows(); // hiding exposes what the window covered
 }
 
 // UpdateWindow sends WM_PAINT directly to the window procedure, synchronously,
@@ -912,8 +914,12 @@ void u_GetWindowLongA(X86 *c) {
 
 void u_SetWindowTextA(X86 *c) {
     Window *w = find_window(arg(c, 0));
-    if (w)
+    if (w) {
         w->title_utf8 = gm_str(arg(c, 1));
+        // SetWindowText sends WM_SETTEXT; a caption or control text change
+        // repaints the window, exactly as DefWindowProc's WM_SETTEXT does.
+        w->update_pending = true;
+    }
     set_eax(c, 1);
 }
 
@@ -1161,8 +1167,13 @@ void def_window_proc(X86 *c, bool wide) {
     Window *w = find_window(hwnd);
     switch (msg) {
     case 0x000c: // WM_SETTEXT
-        if (w)
+        if (w) {
             w->title_utf8 = wide ? gm_wstr(arg(c, 3)) : gm_str(arg(c, 3));
+            // Windows repaints a window whose text changed (the caption, or a
+            // static/button/edit's own client), which is what a program that
+            // fills a dialog with SetDlgItemTextA then shows expects.
+            w->update_pending = true;
+        }
         set_eax(c, w ? 1 : 0);
         return;
     case 0x000d: // WM_GETTEXT
