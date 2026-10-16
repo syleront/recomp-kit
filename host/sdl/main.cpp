@@ -1251,10 +1251,21 @@ int service(double seconds) {
     bool first = true;
     for (;;) {
         bool got;
-        if (first && seconds > 0.0)
-            got = SDL_WaitEventTimeout(&event, int(seconds * 1000.0));
-        else
+        if (first && seconds > 0.0) {
+            // SDL waits in whole milliseconds, and a wait is a wait: truncating
+            // a sub-millisecond remainder to zero turns it into an immediate
+            // poll. The scheduler hands the host the time remaining to the
+            // guest's own deadline, which is routinely under a millisecond
+            // between two frames, so a truncating conversion spins the host at
+            // tens of thousands of polls a second - one core at 100% while the
+            // guest is asleep. Round up so the wait blocks.
+            int ms = int(seconds * 1000.0);
+            if (ms < 1)
+                ms = 1;
+            got = SDL_WaitEventTimeout(&event, ms);
+        } else {
             got = SDL_PollEvent(&event);
+        }
         first = false;
         if (!got)
             break;

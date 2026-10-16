@@ -507,9 +507,16 @@ void audio_pump() {
 // the guest would wait for the cursor, which is a hang the video player finds
 // within six frames.
 int audio_idle_wait(double seconds) {
-    (void)seconds;
-    if (!g_audio_offline)
+    if (!g_audio_offline) {
+        // There is no window and no host event source on this host, so an idle
+        // turn has nothing to service. The guest is asleep and waiting out its
+        // own deadline: if this returns without sleeping, the scheduler treats
+        // it as a serviced slice and loops, spinning the run thread at 100%.
+        // The slice is a real sleep here, or it is not a wait at all.
+        if (seconds > 0.0)
+            os_sleep_us((uint64_t)(seconds * 1e6));
         return 0;
+    }
     uint64_t before = g_audio_frames_rendered;
     audio_pump();
     return g_audio_frames_rendered != before ? 1 : 0;
