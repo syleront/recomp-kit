@@ -190,8 +190,13 @@ static void test_model() {
     check(call_import(&c, "GDI32.dll", "GetPixel", {dc, 2, 2}) == 0xff,
           "window pixels survive DC release");
     call_import(&c, "USER32.dll", "EndPaint", {hwnd, s});
-    check(presents == 1 && presented.size() == 1024 * 768 && presented[2 * 1024 + 2] == 0xffff0000,
-          "EndPaint presents owned ARGB pixels in the desktop composite");
+    // No display mode is selected, so gdi_present_windows fits the composite to
+    // the visible top-level window (32x24 at the origin) instead of the 1024x768
+    // fallback desktop.  The owned ARGB pixel at window (2,2) lands at composite
+    // (2,2) of that fitted frame.
+    check(presents == 1 && presented_w == 32 && presented_h == 24 && presented.size() == 32 * 24 &&
+              presented[2 * 32 + 2] == 0xffff0000,
+          "EndPaint presents owned ARGB pixels in the window-fitted composite");
     os_setenv("RECOMP_SMOKE_DRAWABLE", "800x600");
     uint32_t screen_w = call_import(&c, "USER32.dll", "GetSystemMetrics", {0});
     uint32_t screen_h = call_import(&c, "USER32.dll", "GetSystemMetrics", {1});

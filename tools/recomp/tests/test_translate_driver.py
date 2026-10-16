@@ -60,6 +60,7 @@ def synthetic_image(code_at, base=0x00400000, size=0x2000):
         data[va - base:va - base + len(code)] = code
     img.data = bytes(data)
     img.reloc_dir = (0, 0)
+    img.iat_slots = set()
     img.exec_ranges = [(base, base + size, ".text")]
     img.data_ranges = []
     img.recover_errors = []
