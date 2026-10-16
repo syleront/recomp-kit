@@ -794,7 +794,6 @@ void g_CreateICA(X86 *c) {
 }
 
 const ImportShim g_gdi32_shims[] = {
-    {"GDI32.dll", "CreateFontA", 14, nullptr},
     {"GDI32.dll", "ExtTextOutA", 8, nullptr},
     {"GDI32.dll", "CreateCompatibleBitmap", 3, g_CreateCompatibleBitmap},
     // Named for its argument count; the result is ERROR, which is honest.

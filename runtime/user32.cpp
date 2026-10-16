@@ -2030,17 +2030,19 @@ void control_proc(X86 *c) {
         set_eax(c, 0);
         return;
     case 0x0201: // WM_LBUTTONDOWN: remember the press so the click is a pair
+        LOGW("control: WM_LBUTTONDOWN hwnd=%08x id=%u", hwnd, w ? w->id : 0);
         if (w)
             w->userdata |= 1u;
         set_eax(c, 0);
         return;
     case 0x0202: { // WM_LBUTTONUP: a completed click reports WM_COMMAND
         uint32_t parent = w ? w->parent : 0, id = w ? w->id : 0;
+        LOGW("control: WM_LBUTTONUP hwnd=%08x id=%u parent=%08x", hwnd, id, parent);
         if (w)
             w->userdata &= ~1u;
         if (parent)
             host_dispatch_to_wndproc(c, parent, 0x0111 /* WM_COMMAND */,
-                                     (1u /* BN_CLICKED */ << 16) | (id & 0xffffu), hwnd);
+                                     id & 0xffffu /* BN_CLICKED is 0 */, hwnd);
         set_eax(c, 0);
         return;
     }
@@ -2161,6 +2163,12 @@ bool parse_dlg_item(uint32_t p, uint32_t end, bool extended, DlgItemTemplate *it
             return false;
         p += extra;
     }
+    // DLGITEMTEMPLATE structures are DWORD-aligned in the resource. Without
+    // this, every item after one whose content length is not a multiple of
+    // four is read two bytes early: its id, class and geometry all shift, so a
+    // template's buttons get the previous item's id and the wrong rectangle
+    // (the "Welcome to Catz 5" dialog parsed `Previous`/`Help` as id 14).
+    p = (p + 3) & ~3u;
     *next = p;
     return true;
 }
@@ -2201,13 +2209,20 @@ bool parse_dlg_template(uint32_t p, uint32_t size, DlgTemplate *t) {
     if (!q)
         return false;
     if (t->style & 0x40) { // DS_SETFONT / DS_SHELLFONT
-        if (q + 6 > end)
+        // The classic DLGTEMPLATE carries only the point size then the typeface
+        // name; the extended form puts weight, italic and charset in between.
+        // Reading the extended layout from a classic template eats the first
+        // four bytes of the typeface ("MS Sans Serif" -> "Sans Serif").
+        uint32_t skip = extended ? 6u : 2u;
+        if (q + skip > end)
             return false;
         t->pointsize = rd16(q);
-        t->weight = rd16(q + 2);
-        t->italic = rd8(q + 4);
-        t->charset = rd8(q + 5);
-        q = tmpl_string(q + 6, end, &t->font, nullptr, nullptr);
+        if (extended) {
+            t->weight = rd16(q + 2);
+            t->italic = rd8(q + 4);
+            t->charset = rd8(q + 5);
+        }
+        q = tmpl_string(q + skip, end, &t->font, nullptr, nullptr);
         if (!q)
             return false;
     }

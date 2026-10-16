@@ -83,6 +83,11 @@ uint32_t mouse_window(uint32_t parent, int32_t x, int32_t y, size_t depth = 0) {
         if (!w->visible || !w->enabled || x < wx || y < wy || int64_t(x) >= int64_t(wx) + w->w ||
             int64_t(y) >= int64_t(wy) + w->h)
             continue;
+        // A STATIC control is transparent to the mouse unless it has SS_NOTIFY
+        // (0x100), which is why a caption drawn over a button does not eat its
+        // click. Windows reports HTTRANSPARENT from WM_NCHITTEST here.
+        if (w->cls == "static" && !(w->style & 0x100))
+            continue;
         uint32_t child = mouse_window(*i, x, y, depth + 1);
         return child ? child : *i;
     }

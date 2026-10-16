@@ -39,12 +39,7 @@ void create_font(X86 *c) {
 // CreateFontIndirectA receives a 60-byte LOGFONTA. The fourteen scalar fields
 // before lfFaceName are identical to LOGFONTW, only the 32-byte face name
 // differs; widening it gives the same 92-byte object the W form stores.
-void create_font_a(X86 *c) {
-    uint32_t p = arg(c, 0);
-    if (!p || !gm_valid(p, 60)) {
-        set_eax(c, 0);
-        return;
-    }
+uint32_t font_from_logfont_a(uint32_t p) {
     Object font;
     font.kind = Object::Font;
     memcpy(font.logfont.data(), g_mem + p, 28);
@@ -53,7 +48,34 @@ void create_font_a(X86 *c) {
         ++n;
     for (size_t i = 0; i < n; ++i)
         font.logfont[28 + 2 * i] = rd8(p + 28 + i);
-    set_eax(c, make_object(font));
+    return make_object(font);
+}
+void create_font_a(X86 *c) {
+    uint32_t p = arg(c, 0);
+    set_eax(c, p && gm_valid(p, 60) ? font_from_logfont_a(p) : 0);
+}
+// CreateFontA passes the LOGFONTA fields as fourteen scalar arguments instead
+// of a struct. Build the same 60-byte LOGFONTA and share the widening above,
+// so a program that names a font directly gets the same object.
+void create_font_named(X86 *c) {
+    uint32_t buf = heap_alloc(60, true);
+    if (!buf) {
+        set_eax(c, 0);
+        return;
+    }
+    for (int i = 0; i < 5; ++i)
+        wr32(buf + 4 * i, arg(c, i)); // cHeight..cWeight
+    for (int i = 5; i < 13; ++i)
+        wr8(buf + 20 + (i - 5), uint8_t(arg(c, i))); // italic..pitchAndFamily
+    std::string face = gm_str(arg(c, 13));
+    size_t n = 0;
+    while (n < 31 && n < face.size()) {
+        wr8(buf + 28 + n, uint8_t(face[n]));
+        ++n;
+    }
+    uint32_t handle = font_from_logfont_a(buf);
+    heap_free(buf);
+    set_eax(c, handle);
 }
 // TEXTMETRICW is 60 bytes on x86: eleven DWORDs, four UTF-16
 // characters, five BYTE fields and three bytes of trailing padding.
@@ -461,6 +483,7 @@ void register_text() {
     }
     static const ImportShim shims[] = {G("CreateFontIndirectW", 1, create_font),
                                        G("CreateFontIndirectA", 1, create_font_a),
+                                       G("CreateFontA", 14, create_font_named),
                                        G("ExtTextOutW", 8, text_out),
                                        G("GetTextExtentPoint32W", 4, extent),
                                        G("GetTextExtentPoint32A", 4, extent_a),

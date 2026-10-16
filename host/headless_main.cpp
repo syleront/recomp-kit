@@ -77,7 +77,8 @@ bool g_activate = true;
 // driven without a display; a real host feeds the same queue from its window.
 uint32_t g_click_frame = 0;
 int32_t g_click_x = 0, g_click_y = 0;
-bool g_clicked = false;
+uint32_t g_click_interval = 150; // frames between clicks; one dialog per click
+uint32_t g_clicked = 0;
 
 // --- run state -------------------------------------------------------------
 uint32_t g_present_count = 0; // host_present calls
@@ -509,13 +510,14 @@ void headless_tick() {
     // This is also the only thing that moves a play cursor here, so it runs
     // before the caps are looked at and on every turn.
     audio_pump();
-    if (g_click_frame && !g_clicked && g_present_count >= g_click_frame) {
-        g_clicked = true;
+    if (g_click_frame && g_present_count >= g_click_frame &&
+        g_present_count - g_click_frame >= g_clicked * g_click_interval) {
+        ++g_clicked;
         host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_click_x, g_click_y);
         host_post_mouse_message(0x0201 /* WM_LBUTTONDOWN */, 1, g_click_x, g_click_y);
         host_post_mouse_message(0x0202 /* WM_LBUTTONUP */, 0, g_click_x, g_click_y);
-        printf("[host] synthetic click at (%d,%d) after %u frames\n", g_click_x, g_click_y,
-               g_present_count);
+        printf("[host] synthetic click %u at (%d,%d) after %u frames\n", g_clicked, g_click_x,
+               g_click_y, g_present_count);
         fflush(stdout);
     }
     if (boot_close_requested())
@@ -638,6 +640,8 @@ int main(int argc, char **argv) {
     }
     if (const char *v = recomp_env("CLICK_FRAME"))
         g_click_frame = (uint32_t)strtoul(v, nullptr, 0);
+    if (const char *v = recomp_env("CLICK_INTERVAL"))
+        g_click_interval = (uint32_t)strtoul(v, nullptr, 0);
 
     mkdir_p(g_frames_dir);
 
