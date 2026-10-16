@@ -68,6 +68,15 @@ struct Window {
     // template's DS_SETFONT face. Zero on a non-dialog window; MapDialogRect
     // then uses the 8x16 bitmap-cell default, matching a fontless template.
     int32_t dlg_base_x = 0, dlg_base_y = 0;
+    // Non-client insets in pixels. A dialog's template rectangle is its CLIENT
+    // size (Windows AdjustWindowRect semantics), so for a framed dialog x/y is
+    // the OUTER origin, w/h stays the client size, and the client origin is
+    // (x + nc_left, y + nc_top). Zero on every other window, so the game's own
+    // frame window, its popups and its controls keep the old geometry exactly.
+    int32_t nc_left = 0, nc_top = 0, nc_right = 0, nc_bottom = 0;
+    // True when the caption bar above the client is drawn (WS_CAPTION); the
+    // chrome painter needs it to place the title and the close box.
+    bool nc_caption = false;
 };
 
 struct Msg {
@@ -116,6 +125,9 @@ void pump_mouse_input(X86 *c);
 void forget_window_services(uint32_t hwnd);
 bool destroy_window(X86 *c, uint32_t hwnd);
 void client_origin(uint32_t hwnd, int32_t *x, int32_t *y);
+// A window's OUTER (frame) origin: like client_origin but without the
+// non-client insets. Equal to client_origin on every window without a frame.
+void window_origin(uint32_t hwnd, int32_t *x, int32_t *y);
 void display_rect(uint32_t out);
 void alias_ansi(X86 *c, const char *name);
 // Registers the system control classes (STATIC) on first use.

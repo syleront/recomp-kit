@@ -2380,6 +2380,90 @@ static void test_dialog_dlu_mapping(X86 *c) {
     check(none.x == 8 && none.y == 16, "a fontless template uses the 8x16 cell");
 }
 
+// A framed dialog's DLU-mapped size is its CLIENT size; Windows grows the
+// window around it by the non-client area (caption + border). So GetWindowRect
+// is larger than GetClientRect by exactly those insets, the client origin is
+// inside the frame, a hit at the client origin is client (0,0), and a hit in
+// the caption belongs to the window (the close box cancels it) rather than a
+// control. A window of any other class stays frameless, so the game's own frame
+// is untouched.
+static uint32_t g_frame_dialog_cmd = 0, g_frame_dialog_cmd_id = 0;
+static void frame_dialog_proc(X86 *c) {
+    uint32_t msg = arg(c, 1);
+    if (msg == 0x0111) { // WM_COMMAND
+        g_frame_dialog_cmd = msg;
+        g_frame_dialog_cmd_id = arg(c, 2) & 0xffffu;
+        set_eax(c, 1);
+        return;
+    }
+    set_eax(c, msg == 0x0081 ? 1 : 0);
+}
+static void test_dialog_frame_geometry(X86 *c) {
+    section("USER32 dialog non-client frame geometry");
+    ensure_dialog_classes();
+    uint32_t proc = imports_alloc_trampoline("test", "frame_dialog_proc", frame_dialog_proc, 4);
+    uint32_t title = put_str("Framed Dialog");
+    uint32_t cls = put_str("#32770");
+    // WS_POPUP|WS_VISIBLE|WS_CAPTION|WS_SYSMENU, no extended style.
+    uint32_t hwnd =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, cls, title, 0x80000000u | 0x10000000u | 0x00c00000u | 0x00080000u, 100, 120,
+                     200, 150, 0, 0, 0, 0});
+    check(hwnd != 0, "create a captioned #32770 dialog");
+    user32::Window *w = user32::find_window(hwnd);
+    check(w && w->nc_top == 19 && w->nc_left == 3 && w->nc_right == 3 && w->nc_bottom == 3 &&
+              w->nc_caption,
+          "the client is inset by a 19 px caption and a 3 px border (%d/%d)", w ? w->nc_top : -1,
+          w ? w->nc_left : -1);
+    uint32_t rect = scratch_block(16);
+    call_import(c, "USER32.dll", "GetClientRect", {hwnd, rect});
+    check(rd32(rect + 8) == 200 && rd32(rect + 12) == 150,
+          "GetClientRect is the template (client) size");
+    call_import(c, "USER32.dll", "GetWindowRect", {hwnd, rect});
+    check(int32_t(rd32(rect + 0)) == 100 && int32_t(rd32(rect + 4)) == 120 &&
+              int32_t(rd32(rect + 8)) == 306 && int32_t(rd32(rect + 12)) == 292,
+          "GetWindowRect is the client grown by the frame (%d,%d)-(%d,%d)", int32_t(rd32(rect)),
+          int32_t(rd32(rect + 4)), int32_t(rd32(rect + 8)), int32_t(rd32(rect + 12)));
+    uint32_t pt = scratch_block(8);
+    wr32(pt, 0);
+    wr32(pt + 4, 0);
+    call_import(c, "USER32.dll", "ClientToScreen", {hwnd, pt});
+    check(int32_t(rd32(pt)) == 103 && int32_t(rd32(pt + 4)) == 139,
+          "the client origin is inside the frame (%d,%d)", int32_t(rd32(pt)),
+          int32_t(rd32(pt + 4)));
+    // A hit at the client origin routes to the dialog at client (0,0) ...
+    uint32_t msg = scratch_block(28);
+    host_post_mouse_message(0x200, 0, 103, 139);
+    check(call_import(c, "USER32.dll", "PeekMessageA", {msg, hwnd, 0x200, 0x209, 1}) == 1 &&
+              rd32(msg) == hwnd && rd32(msg + 12) == 0,
+          "a hit at the client origin is client (0,0) of the dialog");
+    // ... and a hit in the caption is the frame's: it produces no child message.
+    host_post_mouse_message(0x200, 0, 103, 130);
+    check(call_import(c, "USER32.dll", "PeekMessageA", {msg, hwnd, 0x200, 0x209, 1}) == 0,
+          "a caption hit does not reach a control");
+    // The close box cancels the dialog: WM_COMMAND IDCANCEL to its procedure.
+    call_import(c, "USER32.dll", "SetWindowLongA", {hwnd, uint32_t(-4), proc}); // GWL_WNDPROC
+    g_frame_dialog_cmd = 0;
+    host_post_mouse_message(0x201, 1, 290, 129);
+    call_import(c, "USER32.dll", "PeekMessageA", {msg, hwnd, 0x200, 0x209, 1});
+    check(g_frame_dialog_cmd == 0x0111 && g_frame_dialog_cmd_id == 2,
+          "a close-box click sends WM_COMMAND IDCANCEL (id %u)", g_frame_dialog_cmd_id);
+    call_import(c, "USER32.dll", "DestroyWindow", {hwnd});
+    // A window of any other class keeps the old frameless geometry.
+    uint32_t cls2 = put_str("FramelessTest");
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 4, imports_alloc_trampoline("test", "frameless_wndproc", frame_dialog_proc, 4));
+    wr32(wc + 36, cls2);
+    call_import(c, "USER32.dll", "RegisterClassA", {wc});
+    uint32_t plain = call_import(c, "USER32.dll", "CreateWindowExA",
+                                 {0, cls2, title, 0x10000000u, 10, 20, 60, 40, 0, 0, 0, 0});
+    call_import(c, "USER32.dll", "GetWindowRect", {plain, rect});
+    check(int32_t(rd32(rect + 0)) == 10 && int32_t(rd32(rect + 4)) == 20 &&
+              int32_t(rd32(rect + 8)) == 70 && int32_t(rd32(rect + 12)) == 60,
+          "a non-dialog class stays frameless (window rect == client rect)");
+    call_import(c, "USER32.dll", "DestroyWindow", {plain});
+}
+
 static void test_windows(X86 *c) {
     section("USER32 windows and messages");
     // The window procedure is a stand-in the test-only recomp_call can reach;
@@ -7070,6 +7154,7 @@ int main(int argc, char **argv) {
     test_synchronous_geometry(c);
     test_listbox_ownerdraw_hit(c);
     test_dialog_dlu_mapping(c);
+    test_dialog_frame_geometry(c);
     test_guest_thunks(c);
     test_callbacks(c);
     test_scheduling(c);
