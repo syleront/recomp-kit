@@ -760,12 +760,6 @@ void u_SetDlgItemTextA(X86 *c) {
     set_eax(c, 1);
 }
 
-void u_CreateDialogParamA(X86 *c) {
-    log_once("CreateDialogParamA",
-             "CreateDialogParamA: dialogs are not implemented, returning NULL");
-    set_eax(c, 0);
-}
-
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -786,6 +780,23 @@ bool msg_matches(const Msg &m, uint32_t filter_hwnd, uint32_t min_msg, uint32_t 
 // An update region is a persistent source of low-priority messages, not a
 // queued item consumed by PM_REMOVE. Only validation (normally BeginPaint)
 // makes it disappear. Hidden child hierarchies never receive synthesized paint.
+// The first window Windows would synthesise a WM_PAINT for, or null.
+Window *first_paint_window() {
+    for (auto &kv : windows()) {
+        Window *w = &kv.second;
+        if (!w->update_pending || !w->visible || w->w <= 0 || w->h <= 0)
+            continue;
+        const Window *ancestor = w;
+        size_t hops = 0;
+        while (ancestor && ancestor->visible && (ancestor->style & 0x40000000u) &&
+               ancestor->parent && hops++ < windows().size())
+            ancestor = find_window(ancestor->parent);
+        if (!ancestor || !ancestor->visible || hops > windows().size())
+            continue;
+        return w;
+    }
+    return nullptr;
+}
 static bool pending_paint(uint32_t p, uint32_t hwnd, uint32_t min_msg, uint32_t max_msg) {
     for (const auto &kv : windows()) {
         const Window *w = &kv.second;
@@ -2217,6 +2228,37 @@ uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it) {
     window_created(hwnd);
     return hwnd;
 }
+// Build a dialog window and its controls from a decoded template. Shared by the
+// modal (DialogBoxParamA) and modeless (CreateDialogParamA) entry points. A
+// template without WS_VISIBLE is created hidden, exactly as Windows does, so
+// the caller's ShowWindow is what makes it appear and invalidates it.
+uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc, const DlgTemplate &t) {
+    ensure_dialog_classes();
+    uint32_t hwnd = g_next_hwnd;
+    g_next_hwnd += 4;
+    Window w;
+    w.hwnd = hwnd;
+    w.wndproc = proc;
+    w.style = t.style;
+    w.exstyle = t.exstyle;
+    w.x = t.x;
+    w.y = t.y;
+    w.w = t.cx;
+    w.h = t.cy;
+    w.cls = "#32770";
+    w.title_utf8 = t.title;
+    w.parent = parent;
+    w.thread = guest_current_thread_id();
+    w.hinstance = hinst;
+    w.visible = (t.style & WS_VISIBLE) != 0;
+    w.shown = w.visible;
+    w.update_pending = w.visible;
+    windows()[hwnd] = w;
+    window_created(hwnd);
+    for (const DlgItemTemplate &item : t.items)
+        dlg_create_child(hwnd, item);
+    return hwnd;
+}
 // DialogBoxParamA reads the template from hInstance, builds the window and its
 // controls, sends WM_INITDIALOG and pumps until EndDialog. Returns -1 when the
 // template cannot be read or nobody can answer the dialog.
@@ -2237,29 +2279,13 @@ void u_DialogBoxParamA(X86 *c) {
         set_eax(c, 0xffffffffu);
         return;
     }
-    ensure_dialog_classes();
-    uint32_t hwnd = g_next_hwnd;
-    g_next_hwnd += 4;
-    Window w;
-    w.hwnd = hwnd;
-    w.wndproc = proc;
-    w.style = t.style;
-    w.exstyle = t.exstyle;
-    w.x = t.x;
-    w.y = t.y;
-    w.w = t.cx;
-    w.h = t.cy;
-    w.cls = "#32770";
-    w.title_utf8 = t.title;
-    w.parent = parent;
-    w.thread = guest_current_thread_id();
-    w.hinstance = hinst;
-    w.visible = true;
-    w.shown = true;
-    windows()[hwnd] = w;
-    window_created(hwnd);
-    for (const DlgItemTemplate &item : t.items)
-        dlg_create_child(hwnd, item);
+    uint32_t hwnd = create_dialog_window(hinst, parent, proc, t);
+    // A modal dialog is shown whether or not the template asks for it.
+    if (Window *w = find_window(hwnd)) {
+        w->visible = true;
+        w->shown = true;
+        w->update_pending = true;
+    }
     dialog_running[hwnd] = true;
     host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, init, 0);
     while (dialog_running.count(hwnd) && dialog_running[hwnd]) {
@@ -2287,6 +2313,13 @@ void u_DialogBoxParamA(X86 *c) {
             break;
         if (dispatched)
             continue;
+        // Windows' own modal loop is a GetMessage loop, and GetMessage is what
+        // synthesises WM_PAINT from an update region. Without this a dialog
+        // engine that only drains the queue never paints anything.
+        if (Window *pw = first_paint_window()) {
+            host_dispatch_to_wndproc(c, pw->hwnd, 0x000f /* WM_PAINT */, 0, 0);
+            continue;
+        }
         if (!g_message_waiter) {
             log_once("DialogBoxParamA-nohost",
                      "DialogBoxParamA: nothing is queued and there is no host to wait on");
@@ -2302,6 +2335,37 @@ void u_DialogBoxParamA(X86 *c) {
     if (find_window(hwnd))
         destroy_window(c, hwnd);
     set_eax(c, uint32_t(result));
+}
+
+// A modeless dialog: build the window and its controls, send WM_INITDIALOG and
+// return the handle. The guest's own message loop drives it afterwards, which
+// is why the splash/gauge screen (whose wndproc paints a pre-rendered bitmap)
+// only appears once this exists.
+void u_CreateDialogParamA(X86 *c) {
+    uint32_t hinst = arg(c, 0), name = arg(c, 1), parent = arg(c, 2), proc = arg(c, 3),
+             init = arg(c, 4);
+    if (!proc) {
+        set_eax(c, 0);
+        return;
+    }
+    std::string why;
+    uint32_t entry = resource_find_in(hinst, 5 /* RT_DIALOG */, name, true, &why);
+    uint32_t size = 0, p = entry ? resource_data(entry, &size, &why) : 0;
+    DlgTemplate t;
+    if (!p || !parse_dlg_template(p, size, &t)) {
+        log_once("CreateDialogParamA-template",
+                 "CreateDialogParamA: dialog template %u could not be read (%s)", name,
+                 why.c_str());
+        set_eax(c, 0);
+        return;
+    }
+    uint32_t hwnd = create_dialog_window(hinst, parent, proc, t);
+    if (!hwnd) {
+        set_eax(c, 0);
+        return;
+    }
+    host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, init, 0);
+    set_eax(c, hwnd);
 }
 
 const ImportShim g_user32_shims[] = {
