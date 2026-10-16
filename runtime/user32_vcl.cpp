@@ -36,6 +36,10 @@ void window_created(uint32_t hwnd) {
     if (!focus)
         focus = hwnd;
 }
+void set_focus_window(uint32_t hwnd) {
+    if (find_window(hwnd))
+        focus = hwnd;
+}
 std::vector<uint32_t> window_z_order(uint32_t parent) {
     std::vector<uint32_t> result;
     for (uint32_t hwnd : z_order) {
@@ -1526,6 +1530,31 @@ void insert_menu_info_w(X86 *c) {
 void insert_menu_info_a(X86 *c) {
     insert_menu_info(c, true);
 }
+// A game may own its popup menus: it calls the native TrackPopupMenu but draws
+// and drives the menu with its own window class (Petz 5's WinMenu). The runtime
+// has no owner-draw menu engine, so when game.toml names the game's menu routine
+// the call is handed to it - the same routine the game's own custom-menu path
+// already calls, so its message loop drives the popup exactly as for that path.
+// The menu owner is the `this` pointer (a guest global), passed in ECX.
+void track_popup_menu(X86 *c) {
+#if defined(RECOMP_HOOK_MENU_TRACK_POPUP) && defined(RECOMP_HOOK_MENU_OWNER)
+    uint32_t owner = RECOMP_HOOK_MENU_OWNER ? rd32(RECOMP_HOOK_MENU_OWNER) : 0;
+    if (!owner) {
+        zero(c);
+        return;
+    }
+    uint32_t args[7];
+    for (int i = 0; i < 7; ++i)
+        args[i] = arg(c, i);
+    uint32_t saved_ecx = c->r[1];
+    c->r[1] = owner;
+    uint32_t result = guest_call(c, RECOMP_HOOK_MENU_TRACK_POPUP, args, 7);
+    c->r[1] = saved_ecx;
+    set_eax(c, result);
+#else
+    zero(c);
+#endif
+}
 
 const ImportShim shims[] = {
 #define U(name, n, fn) {"USER32.dll", name, n, fn}
@@ -1604,7 +1633,7 @@ const ImportShim shims[] = {
     U("RemoveMenu", 3, remove_menu_item),
     U("DeleteMenu", 3, delete_menu_item),
     U("DrawMenuBar", 1, yes),
-    U("TrackPopupMenu", 7, zero),
+    U("TrackPopupMenu", 7, track_popup_menu),
     U("EndMenu", 0, yes),
     U("GetMenuStringW", 5, get_menu_string_w),
     U("GetMenuStringA", 5, get_menu_string_a),

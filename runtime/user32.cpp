@@ -2024,6 +2024,41 @@ void u_EndDialog(X86 *c) {
     set_eax(c, 1);
 }
 
+// A listbox control with strings (LBS_HASSTRINGS): paint the rows top to
+// bottom and highlight the selected one. Item height is the 8pt system font's
+// 16 pixels, which is what MapDialogRect uses for a dialog unit's height.
+void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    if (!gdi::dc_of(hdc))
+        return;
+    gdi::fill(hdc, {0, 0, width, height}, 0x00ffffff);
+    const int32_t ih = 16;
+    int32_t y = 0;
+    for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i, y += ih) {
+        if (i == w->list_sel)
+            gdi::fill(hdc, {0, y, width, y + ih}, 0x00c00000);
+        uint32_t units = wide_units(w->list_items[i]);
+        if (!units)
+            continue;
+        if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+            wr32(block + 0, 2);
+            wr32(block + 4, y);
+            wr32(block + 8, width - 2);
+            wr32(block + 12, y + ih);
+            gm_put_wstr(block + 16, w->list_items[i], units + 1);
+            gdi::draw_text(hdc, block + 16, units, block, 0x24 /* DT_SINGLELINE|DT_VCENTER */);
+            heap_free(block);
+        }
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+}
 // Control windows answer the button-state and text messages the dialog helper
 // imports generate; everything else falls through to DefWindowProc.
 void control_proc(X86 *c) {
@@ -2032,7 +2067,10 @@ void control_proc(X86 *c) {
     switch (msg) {
     case 0x000f: // WM_PAINT
     case 0x0318: // WM_PRINTCLIENT
-        paint_control(c, hwnd, arg(c, 2));
+        if (w && w->cls == "listbox")
+            paint_listbox(c, hwnd, arg(c, 2));
+        else
+            paint_control(c, hwnd, arg(c, 2));
         set_eax(c, 0);
         return;
     case 0x000c: // WM_SETTEXT: the new caption has to be drawn
@@ -2040,6 +2078,119 @@ void control_proc(X86 *c) {
         if (Window *after = find_window(hwnd))
             after->update_pending = true;
         return;
+    case 0x0102: { // WM_CHAR: an edit control appends the typed character
+        if (w && w->cls == "edit") {
+            uint32_t ch = arg(c, 2);
+            if (ch == 8) {
+                if (!w->title_utf8.empty())
+                    w->title_utf8.pop_back();
+            } else if (ch >= 0x20 && ch < 0x7f) {
+                w->title_utf8.push_back(char(ch));
+            }
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    }
+    case 0x0100: // WM_KEYDOWN: backspace edits, everything else is ignored
+        if (w && w->cls == "edit" && arg(c, 2) == 8) {
+            if (!w->title_utf8.empty())
+                w->title_utf8.pop_back();
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0180: // LB_ADDSTRING
+        if (w) {
+            w->list_items.push_back(gm_str(arg(c, 3)));
+            w->update_pending = true;
+            set_eax(c, uint32_t(w->list_items.size() - 1));
+        } else {
+            set_eax(c, 0xffffffffu);
+        }
+        return;
+    case 0x0181: { // LB_INSERTSTRING
+        if (w) {
+            int32_t i = int32_t(arg(c, 2));
+            if (i < 0 || i > int32_t(w->list_items.size()))
+                i = int32_t(w->list_items.size());
+            w->list_items.insert(w->list_items.begin() + i, gm_str(arg(c, 3)));
+            w->update_pending = true;
+            set_eax(c, uint32_t(i));
+        } else {
+            set_eax(c, 0xffffffffu);
+        }
+        return;
+    }
+    case 0x0184: // LB_RESETCONTENT
+        if (w) {
+            w->list_items.clear();
+            w->list_sel = -1;
+            w->list_top = 0;
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0186: { // LB_SETCURSEL
+        int32_t i = int32_t(arg(c, 2));
+        if (w)
+            w->list_sel = (i < 0 || i >= int32_t(w->list_items.size())) ? -1 : i;
+        if (w)
+            w->update_pending = true;
+        set_eax(c, w ? uint32_t(w->list_sel) : 0xffffffffu);
+        return;
+    }
+    case 0x0188: // LB_GETCURSEL
+        set_eax(c, w ? uint32_t(w->list_sel) : 0xffffffffu);
+        return;
+    case 0x0189: { // LB_GETTEXT
+        int32_t i = int32_t(arg(c, 2));
+        std::string s = (w && i >= 0 && i < int32_t(w->list_items.size())) ? w->list_items[i] : "";
+        set_eax(c, gm_put_str(arg(c, 3), s.c_str(), 0x10000));
+        return;
+    }
+    case 0x018a: { // LB_GETTEXTLEN
+        int32_t i = int32_t(arg(c, 2));
+        set_eax(c, (w && i >= 0 && i < int32_t(w->list_items.size()))
+                       ? uint32_t(w->list_items[i].size())
+                       : 0xffffffffu);
+        return;
+    }
+    case 0x018b: // LB_GETCOUNT
+        set_eax(c, w ? uint32_t(w->list_items.size()) : 0);
+        return;
+    case 0x018f: { // LB_FINDSTRING: first item after the start with the prefix
+        std::string want = gm_str(arg(c, 3));
+        std::string lower_want = user32::lower(want);
+        int32_t start = int32_t(arg(c, 2)) + 1;
+        int32_t found = -1;
+        if (w)
+            for (int32_t i = start; i < int32_t(w->list_items.size()); ++i)
+                if (user32::lower(w->list_items[i]).rfind(lower_want, 0) == 0) {
+                    found = i;
+                    break;
+                }
+        set_eax(c, found < 0 ? 0xffffffffu : uint32_t(found));
+        return;
+    }
+    case 0x0190: { // LB_SELECTSTRING
+        std::string want = gm_str(arg(c, 3));
+        std::string lower_want = user32::lower(want);
+        int32_t start = int32_t(arg(c, 2)) + 1;
+        int32_t found = -1;
+        if (w)
+            for (int32_t i = start; i < int32_t(w->list_items.size()); ++i)
+                if (user32::lower(w->list_items[i]).rfind(lower_want, 0) == 0) {
+                    found = i;
+                    break;
+                }
+        if (w && found >= 0) {
+            w->list_sel = found;
+            w->update_pending = true;
+        }
+        set_eax(c, found < 0 ? 0xffffffffu : uint32_t(found));
+        return;
+    }
     case 0x00f1: // BM_SETCHECK
         if (w)
             w->userdata = arg(c, 2);
@@ -2053,6 +2204,18 @@ void control_proc(X86 *c) {
         return;
     case 0x0201: // WM_LBUTTONDOWN: remember the press so the click is a pair
         LOGW("control: WM_LBUTTONDOWN hwnd=%08x id=%u", hwnd, w ? w->id : 0);
+        if (w && w->cls == "listbox") {
+            int32_t row = w->list_top + (int16_t((arg(c, 3) >> 16) & 0xffff) / 16);
+            if (row >= 0 && row < int32_t(w->list_items.size()) && row != w->list_sel) {
+                w->list_sel = row;
+                w->update_pending = true;
+                if (w->parent)
+                    host_dispatch_to_wndproc(c, w->parent, 0x0111 /* WM_COMMAND */, w->id & 0xffffu,
+                                             hwnd); // LBN_SELCHANGE
+            }
+            set_eax(c, 0);
+            return;
+        }
         if (w)
             w->userdata |= 1u;
         set_eax(c, 0);
@@ -2337,6 +2500,14 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
     window_created(hwnd);
     for (const DlgItemTemplate &item : t.items)
         dlg_create_child(hwnd, item);
+    // The dialog manager gives the keyboard to the first tab stop, which is
+    // where the host's keystrokes go (an edit control in a naming dialog).
+    for (const auto &kv : windows())
+        if (kv.second.parent == hwnd && kv.second.visible &&
+            (kv.second.style & 0x10000 /*WS_TABSTOP*/)) {
+            set_focus_window(kv.first);
+            break;
+        }
     return hwnd;
 }
 // DialogBoxParamA reads the template from hInstance, builds the window and its

@@ -53,6 +53,11 @@ struct Window {
     // colour transparent, LWA_ALPHA (2) applies one opacity to the whole
     // window. Both are honoured where the window surfaces are composited.
     uint32_t layered_flags = 0, layered_key = 0, layered_alpha = 255;
+    // Listbox content (LB_ADDSTRING and friends). A dialog listbox has strings
+    // and one selection; the engine paints them and a click selects one.
+    std::vector<std::string> list_items;
+    int32_t list_sel = -1;
+    int32_t list_top = 0;
 };
 
 struct Msg {
@@ -83,6 +88,8 @@ void pump_window_timers();
 // Whether some visible window has an update region a paint would answer.
 bool paint_pending();
 void window_created(uint32_t hwnd);
+// Give the keyboard focus to a window (the dialog engine's first tab stop).
+void set_focus_window(uint32_t hwnd);
 // Siblings in back-to-front stacking order, respecting WS_EX_TOPMOST.
 std::vector<uint32_t> window_z_order(uint32_t parent);
 void reorder_window(uint32_t hwnd, uint32_t after);

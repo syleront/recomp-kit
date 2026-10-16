@@ -92,11 +92,12 @@ uint32_t g_clicked = 0;
 // down/up flags into ShlGlobals), so a press and release delivered between two
 // frames is invisible to it. A real click holds the button for many frames.
 struct ClickStep {
-    enum Kind { Click, Drag, Key, Move };
+    enum Kind { Click, Drag, Key, Move, Text };
     uint32_t frame = 0;
     Kind kind = Click;
     int x = 0, y = 0, x2 = 0, y2 = 0;
     uint32_t vk = 0;
+    std::string text;
 };
 std::vector<ClickStep> g_clicks;
 size_t g_next_click = 0;
@@ -548,6 +549,9 @@ void parse_clicks(const char *v) {
         if (action.rfind("key=", 0) == 0) {
             st.kind = ClickStep::Key;
             st.vk = (uint32_t)strtoul(action.c_str() + 4, nullptr, 0);
+        } else if (action.rfind("text=", 0) == 0) {
+            st.kind = ClickStep::Text;
+            st.text = action.substr(5);
         } else if (action.rfind("move=", 0) == 0) {
             st.kind = ClickStep::Move;
             if (sscanf(action.c_str() + 5, "%d,%d", &st.x, &st.y) != 2) {
@@ -597,6 +601,18 @@ void run_click_script() {
            g_present_count >= g_clicks[g_next_click].frame) {
         g_press_step = g_clicks[g_next_click++];
         g_press_frame = g_present_count;
+        if (g_press_step.kind == ClickStep::Text) {
+            // Type into the focused control: one WM_CHAR per byte, the message
+            // an edit control actually consumes. TranslateMessage would turn a
+            // key press into this; posting it directly is what a text seam needs
+            // and keeps the script free of virtual-key codes.
+            for (char ch : g_press_step.text)
+                host_post_key_message(0x0102 /* WM_CHAR */, (uint32_t)(unsigned char)ch, 1);
+            printf("[host] scripted text \"%s\" after %u frames\n", g_press_step.text.c_str(),
+                   g_present_count);
+            fflush(stdout);
+            continue;
+        }
         if (g_press_step.kind == ClickStep::Move) {
             host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_press_step.x, g_press_step.y);
             printf("[host] scripted move to (%d,%d) after %u frames\n", g_press_step.x,
