@@ -114,6 +114,11 @@ void pump_mouse_input(X86 *c) {
     MouseInput input = mouse_input.front();
     mouse_input.pop_front();
     uint32_t hwnd = find_window(capture) ? capture : mouse_window(0, input.x, input.y);
+    // A wheel event has no button to capture it: Windows sends it to the window
+    // under the cursor, and to the focus window when the point is over none of
+    // this thread's windows. Every other mouse message is routed by its point.
+    if (!hwnd && input.message == 0x20a && find_window(focus))
+        hwnd = focus;
     auto *w = find_window(hwnd);
     if (!w)
         return;
@@ -144,8 +149,12 @@ void pump_mouse_input(X86 *c) {
         return; // activation may destroy its recipient
     int32_t x, y;
     client_origin(hwnd, &x, &y);
-    uint32_t lp = (uint32_t(uint16_t(int64_t(input.y) - y)) << 16) | uint16_t(int64_t(input.x) - x);
-    LOGV("host mouse %04x screen=(%d,%d) -> hwnd=%08x client=(%d,%d) mk=%x", input.message, input.x,
+    // WM_MOUSEWHEEL is the one mouse message whose lParam is SCREEN pixels;
+    // every other one carries client pixels.
+    uint32_t lp = input.message == 0x20a ? (uint32_t(uint16_t(input.y)) << 16) | uint16_t(input.x)
+                                         : (uint32_t(uint16_t(int64_t(input.y) - y)) << 16) |
+                                               uint16_t(int64_t(input.x) - x);
+    LOGV("host mouse %04x screen=(%d,%d) -> hwnd=%08x lp=(%d,%d) mk=%x", input.message, input.x,
          input.y, hwnd, int16_t(lp), int16_t(lp >> 16), input.mk);
     queue().push_back(
         {hwnd, input.message, input.mk, lp, input.time, uint32_t(input.x), uint32_t(input.y)});
@@ -1811,7 +1820,7 @@ void host_post_mouse_message(uint32_t msg, uint32_t mk, int32_t x, int32_t y) {
         mk |= 4;
     if (user32::g_key_state[0x11] & 0x80)
         mk |= 8;
-    if (msg < 0x200 || msg > 0x209)
+    if (msg < 0x200 || msg > 0x20a)
         return;
     // A mouse move is a position, not an event. Windows does not queue one per
     // motion the hardware reports: it keeps the latest and synthesises the

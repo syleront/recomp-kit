@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Map a dialog template's rectangles through the dialog's own font metrics
+  instead of treating dialog units as pixels: a `DS_SETFONT` face's average
+  character width (a quarter of it per unit across) and cell height (an eighth
+  down) scale the `DLGTEMPLATE`/`DLGITEMTEMPLATE`, via `MulDiv`. A `DS_SETFONT`
+  dialog was drawn ~30% too small, so its listbox could not hold its rows. A
+  raster face or a fontless template keeps the 8x16 bitmap cell. `MapDialogRect`
+  uses the same stored base units, `DS_CENTER` is honoured (centred on the
+  owner), and a listbox now answers `WM_MOUSEWHEEL`, `WM_KEYDOWN` navigation and
+  `WM_VSCROLL`, clamped so the last row reaches the bottom.
+- Deliver the mouse wheel as `WM_MOUSEWHEEL`: the SDL host already decoded it but
+  the runtime dropped any message above `0x209`, so it never reached a listbox.
+  It is now routed like any mouse message - to the window under the cursor, or to
+  the focus when the point is over none of the thread's windows - with the wheel
+  delta in wParam's high word and screen pixels in lParam. Clicking a listbox in
+  a dialog gives it the keyboard, so the arrow keys that follow reach it.
 - Report the primary display's work area, not a window's client area, from
   `SystemParametersInfoA(SPI_GETWORKAREA)`: the shim read the first top-level
   window's client rect and, before any window existed, fell back to a hard-coded

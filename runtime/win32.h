@@ -357,6 +357,9 @@ void host_post_key_message(uint32_t msg, uint32_t wparam, uint32_t lparam);
 uint32_t host_main_window(); // first created top-level HWND, or 0
 // Post WM_CLOSE to every visible top-level window, as closing a window does.
 void host_post_close_messages();
+// Post WM_COMMAND(id) to every visible top-level window, as choosing a menu
+// command does. Test/host seam: a command the guest would issue from its menu.
+void host_post_command(uint32_t id);
 uint32_t host_window_proc(uint32_t hwnd); // guest WNDPROC address, or 0
 bool host_window_rect(uint32_t hwnd, int32_t *x, int32_t *y, int32_t *w, int32_t *h);
 void host_set_client_size(uint32_t hwnd, int32_t w, int32_t h);

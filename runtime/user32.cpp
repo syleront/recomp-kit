@@ -176,6 +176,24 @@ void host_post_close_messages() {
     if (!any && g_main_hwnd)
         host_post_message(g_main_hwnd, 0x0010 /* WM_CLOSE */, 0, 0);
 }
+// A host choosing a menu command is what a user clicking the menu is: Windows
+// sends WM_COMMAND to the window that owns the menu. The port projects the
+// guest's play window and has no real menu bar, so deliver it to every visible
+// top-level window - whichever owns the command handles it, the rest ignore it.
+// This is the same fan-out as host_post_close_messages, for the same reason: the
+// program's frame is not the first window host_main_window names.
+void host_post_command(uint32_t id) {
+    bool any = false;
+    for (auto &kv : windows()) {
+        const Window &w = kv.second;
+        if (w.parent || !w.visible)
+            continue;
+        host_post_message(w.hwnd, 0x0111 /* WM_COMMAND */, id, 0);
+        any = true;
+    }
+    if (!any && g_main_hwnd)
+        host_post_message(g_main_hwnd, 0x0111 /* WM_COMMAND */, id, 0);
+}
 uint32_t host_window_proc(uint32_t hwnd) {
     Window *w = find_window(hwnd);
     return w ? w->wndproc : 0;
@@ -2548,6 +2566,10 @@ void control_proc(X86 *c) {
     case 0x0201: // WM_LBUTTONDOWN: remember the press so the click is a pair
         LOGW("control: WM_LBUTTONDOWN hwnd=%08x id=%u", hwnd, w ? w->id : 0);
         if (w && w->cls == "listbox") {
+            // Windows gives the keyboard to a listbox that is clicked, so the
+            // arrow keys that follow reach it. The dialog manager otherwise
+            // leaves focus on the first tab stop (its OK button).
+            set_focus_window(hwnd);
             // The click row comes from the same heights the paint and
             // LB_GETITEMRECT use; a hard 16 px divisor here selected the wrong
             // row once WM_MEASUREITEM gave the box a different height.
@@ -2921,6 +2943,11 @@ void u_DialogBoxParamA(X86 *c) {
         return;
     }
     uint32_t hwnd = create_dialog_window(hinst, parent, proc, t);
+    if (const Window *cw = find_window(hwnd)) {
+        const Window *ow = find_window(parent);
+        LOGV("DialogBoxParamA: name=%u parent=%08x owner=%dx%d rect=(%d,%d) %dx%d", name, parent,
+             ow ? ow->w : -1, ow ? ow->h : -1, cw->x, cw->y, cw->w, cw->h);
+    }
     // A modal dialog is shown whether or not the template asks for it.
     if (Window *w = find_window(hwnd)) {
         w->visible = true;

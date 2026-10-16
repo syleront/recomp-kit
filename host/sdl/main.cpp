@@ -136,7 +136,7 @@ void post(uint32_t msg, uint32_t wparam, uint32_t lparam) {
         host_post_key_message(msg, wparam, lparam);
         return;
     }
-    if (msg >= 0x200 && msg <= 0x209) {
+    if (msg >= 0x200 && msg <= 0x20a) {
         // A gate hit is already a GUEST SCREEN pixel: the presenter composes
         // the guest image into a frame rooted at the guest screen origin
         // (present.h; gdi_present_windows draws the whole screen from 0,0),

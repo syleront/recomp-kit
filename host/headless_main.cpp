@@ -96,11 +96,12 @@ uint32_t g_clicked = 0;
 // down/up flags into ShlGlobals), so a press and release delivered between two
 // frames is invisible to it. A real click holds the button for many frames.
 struct ClickStep {
-    enum Kind { Click, Drag, Key, Move, Text, Hold };
+    enum Kind { Click, Drag, Key, Move, Text, Hold, Wheel, Cmd };
     uint32_t frame = 0;
     Kind kind = Click;
     int x = 0, y = 0, x2 = 0, y2 = 0;
-    uint32_t vk = 0;
+    int delta = 0;   // Wheel: notches (positive = up), the WM_MOUSEWHEEL delta / 120
+    uint32_t vk = 0; // Key: virtual-key code; Cmd: the WM_COMMAND id
     std::string text;
 };
 std::vector<ClickStep> g_clicks;
@@ -570,6 +571,21 @@ void parse_clicks(const char *v) {
         } else if (action.rfind("text=", 0) == 0) {
             st.kind = ClickStep::Text;
             st.text = action.substr(5);
+        } else if (action.rfind("wheel=", 0) == 0) {
+            // wheel=x,y,delta: one WM_MOUSEWHEEL at the guest screen point, the
+            // delta in notches (a notch is 120, the WM_MOUSEWHEEL wParam unit).
+            st.kind = ClickStep::Wheel;
+            if (sscanf(action.c_str() + 6, "%d,%d,%d", &st.x, &st.y, &st.delta) != 3) {
+                fprintf(stderr, "[host] RECOMP_CLICKS wheel \"%s\": want wheel=x,y,delta\n",
+                        action.c_str());
+                continue;
+            }
+        } else if (action.rfind("cmd=", 0) == 0) {
+            // cmd=ID: choose a menu command, as clicking its item does. How a
+            // test reaches a dialog the guest only builds conditionally (the
+            // "More ... Scenes" dialogs vanish once every area fits the menu).
+            st.kind = ClickStep::Cmd;
+            st.vk = (uint32_t)strtoul(action.c_str() + 4, nullptr, 0);
         } else if (action.rfind("move=", 0) == 0) {
             st.kind = ClickStep::Move;
             if (sscanf(action.c_str() + 5, "%d,%d", &st.x, &st.y) != 2) {
@@ -644,6 +660,26 @@ void run_click_script() {
             for (char ch : g_press_step.text)
                 host_post_key_message(0x0102 /* WM_CHAR */, (uint32_t)(unsigned char)ch, 1);
             printf("[host] scripted text \"%s\" after %u frames\n", g_press_step.text.c_str(),
+                   g_present_count);
+            fflush(stdout);
+            continue;
+        }
+        if (g_press_step.kind == ClickStep::Wheel) {
+            // One WM_MOUSEWHEEL: wParam's high word is the delta in 120ths,
+            // lParam the screen point (the runtime uses it to pick the window
+            // under the cursor). An immediate action, not a press to hold.
+            uint32_t wparam = uint32_t(int32_t(g_press_step.delta * 120)) << 16;
+            host_post_mouse_message(0x020a /* WM_MOUSEWHEEL */, wparam, g_press_step.x,
+                                    g_press_step.y);
+            printf("[host] scripted wheel delta=%d at (%d,%d) after %u frames\n",
+                   g_press_step.delta, g_press_step.x, g_press_step.y, g_present_count);
+            fflush(stdout);
+            continue;
+        }
+        if (g_press_step.kind == ClickStep::Cmd) {
+            // An immediate menu command, not a press to hold.
+            host_post_command(g_press_step.vk);
+            printf("[host] scripted command id=%u after %u frames\n", g_press_step.vk,
                    g_present_count);
             fflush(stdout);
             continue;

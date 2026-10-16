@@ -6279,6 +6279,19 @@ static void test_host_mouse_routing() {
     take(0x201, 1, 125, 150, hidden, 25, 30);
     call_import(&c, "USER32.dll", "SetWindowPos", {top, 0xffffffffu, 0, 0, 0, 0, 3});
     take(0x201, 1, 125, 150, child, 15, 18);
+    // A wheel has no button, so it is not captured: it goes to the window under
+    // the cursor, and its lParam is SCREEN pixels, unlike every other mouse
+    // message. With no window under the cursor it falls back to the focus.
+    host_post_mouse_message(0x20a, 3u << 16, 125, 150);
+    check(call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x20a, 1}) == 1 &&
+              rd32(msg) == child && rd32(msg + 4) == 0x20a && rd32(msg + 8) == (3u << 16) &&
+              rd32(msg + 12) == ((150u << 16) | 125u),
+          "a wheel goes to the window under the cursor with a screen lParam");
+    call_import(&c, "USER32.dll", "SetFocus", {ordinary});
+    host_post_mouse_message(0x20a, 1u << 16, 5000, 5000);
+    check(call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x20a, 1}) == 1 &&
+              rd32(msg) == ordinary && rd32(msg + 12) == ((5000u << 16) | 5000u),
+          "a wheel over no window goes to the focus");
     activate_result = 4; // MA_NOACTIVATEANDEAT consumes the press.
     call_import(&c, "USER32.dll", "SetActiveWindow", {ordinary});
     host_post_mouse_message(0x201, 1, 125, 150);
