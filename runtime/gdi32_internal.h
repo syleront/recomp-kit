@@ -99,6 +99,11 @@ bool font_dialog_units(const std::string &face, int32_t point_size, int32_t weig
 // never disagree. Select it into the dialog and its controls (WM_SETFONT).
 Object dialog_font_object(const std::string &face, int32_t point_size, int32_t weight);
 uint32_t draw_text(uint32_t dc, uint32_t text, uint32_t count, uint32_t rect, uint32_t flags);
+// The width and line height of an ANSI string in the DC's selected font: the
+// same measurement DrawText/ExtTextOut lay text out with. For a caret's x and a
+// selection's extent in an edit control.
+int32_t text_width(uint32_t dc, const std::string &text);
+int32_t text_height(uint32_t dc);
 } // namespace gdi
 uint32_t gdi_window_dc(uint32_t window);
 bool gdi_release_window_dc(uint32_t window, uint32_t dc);

@@ -2659,6 +2659,180 @@ static void test_button_state(X86 *c) {
     call_import(c, "USER32.dll", "DestroyWindow", {parent});
 }
 
+// The root cause of the windowed Rename failure (TD-079): the button class's
+// pressed bit must not live in GWL_USERDATA. Petz 5's rename edit is subclassed
+// and stores the old window procedure in GWL_USERDATA; an edit click that ORed
+// a pressed bit into it turned 0x0ff084d0 into 0x0ff084d1, so every later
+// message went to CallWindowProc(0x0ff084d1) and typing did nothing.
+static void test_edit_click_preserves_userdata(X86 *c) {
+    section("USER32 edit click keeps GWL_USERDATA");
+    ensure_dialog_classes();
+    uint32_t cls = put_str("RTUserdataParent");
+    uint32_t proc = imports_alloc_trampoline("test", "rt_userdata_parent", fake_guest_fn, 4);
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 0, 0);
+    wr32(wc + 4, proc);
+    wr32(wc + 36, cls);
+    check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0, "register the parent");
+    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                  {0, cls, cls, 0x80000000u, 0, 0, 300, 100, 0, 0, 0, 0});
+    uint32_t ecls = put_str("edit");
+    uint32_t edit = call_import(
+        c, "USER32.dll", "CreateWindowExA",
+        {0, ecls, 0, 0x40000000u | 0x10000000u | 0x00800000u, 0, 0, 100, 20, parent, 42, 0, 0});
+    if (user32::Window *ew = user32::find_window(edit))
+        ew->cls = "edit";
+    // A subclass procedure, the value the game stores in GWL_USERDATA.
+    const uint32_t stored = 0x0ff084d0u;
+    call_import(c, "USER32.dll", "SetWindowLongA", {edit, uint32_t(-21), stored});
+    call_import(c, "USER32.dll", "SendMessageA", {edit, 0x0201 /*WM_LBUTTONDOWN*/, 1, 0x00140014});
+    check(call_import(c, "USER32.dll", "GetWindowLongA", {edit, uint32_t(-21)}) == stored,
+          "an edit click leaves GWL_USERDATA bit for bit");
+    check(user32::focus_window() == edit, "the click gives the edit the focus");
+    call_import(c, "USER32.dll", "SendMessageA", {edit, 0x0202 /*WM_LBUTTONUP*/, 0, 0x00140014});
+    check(call_import(c, "USER32.dll", "GetWindowLongA", {edit, uint32_t(-21)}) == stored,
+          "the release leaves GWL_USERDATA alone too");
+    // A push button still records its press in the button's own state.
+    uint32_t bcls = put_str("button");
+    uint32_t btn =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, bcls, 0, 0x40000000u | 0x10000000u, 0, 0, 80, 24, parent, 7, 0, 0});
+    if (user32::Window *bw = user32::find_window(btn))
+        bw->cls = "button";
+    call_import(c, "USER32.dll", "SendMessageA", {btn, 0x0201, 1, 0x00140014});
+    check(user32::find_window(btn)->pressed, "a button click records the press");
+    call_import(c, "USER32.dll", "SendMessageA", {btn, 0x0202, 0, 0x00140014});
+    check(!user32::find_window(btn)->pressed, "the release clears the press");
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
+}
+
+// An edit control's text model: caret, selection and the editing keys.
+static void test_edit_text_model(X86 *c) {
+    section("USER32 edit caret and selection");
+    ensure_dialog_classes();
+    uint32_t cls = put_str("RTEditParent");
+    uint32_t proc = imports_alloc_trampoline("test", "rt_edit_parent", fake_guest_fn, 4);
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 0, 0);
+    wr32(wc + 4, proc);
+    wr32(wc + 36, cls);
+    check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0, "register the edit parent");
+    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                  {0, cls, cls, 0x80000000u, 0, 0, 300, 100, 0, 0, 0, 0});
+    uint32_t ecls = put_str("edit");
+    uint32_t edit = call_import(
+        c, "USER32.dll", "CreateWindowExA",
+        {0, ecls, 0, 0x40000000u | 0x10000000u | 0x00800000u, 0, 0, 100, 20, parent, 42, 0, 0});
+    if (user32::Window *ew = user32::find_window(edit))
+        ew->cls = "edit";
+    check(edit != 0, "create a child edit");
+    auto w = [&]() { return user32::find_window(edit); };
+    auto text = [&]() { return user32::find_window(edit)->title_utf8; };
+    auto send = [&](uint32_t msg, uint32_t wp, uint32_t lp) {
+        call_import(c, "USER32.dll", "SendMessageA", {edit, msg, wp, lp});
+    };
+    auto set_text = [&](const char *s) {
+        call_import(c, "USER32.dll", "SetWindowTextA", {edit, put_str(s)});
+    };
+
+    set_text("Pouncer");
+    user32::focus_edit_select_all(edit);
+    check(w()->sel_anchor == 0 && w()->caret == 7, "focus selects the whole text");
+    send(0x0102, 'X', 0); // WM_CHAR replaces the selection
+    check(text() == "X" && w()->caret == 1, "typing replaces the selection");
+    send(0x0102, 'a', 0);
+    send(0x0102, 'b', 0);
+    check(text() == "Xab" && w()->caret == 3, "typing inserts at the caret");
+    send(0x0100, 0x25, 0); // VK_LEFT
+    send(0x0102, 'Z', 0);
+    check(text() == "XaZb" && w()->caret == 3, "Left moves the caret and typing lands there");
+    send(0x0100, 0x08, 0); // VK_BACK
+    check(text() == "Xab" && w()->caret == 2, "Backspace deletes before the caret");
+    send(0x0100, 0x24, 0); // VK_HOME
+    check(w()->caret == 0, "Home goes to the start");
+    host_set_key_state(0x10, true);
+    send(0x0100, 0x27, 0); // Shift+Right extends
+    host_set_key_state(0x10, false);
+    check(w()->sel_anchor == 0 && w()->caret == 1, "Shift+Right extends the selection");
+    send(0x0102, 'Q', 0);
+    check(text() == "Qab", "typing replaces a partial selection");
+    host_set_key_state(0x11, true);
+    send(0x0100, 'A', 0); // Ctrl+A
+    host_set_key_state(0x11, false);
+    check(w()->sel_anchor == 0 && w()->caret == 3, "Ctrl+A selects everything");
+    send(0x0102, 'y', 0);
+    check(text() == "y", "Ctrl+A then typing replaces it");
+    send(0x0100, 0x24, 0); // VK_HOME
+    send(0x0100, 0x2e, 0); // VK_DELETE
+    check(text() == "", "Delete removes the character after the caret");
+    // A click places the caret; the 8x16 cells advance 8 px per character.
+    set_text("abcd");
+    send(0x0201 /*WM_LBUTTONDOWN*/, 1, 17);
+    check(w()->caret == 2, "a click places the caret near the pointer (caret %d)", w()->caret);
+    check(user32::focus_window() == edit, "a click gives the edit the focus");
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
+}
+
+// The modal pump's IsDialogMessage: Return presses the default push button,
+// Escape cancels, Tab moves the focus. The rename dialog's OK is a
+// BS_DEFPUSHBUTTON, so a player who presses Return renames.
+static uint32_t g_dk_cmd = 0, g_dk_cmd_id = 0;
+static void dialogkey_proc(X86 *c) {
+    uint32_t msg = arg(c, 1);
+    if (msg == 0x0111) { // WM_COMMAND
+        ++g_dk_cmd;
+        g_dk_cmd_id = arg(c, 2) & 0xffffu;
+        set_eax(c, 1);
+        return;
+    }
+    set_eax(c, msg == 0x0081 ? 1 : 0);
+}
+static void test_dialog_key_routing(X86 *c) {
+    section("USER32 dialog default button and Escape");
+    ensure_dialog_classes();
+    uint32_t dproc = imports_alloc_trampoline("test", "dialogkey_proc", dialogkey_proc, 4);
+    uint32_t cls = put_str("#32770");
+    uint32_t dlg = call_import(c, "USER32.dll", "CreateWindowExA",
+                               {0, cls, put_str("Keys"), 0x10000000u, 0, 0, 300, 200, 0, 0, 0, 0});
+    // A window made through CreateWindowExA records its class by ATOM; the
+    // dialog engine and the dialog tests use the friendly name.
+    if (user32::Window *dw = user32::find_window(dlg))
+        dw->cls = "#32770";
+    call_import(c, "USER32.dll", "SetWindowLongA", {dlg, uint32_t(-4), dproc}); // GWL_WNDPROC
+    uint32_t ecls = put_str("edit");
+    uint32_t edit = call_import(
+        c, "USER32.dll", "CreateWindowExA",
+        {0, ecls, 0, 0x40000000u | 0x10000000u | 0x00010000u, 5, 5, 100, 20, dlg, 1102, 0, 0});
+    uint32_t bcls = put_str("button");
+    uint32_t ok = call_import(c, "USER32.dll", "CreateWindowExA",
+                              {0, bcls, put_str("OK"), 0x40000000u | 0x10000000u | 0x00010000u | 1u,
+                               5, 50, 60, 20, dlg, 1, 0, 0});
+    uint32_t cancel =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, bcls, put_str("Cancel"), 0x40000000u | 0x10000000u | 0x00010000u, 80, 50,
+                     60, 20, dlg, 2, 0, 0});
+    if (user32::Window *ew = user32::find_window(edit))
+        ew->cls = "edit";
+    check(ok != 0 && cancel != 0, "create the dialog's buttons");
+    user32::set_focus_window(edit);
+    g_dk_cmd = g_dk_cmd_id = 0;
+    check(user32::dialog_key_message(c, dlg, 0x0100, 0x0d, 0), "Return is consumed by the dialog");
+    check(g_dk_cmd == 1 && g_dk_cmd_id == 1, "Return presses the default button (id %u)",
+          g_dk_cmd_id);
+    g_dk_cmd = g_dk_cmd_id = 0;
+    check(user32::dialog_key_message(c, dlg, 0x0100, 0x1b, 0), "Escape is consumed by the dialog");
+    check(g_dk_cmd == 1 && g_dk_cmd_id == 2, "Escape sends IDCANCEL");
+    user32::set_focus_window(edit);
+    check(user32::dialog_key_message(c, dlg, 0x0100, 0x09, 0), "Tab is consumed by the dialog");
+    check(user32::focus_window() == ok, "Tab focuses the next tab stop");
+    if (user32::Window *ew = user32::find_window(edit))
+        ew->style |= 4u; // ES_MULTILINE
+    user32::set_focus_window(edit);
+    check(!user32::dialog_key_message(c, dlg, 0x0100, 0x0d, 0), "a multiline edit keeps Return");
+    check(!user32::dialog_key_message(c, dlg, 0x0100, 0x1b, 0), "a multiline edit keeps Escape");
+    call_import(c, "USER32.dll", "DestroyWindow", {dlg});
+}
+
 static void test_windows(X86 *c) {
     section("USER32 windows and messages");
     // The window procedure is a stand-in the test-only recomp_call can reach;
@@ -7413,6 +7587,9 @@ int main(int argc, char **argv) {
     test_dialog_frame_geometry(c);
     test_dialog_close_box(c);
     test_button_state(c);
+    test_edit_click_preserves_userdata(c);
+    test_edit_text_model(c);
+    test_dialog_key_routing(c);
     test_interp_extra_ops(c);
     test_acm_pcm_converter(c);
     test_guest_thunks(c);

@@ -75,11 +75,18 @@ void post_key(HostKeyMapping m, bool down, bool sys, bool context, uint32_t char
     post(down ? (sys ? WM_SYSKEYDOWN_ : WM_KEYDOWN_) : (sys ? WM_SYSKEYUP_ : WM_KEYUP_), m.vk,
          lparam);
     // Printable characters, and the four control characters Win32 also
-    // delivers as WM_CHAR.
-    if (down && !sys && character &&
-        ((character >= 0x20 && character < 0x7f) || character == 0x0d || character == 0x1b ||
-         character == 0x09 || character == 0x08))
-        post(WM_CHAR_, character, lparam);
+    // delivers as WM_CHAR. With Control held a letter is an accelerator, not
+    // text: TranslateMessage makes it a control code (Ctrl+A -> 0x01) and no
+    // printable WM_CHAR follows. The guest edit reads that as select-all.
+    if (down && !sys && character) {
+        const bool ctrl = (g_guest_modifiers & 2) != 0;
+        if (ctrl &&
+            ((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')))
+            post(WM_CHAR_, character & 0x1fu, lparam);
+        else if ((character >= 0x20 && character < 0x7f) || character == 0x0d ||
+                 character == 0x1b || character == 0x09 || character == 0x08)
+            post(WM_CHAR_, character, lparam);
+    }
 }
 
 // The modifier bit a scan code contributes: either side counts, which is what

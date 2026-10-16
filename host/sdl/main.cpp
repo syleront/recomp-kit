@@ -729,9 +729,13 @@ void handle_key(const SDL_KeyboardEvent &event, bool down) {
     e.kind = PendingInput::KEY;
     e.key = key;
     e.down = down;
-    // The character the key produces with no modifier held, which is what a
-    // WM_CHAR for it carries; keycodes above the Unicode range are not characters.
-    const SDL_Keycode plain = SDL_GetKeyFromScancode(event.scancode, SDL_KMOD_NONE, false);
+    // The character the key produces with the shifts the layout applies, which
+    // is what a WM_CHAR for it carries: Shift (and Caps Lock) make a letter
+    // upper case, so a typed name is not silently lower-cased. Control is left
+    // out - a Ctrl+letter is an accelerator, and input_gate.cpp turns it into
+    // the control code. Keycodes above the Unicode range are not characters.
+    const SDL_Keycode plain =
+        SDL_GetKeyFromScancode(event.scancode, event.mod & (SDL_KMOD_SHIFT | SDL_KMOD_CAPS), false);
     e.character = plain < 0x40000000 && plain >= 0x20 ? (uint32_t)plain : 0u;
     e.flags = host_modifier_flags_from_sdl(event.mod);
     queue_or_apply(e);
@@ -1104,8 +1108,14 @@ void handle_event(const SDL_Event &event) {
     case SDL_EVENT_KEY_UP:
         // Command combinations belong to the application, not the game:
         // Command-Q quits through SDL_EVENT_QUIT and Command-H hides.
-        if (event.key.mod & SDL_KMOD_GUI)
+        if (event.key.mod & SDL_KMOD_GUI) {
+            // On macOS Command stands in for Control in the guest. Only
+            // select-all is wired: Command+A is the Ctrl+A control code an edit
+            // reads as "select the whole text".
+            if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_A)
+                host_post_key_message(WM_CHAR_, 0x01, 0);
             break;
+        }
         handle_key(event.key, event.type == SDL_EVENT_KEY_DOWN);
         break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:

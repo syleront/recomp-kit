@@ -1192,6 +1192,10 @@ void def_window_proc(X86 *c, bool wide) {
             // static/button/edit's own client), which is what a program that
             // fills a dialog with SetDlgItemTextA then shows expects.
             w->update_pending = true;
+            // An edit's caret collapses to the end of the new text, so a stale
+            // index into the old (longer) string cannot outlive it.
+            if (w->cls == "edit")
+                w->caret = w->sel_anchor = int32_t(w->title_utf8.size());
         }
         set_eax(c, w ? 1 : 0);
         return;
@@ -2587,7 +2591,7 @@ void fill_disc(uint32_t hdc, int32_t cx, int32_t cy, int32_t r, uint32_t color) 
         gdi::fill(hdc, {cx - x, cy + dy, cx + x + 1, cy + dy + 1}, color);
     }
 }
-// Button styles whose check state lives in the window's userdata rather than
+// Button styles whose check state is the window's own `check_state` rather than
 // the pressed flag: checkbox, auto-checkbox, radio, 3-state, auto-3-state,
 // auto-radio (BS_TYPEMASK values 2,3,4,5,6,9).
 bool is_check_button(uint32_t style) {
@@ -2606,7 +2610,7 @@ void paint_checkbox(X86 *c, uint32_t hwnd, uint32_t into) {
         w->update_pending = false;
     const int32_t width = w->w, height = w->h;
     const bool radio = ((w->style & 0x0fu) == 0x4u || (w->style & 0x0fu) == 0x9u);
-    const uint32_t checked = (w->userdata & 3u) != 0;
+    const uint32_t checked = (w->check_state & 3u) != 0;
     const bool left_text = (w->style & 0x20u) != 0; // BS_LEFTTEXT
     const std::string text = w->title_utf8;
     uint32_t hdc = into ? into : gdi_window_dc(hwnd);
@@ -2703,7 +2707,7 @@ void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
     if (!into)
         w->update_pending = false;
     const int32_t width = w->w, height = w->h;
-    const bool pressed = (w->userdata & 1u) != 0;
+    const bool pressed = w->pressed;
     const bool is_default = (w->style & 0x0fu) == 1u;
     const bool disabled = (w->style & 0x08000000u) != 0; // WS_DISABLED
     const std::string text = w->title_utf8;
@@ -2840,12 +2844,99 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
 // edit; COLOR_WINDOW when the dialog procedure answers nothing) inside a sunken
 // border, with the text left-aligned, clipped to the field, in the control's
 // WM_SETFONT face. Caret and selection are not modelled (TD-049).
+// An edit control's text model. The caret and the selection anchor are byte
+// indices into title_utf8; every operation clamps them to the current text so a
+// WM_SETTEXT that shrinks the string cannot leave a caret past its end.
+void edit_clamp(Window *w) {
+    const int32_t n = int32_t(w->title_utf8.size());
+    if (w->caret < 0)
+        w->caret = 0;
+    if (w->caret > n)
+        w->caret = n;
+    if (w->sel_anchor < 0)
+        w->sel_anchor = 0;
+    if (w->sel_anchor > n)
+        w->sel_anchor = n;
+}
+int32_t edit_sel_begin(const Window *w) {
+    return w->sel_anchor < w->caret ? w->sel_anchor : w->caret;
+}
+int32_t edit_sel_end(const Window *w) {
+    return w->sel_anchor < w->caret ? w->caret : w->sel_anchor;
+}
+void edit_delete_selection(Window *w) {
+    edit_clamp(w);
+    const int32_t a = edit_sel_begin(w), b = edit_sel_end(w);
+    if (a == b)
+        return;
+    w->title_utf8.erase(size_t(a), size_t(b - a));
+    w->caret = w->sel_anchor = a;
+}
+// Put the caret at `pos`, extending the selection to it when `select` (Shift).
+void edit_move_caret(Window *w, int32_t pos, bool select) {
+    const int32_t n = int32_t(w->title_utf8.size());
+    if (pos < 0)
+        pos = 0;
+    if (pos > n)
+        pos = n;
+    w->caret = pos;
+    if (!select)
+        w->sel_anchor = pos;
+    w->update_pending = true;
+}
+void edit_insert(Window *w, char ch) {
+    edit_clamp(w);
+    edit_delete_selection(w);
+    w->title_utf8.insert(w->title_utf8.begin() + w->caret, ch);
+    ++w->caret;
+    w->sel_anchor = w->caret;
+    w->update_pending = true;
+}
+void edit_backspace(Window *w) {
+    edit_clamp(w);
+    if (edit_sel_begin(w) != edit_sel_end(w)) {
+        edit_delete_selection(w);
+    } else if (w->caret > 0) {
+        w->title_utf8.erase(size_t(w->caret - 1), 1);
+        --w->caret;
+        w->sel_anchor = w->caret;
+    }
+    w->update_pending = true;
+}
+void edit_delete(Window *w) {
+    edit_clamp(w);
+    if (edit_sel_begin(w) != edit_sel_end(w)) {
+        edit_delete_selection(w);
+    } else if (w->caret < int32_t(w->title_utf8.size())) {
+        w->title_utf8.erase(size_t(w->caret), 1);
+    }
+    w->update_pending = true;
+}
+// The caret index nearest a client x: walk the string and take the boundary
+// whose midpoint the point is on. The same advance the paint lays the text out
+// with, so a click lands where the glyph under it is.
+int32_t edit_index_from_x(uint32_t hdc, const Window *w, int32_t x) {
+    const std::string &s = w->title_utf8;
+    int32_t best = 0, best_dist = INT32_MAX;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        const int32_t cx = gdi::text_width(hdc, s.substr(0, i));
+        const int32_t dist = cx > x ? cx - x : x - cx;
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = int32_t(i);
+        }
+        if (cx > x)
+            break;
+    }
+    return best;
+}
 void paint_edit(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
     if (!w)
         return;
     if (!into)
         w->update_pending = false;
+    edit_clamp(w);
     const int32_t width = w->w, height = w->h;
     const uint32_t parent = w->parent;
     const std::string text = w->title_utf8;
@@ -2884,24 +2975,66 @@ void paint_edit(X86 *c, uint32_t hwnd, uint32_t into) {
         gdi::fill(hdc, {width - inset - 1, inset, width - inset, height - inset}, light);
         inset += 2;
     }
+    const bool multiline = (w->style & 0x0004u) != 0; // ES_MULTILINE
+    const bool focused = focus_window() == hwnd;
+    // A one-line edit's caret/selection geometry. The text is drawn vertically
+    // centred (DT_VCENTER), so the caret band sits at the same centre.
+    const int32_t tx = inset + 2, line_h = gdi::text_height(hdc);
+    const int32_t ty = multiline ? inset + 1 : (height - line_h) / 2;
+    const int32_t sel_a = edit_sel_begin(w), sel_b = edit_sel_end(w);
+    if (!multiline && sel_a != sel_b && line_h > 0) {
+        const int32_t xa = tx + gdi::text_width(hdc, text.substr(0, size_t(sel_a)));
+        const int32_t xb = tx + gdi::text_width(hdc, text.substr(0, size_t(sel_b)));
+        // A focused edit's selection is the system highlight (navy); an
+        // unfocused one is the grey Windows uses for an inactive selection.
+        const uint32_t hi = focused ? gdi::argb(0x00a80000) : gdi::argb(0x00c0c0c0);
+        gdi::fill(hdc, {xa, ty, xb, ty + line_h}, hi);
+    }
     uint32_t units = text.empty() ? 0 : wide_units(text);
     if (units && units < (UINT32_MAX - 32) / 2 && width > 2 * inset && height > 2 * inset) {
         if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
             dc->text_color = 0x00000000;
             dc->bk_mode = 1; // TRANSPARENT over the field just filled
-            wr32(block + 0, uint32_t(inset + 2));
-            wr32(block + 4, uint32_t(inset + 1));
+            wr32(block + 0, uint32_t(tx));
+            wr32(block + 4, uint32_t(ty));
             wr32(block + 8, uint32_t(width - inset - 1));
             wr32(block + 12, uint32_t(height - inset));
             gm_put_wstr(block + 16, text, units + 1);
             uint32_t flags = 0x800 | 0x40; // DT_NOPREFIX | DT_EXPANDTABS
-            if (w->style & 0x0004u)        // ES_MULTILINE
-                flags |= 0x10;             // DT_WORDBREAK
+            if (multiline)
+                flags |= 0x10; // DT_WORDBREAK
             else
                 flags |= 0x20 | 0x4; // DT_SINGLELINE | DT_VCENTER (DT_LEFT is 0)
             gdi::draw_text(hdc, block + 16, units, block, flags);
+            // The selected run again, white, clipped to its own highlight band.
+            if (!multiline && sel_a != sel_b && focused && line_h > 0) {
+                std::string sel = text.substr(size_t(sel_a), size_t(sel_b - sel_a));
+                uint32_t sunits = wide_units(sel);
+                if (sunits && sunits < (UINT32_MAX - 32) / 2) {
+                    uint32_t sblock = heap_alloc(16 + 2 * (sunits + 1), true);
+                    if (sblock) {
+                        const int32_t xa = tx + gdi::text_width(hdc, text.substr(0, size_t(sel_a)));
+                        const int32_t xb = tx + gdi::text_width(hdc, text.substr(0, size_t(sel_b)));
+                        dc->text_color = 0x00ffffff;
+                        wr32(sblock + 0, uint32_t(xa));
+                        wr32(sblock + 4, uint32_t(ty));
+                        wr32(sblock + 8, uint32_t(xb));
+                        wr32(sblock + 12, uint32_t(ty + line_h));
+                        gm_put_wstr(sblock + 16, sel, sunits + 1);
+                        gdi::draw_text(hdc, sblock + 16, sunits, sblock, 0x800 | 0x40 | 0x20);
+                        heap_free(sblock);
+                    }
+                }
+            }
             heap_free(block);
         }
+    }
+    // The caret: a one-pixel bar at the insertion point while the edit has the
+    // keyboard focus. It does not blink yet (TD-095).
+    if (!multiline && focused && line_h > 0) {
+        const int32_t cx = tx + gdi::text_width(hdc, text.substr(0, size_t(w->caret)));
+        if (cx >= inset && cx < width)
+            gdi::fill(hdc, {cx, ty, cx + 1, ty + line_h}, gdi::argb(0x00000000));
     }
     if (!into)
         gdi_release_window_dc(hwnd, hdc);
@@ -2933,22 +3066,67 @@ void control_proc(X86 *c) {
         if (Window *after = find_window(hwnd))
             after->update_pending = true;
         return;
-    case 0x0102: { // WM_CHAR: an edit control appends the typed character
+    case 0x0102: { // WM_CHAR: an edit control inserts the typed character
         if (w && w->cls == "edit") {
             uint32_t ch = arg(c, 2);
             if (ch == 8) {
-                if (!w->title_utf8.empty())
-                    w->title_utf8.pop_back();
+                edit_backspace(w);
+            } else if (ch == 1) {
+                // Ctrl+A: the control code TranslateMessage makes of it. Select
+                // the whole text so the next keystroke replaces it.
+                w->sel_anchor = 0;
+                w->caret = int32_t(w->title_utf8.size());
+                w->update_pending = true;
             } else if (ch >= 0x20 && ch < 0x7f) {
-                w->title_utf8.push_back(char(ch));
+                edit_insert(w, char(ch));
             }
             w->update_pending = true;
         }
         set_eax(c, 0);
         return;
     }
-    case 0x0100: { // WM_KEYDOWN: listbox navigation, backspace edits
+    case 0x0100: { // WM_KEYDOWN: listbox navigation, edit caret/selection
         uint32_t vk = arg(c, 2);
+        if (w && w->cls == "edit") {
+            // Shift extends the selection; Control+A selects everything. The
+            // control key state is the one the host set for the modifier.
+            const bool shift = (g_key_state[0x10] & 0x80) != 0;
+            const bool ctrl = (g_key_state[0x11] & 0x80) != 0;
+            edit_clamp(w);
+            switch (vk) {
+            case 0x25: // VK_LEFT
+                edit_move_caret(w, w->caret - 1, shift);
+                break;
+            case 0x27: // VK_RIGHT
+                edit_move_caret(w, w->caret + 1, shift);
+                break;
+            case 0x26: // VK_UP: a one-line edit goes to the start
+            case 0x24: // VK_HOME
+                edit_move_caret(w, 0, shift);
+                break;
+            case 0x28: // VK_DOWN: a one-line edit goes to the end
+            case 0x23: // VK_END
+                edit_move_caret(w, int32_t(w->title_utf8.size()), shift);
+                break;
+            case 0x2e: // VK_DELETE
+                edit_delete(w);
+                break;
+            case 0x08: // VK_BACK
+                edit_backspace(w);
+                break;
+            case 'A':
+                if (ctrl) {
+                    w->sel_anchor = 0;
+                    w->caret = int32_t(w->title_utf8.size());
+                    w->update_pending = true;
+                }
+                break;
+            default:
+                break;
+            }
+            set_eax(c, 0);
+            return;
+        }
         if (w && w->cls == "listbox") {
             int32_t n = int32_t(w->list_items.size());
             int32_t sel = w->list_sel;
@@ -2986,11 +3164,6 @@ void control_proc(X86 *c) {
             }
             set_eax(c, 0);
             return;
-        }
-        if (w && w->cls == "edit" && vk == 8) {
-            if (!w->title_utf8.empty())
-                w->title_utf8.pop_back();
-            w->update_pending = true;
         }
         set_eax(c, 0);
         return;
@@ -3184,11 +3357,11 @@ void control_proc(X86 *c) {
     }
     case 0x00f1: // BM_SETCHECK
         if (w)
-            w->userdata = arg(c, 2);
+            w->check_state = arg(c, 2);
         set_eax(c, 0);
         return;
     case 0x00f0: // BM_GETCHECK
-        set_eax(c, w ? w->userdata : 0);
+        set_eax(c, w ? w->check_state : 0);
         return;
     case 0x00f2: { // BM_GETSTATE
         // BST_PUSHED while the button is held, BST_FOCUS while it owns the
@@ -3196,7 +3369,7 @@ void control_proc(X86 *c) {
         // Petz 5's profile gates its Pick A Pet and Family Tree handlers on a
         // non-zero BM_GETSTATE - they did nothing while this always answered 0.
         uint32_t state = 0;
-        if (w && w->cls == "button" && (w->userdata & 1u))
+        if (w && w->cls == "button" && w->pressed)
             state |= 4u; // BST_PUSHED
         if (focus_window() == hwnd)
             state |= 8u; // BST_FOCUS
@@ -3207,6 +3380,21 @@ void control_proc(X86 *c) {
         LOGW("control: WM_LBUTTONDOWN hwnd=%08x id=%u", hwnd, w ? w->id : 0);
         if (w && w->cls == "button")
             set_focus_window(hwnd); // a clicked button keeps the focus (BST_FOCUS)
+        if (w && w->cls == "edit") {
+            // A click gives the edit the keyboard and places the caret where
+            // the pointer is; Shift extends the existing selection instead.
+            set_focus_window(hwnd);
+            uint32_t hdc = gdi_window_dc(hwnd);
+            if (auto *dc = gdi::dc_of(hdc))
+                if (w->font)
+                    dc->font = w->font; // measure in the control's own face
+            const int32_t x = int16_t(arg(c, 3) & 0xffff);
+            edit_move_caret(w, edit_index_from_x(hdc, w, x), (g_key_state[0x10] & 0x80) != 0);
+            gdi_release_window_dc(hwnd, hdc);
+            w->update_pending = true;
+            set_eax(c, 0);
+            return;
+        }
         if (w && w->cls == "listbox") {
             // Windows gives the keyboard to a listbox that is clicked, so the
             // arrow keys that follow reach it. The dialog manager otherwise
@@ -3227,10 +3415,11 @@ void control_proc(X86 *c) {
             return;
         }
         if (w) {
-            // A checkbox/radio keeps its check state in userdata; a press does
-            // not disturb it (only the push buttons use the pressed bit).
+            // A checkbox/radio keeps its check state in `check_state`; a press
+            // does not disturb it (only the push buttons use the pressed bit).
+            // Never GWL_USERDATA: a program's own storage must survive a click.
             if (w->cls != "button" || !is_check_button(w->style))
-                w->userdata |= 1u;
+                w->pressed = true;
             w->update_pending = true; // the pressed bevel has to be drawn
         }
         set_eax(c, 0);
@@ -3244,13 +3433,13 @@ void control_proc(X86 *c) {
                 // (BS_AUTO*), like the button class; the others only repaint.
                 const uint32_t bs = w->style & 0x0fu;
                 if (bs == 3) // BS_AUTOCHECKBOX
-                    w->userdata = w->userdata ? 0u : 1u;
+                    w->check_state = w->check_state ? 0u : 1u;
                 else if (bs == 6) // BS_AUTO3STATE
-                    w->userdata = (w->userdata + 1) % 3;
+                    w->check_state = (w->check_state + 1) % 3;
                 else if (bs == 9) // BS_AUTORADIOBUTTON
-                    w->userdata = 1u;
+                    w->check_state = 1u;
             } else {
-                w->userdata &= ~1u;
+                w->pressed = false;
             }
             if (w->cls == "button")
                 w->update_pending = true; // the bevel returns to raised
@@ -3597,7 +3786,9 @@ uint32_t create_dialog_window(X86 *c, uint32_t hinst, uint32_t parent, uint32_t 
             if (kv.second.parent == hwnd)
                 host_dispatch_to_wndproc(c, kv.first, 0x0030 /* WM_SETFONT */, font, 1);
     // The dialog manager gives the keyboard to the first tab stop, which is
-    // where the host's keystrokes go (an edit control in a naming dialog).
+    // where the host's keystrokes go (an edit control in a naming dialog). The
+    // whole-text selection an edit gets on focus happens after WM_INITDIALOG
+    // (initial_dialog_focus), once the procedure has filled the field.
     for (const auto &kv : windows())
         if (kv.second.parent == hwnd && kv.second.visible &&
             (kv.second.style & 0x10000 /*WS_TABSTOP*/)) {
@@ -3606,6 +3797,116 @@ uint32_t create_dialog_window(X86 *c, uint32_t hinst, uint32_t parent, uint32_t 
         }
     return hwnd;
 }
+namespace user32 {
+// Give an edit the focus the way the dialog manager does: its whole text is
+// selected, so the next keystroke replaces it. A click uses edit_move_caret
+// instead, which is why this is separate.
+void focus_edit_select_all(uint32_t hwnd) {
+    Window *w = find_window(hwnd);
+    if (!w || w->cls != "edit")
+        return;
+    edit_clamp(w);
+    w->sel_anchor = 0;
+    w->caret = int32_t(w->title_utf8.size());
+    w->update_pending = true;
+}
+// The dialog manager's focus after WM_INITDIALOG: a control the procedure
+// focused keeps it (and an edit gets its whole text selected), otherwise the
+// first WS_TABSTOP control does. Done after WM_INITDIALOG because the procedure
+// fills the fields there, so the selection covers the text it wrote.
+void initial_dialog_focus(uint32_t dlg) {
+    uint32_t target = 0;
+    Window *f = find_window(focus_window());
+    if (f && f->parent == dlg) {
+        target = f->hwnd;
+    } else {
+        for (const auto &kv : windows())
+            if (kv.second.parent == dlg && kv.second.visible && kv.second.enabled &&
+                (kv.second.style & 0x10000 /*WS_TABSTOP*/)) {
+                target = kv.first;
+                break;
+            }
+    }
+    if (target) {
+        set_focus_window(target);
+        focus_edit_select_all(target);
+    }
+}
+// The next (or previous) enabled, visible WS_TABSTOP child of a dialog, in
+// creation order, wrapping at the ends - Windows' tab order.
+uint32_t next_tab_stop(uint32_t dlg, uint32_t from, bool backward) {
+    std::vector<uint32_t> stops;
+    for (const auto &kv : windows())
+        if (kv.second.parent == dlg && kv.second.visible && kv.second.enabled &&
+            (kv.second.style & 0x10000 /*WS_TABSTOP*/))
+            stops.push_back(kv.first);
+    if (stops.empty())
+        return 0;
+    size_t idx = stops.size();
+    for (size_t i = 0; i < stops.size(); ++i)
+        if (stops[i] == from) {
+            idx = i;
+            break;
+        }
+    if (backward)
+        idx = (idx == stops.size() || idx == 0) ? stops.size() - 1 : idx - 1;
+    else
+        idx = (idx == stops.size()) ? 0 : (idx + 1) % stops.size();
+    return stops[idx];
+}
+// The dialog engine's IsDialogMessage. Windows runs it before DispatchMessage,
+// so the modal pump has to: a dialog's OK button is pressed by Return, Escape
+// cancels, and Tab moves the focus. Only WM_KEYDOWN is consumed; the WM_CHAR
+// the host may also post for Return/Escape/Tab is a control character an edit
+// ignores, so it cannot double-act.
+bool dialog_key_message(X86 *c, uint32_t dlg, uint32_t msg, uint32_t wparam, uint32_t lparam) {
+    (void)lparam;
+    if (msg != 0x0100 /*WM_KEYDOWN*/)
+        return false;
+    Window *d = find_window(dlg);
+    if (!d || d->cls != "#32770")
+        return false;
+    // Windows' IsDialogMessage only handles a message addressed to the dialog
+    // or one of its controls.
+    Window *f = find_window(focus_window());
+    if (f && f->hwnd != dlg && f->parent != dlg)
+        return false;
+    // A multiline edit owns Return, Escape and Tab for itself.
+    if (f && f->parent == dlg && f->cls == "edit" && (f->style & 0x0004u /*ES_MULTILINE*/))
+        return false;
+    const uint32_t vk = wparam;
+    if (vk == 0x0d /*VK_RETURN*/) {
+        uint32_t def = 0;
+        for (const auto &kv : windows()) {
+            if (kv.second.parent != dlg || kv.second.cls != "button" || !kv.second.visible ||
+                !kv.second.enabled)
+                continue;
+            if ((kv.second.style & 0x0fu) == 1u /*BS_DEFPUSHBUTTON*/) {
+                def = kv.first;
+                break;
+            }
+        }
+        // The default button is the template's BS_DEFPUSHBUTTON; a dialog with
+        // none still answers Return with IDOK, as Windows does.
+        const uint32_t id = def ? find_window(def)->id : 1u;
+        host_dispatch_to_wndproc(c, dlg, 0x0111 /*WM_COMMAND*/, id & 0xffffu, def);
+        return true;
+    }
+    if (vk == 0x1b /*VK_ESCAPE*/) {
+        host_dispatch_to_wndproc(c, dlg, 0x0111 /*WM_COMMAND*/, 2 /*IDCANCEL*/, 0);
+        return true;
+    }
+    if (vk == 0x09 /*VK_TAB*/) {
+        const bool backward = (g_key_state[0x10] & 0x80) != 0; // Shift+Tab
+        if (uint32_t next = next_tab_stop(dlg, focus_window(), backward)) {
+            set_focus_window(next);
+            focus_edit_select_all(next);
+        }
+        return true;
+    }
+    return false;
+}
+} // namespace user32
 // Decode a dialog template that is already in guest memory and build the window
 // and its controls. DialogBoxParamA/CreateDialogParamA reach the same code
 // through a resource; this entry point lets a test drive the DS_SETFONT font
@@ -3659,6 +3960,7 @@ void u_DialogBoxParamA(X86 *c) {
     // More Scenes list (FUN_00410410, selector 0x2cea) and the adoption pledge
     // (template 164, the pet bitmap) — saw zero.
     host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, 0, init);
+    user32::initial_dialog_focus(hwnd);
     while (dialog_running.count(hwnd) && dialog_running[hwnd]) {
         host_pump_timers(c);
         pump_window_timers();
@@ -3682,8 +3984,13 @@ void u_DialogBoxParamA(X86 *c) {
                 break;
             }
             last_message = m;
-            uint32_t target = find_window(m.hwnd) ? m.hwnd : hwnd;
-            host_dispatch_to_wndproc(c, target, m.message, m.wparam, m.lparam);
+            // IsDialogMessage first: Return presses the default push button,
+            // Escape cancels, Tab moves the focus. Windows does this in the
+            // message loop, before DispatchMessage.
+            if (!user32::dialog_key_message(c, hwnd, m.message, m.wparam, m.lparam)) {
+                uint32_t target = find_window(m.hwnd) ? m.hwnd : hwnd;
+                host_dispatch_to_wndproc(c, target, m.message, m.wparam, m.lparam);
+            }
             dispatched = true;
             if (!dialog_running.count(hwnd) || !dialog_running[hwnd])
                 break;
@@ -3747,6 +4054,7 @@ void u_CreateDialogParamA(X86 *c) {
         return;
     }
     host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, 0, init);
+    user32::initial_dialog_focus(hwnd);
     set_eax(c, hwnd);
 }
 

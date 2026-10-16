@@ -39,7 +39,22 @@ struct Window {
     bool owned_hidden = false;
     uint32_t region = 0;
     uint32_t show_cmd = 0;
+    // GWL_USERDATA: storage the PROGRAM owns, read and written only through
+    // GetWindowLongA/SetWindowLongA. The button class's own pressed/check state
+    // lives in `pressed`/`check_state` below, NOT here: a program that stores a
+    // subclass procedure in GWL_USERDATA (the Petz 5 rename edit does) must get
+    // it back bit for bit, so an edit click may not OR a pressed bit into it.
     uint32_t userdata = 0;
+    // The button class's press/check state. A press is not a check state and a
+    // check state is not GWL_USERDATA (TD-079).
+    bool pressed = false;
+    uint32_t check_state = 0;
+    // An EDIT control's text model: `caret` is a byte index into title_utf8 and
+    // `sel_anchor` the other end of the selection. The selection is
+    // [min(sel_anchor,caret), max(...)); empty when the two are equal. Windows
+    // selects the whole text when the dialog manager gives an edit the focus.
+    int32_t caret = 0;
+    int32_t sel_anchor = 0;
     uint32_t font = 0; // WM_SETFONT, kept for the system control classes
     uint32_t hinstance = 0;
     std::vector<uint32_t> extra;
@@ -115,6 +130,21 @@ uint32_t alloc_window_handle();
 Window *first_paint_window();
 // Give the keyboard focus to a window (the dialog engine's first tab stop).
 void set_focus_window(uint32_t hwnd);
+// Give an edit control the focus the way the dialog manager does: the whole
+// text is selected, so typing replaces it. Does nothing on a non-edit.
+void focus_edit_select_all(uint32_t hwnd);
+// The dialog manager's post-WM_INITDIALOG focus: keep whatever the procedure
+// focused (and select an edit's text), else focus the first WS_TABSTOP control.
+// Called once the procedure has filled the controls.
+void initial_dialog_focus(uint32_t dlg);
+// The dialog engine's IsDialogMessage: VK_RETURN presses the default push
+// button (IDOK unless a BS_DEFPUSHBUTTON names another id), VK_ESCAPE sends
+// IDCANCEL, VK_TAB moves the focus to the next/previous WS_TABSTOP control, and
+// any of the three selects an edit's whole text when it takes the focus. A
+// multiline edit keeps Return, Escape and Tab for itself. Returns true when the
+// message was consumed. Windows runs this before DispatchMessage, so the modal
+// pump (not the guest's own loop) has to do it.
+bool dialog_key_message(X86 *c, uint32_t dlg, uint32_t msg, uint32_t wparam, uint32_t lparam);
 // The window that currently has the keyboard focus (GetFocus's answer), so a
 // control can report it in BM_GETSTATE and an owner can decide a tab order.
 uint32_t focus_window();

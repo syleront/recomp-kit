@@ -358,6 +358,25 @@ void unsupported(X86 *c) {
 }
 } // namespace
 namespace gdi {
+// The advance width and line height of an ANSI string in a DC's selected font:
+// the same measurement DrawText/ExtTextOut lay text out with, used for an edit
+// control's caret x and selection extent. One byte per character is what an
+// edit's own text is; a non-ASCII byte is a single glyph in the ANSI code page,
+// which is what the raster/TrueType path draws for it too.
+int32_t text_width(uint32_t dc, const std::string &text) {
+    if (!dc_of(dc))
+        return 0;
+    const Pen pen = pen_of(dc);
+    int64_t width = 0;
+    for (unsigned char c : text)
+        width += pen.advance(c);
+    return int32_t(width > INT_MAX ? INT_MAX : width);
+}
+int32_t text_height(uint32_t dc) {
+    if (!dc_of(dc))
+        return 0;
+    return int32_t(pen_of(dc).height());
+}
 // The dialog base units of a DS_SETFONT face. A dialog unit (DLU) is a quarter
 // of the font's average character width horizontally and an eighth of its cell
 // height vertically, so these two numbers are all a template needs to lay

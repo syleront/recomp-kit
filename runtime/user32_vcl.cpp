@@ -574,6 +574,12 @@ void set_focus(X86 *c) {
     uint32_t hwnd = arg(c, 0), old = focus;
     if (!hwnd || find_window(hwnd))
         focus = hwnd;
+    // A dialog gives its first tab stop the focus and selects the edit's whole
+    // text, so the player's first keystroke replaces it (the rename/naming
+    // dialogs). Only on a real change, so a program that re-focuses the same
+    // edit does not wipe a selection the player is making.
+    if (hwnd && hwnd != old)
+        focus_edit_select_all(hwnd);
     set_eax(c, old);
 }
 void get_capture(X86 *c) {
