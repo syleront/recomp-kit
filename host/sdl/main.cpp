@@ -1490,6 +1490,11 @@ void apply_mode_change() {
         SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         post_drawable_size();
     }
+    // Report the window the guest frame is shown in: a windowed run's
+    // "window WxH points" line at creation is the pre-guest default, before the
+    // program has presented anything and this has resized it to the frame.
+    fprintf(stderr, "[host] mode %dx%d: window %dx%d points\n", g_mode_w, g_mode_h, size.w, size.h);
+    fflush(stderr);
     host_set_client_size(host_main_window(), g_mode_w, g_mode_h);
 }
 

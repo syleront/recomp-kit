@@ -2458,9 +2458,17 @@ static void test_windows(X86 *c) {
           "FindWindowA finds no other instance");
     check(call_import(c, "USER32.dll", "WaitMessage", {}) == 1, "WaitMessage returns");
     uint32_t work = scratch_block(16);
-    check(call_import(c, "USER32.dll", "SystemParametersInfoA", {48, 0, work, 0}) == 1 &&
-              rd32(work + 8) == 640 && rd32(work + 12) == 480,
-          "SPI_GETWORKAREA is the window's client area");
+    {
+        // The work area is the primary display's, not a window's: Catz 5 asks
+        // for it before creating any window and sizes its play window to the
+        // answer. It must agree with GetSystemMetrics (the virtual desktop).
+        uint32_t dw = 0, dh = 0, dbpp = 0;
+        win32_display_mode(&dw, &dh, &dbpp);
+        check(call_import(c, "USER32.dll", "SystemParametersInfoA", {48, 0, work, 0}) == 1 &&
+                  rd32(work + 0) == 0 && rd32(work + 4) == 0 && rd32(work + 8) == dw &&
+                  rd32(work + 12) == dh,
+              "SPI_GETWORKAREA is the virtual desktop, not a window's client area");
+    }
     check(call_import(c, "USER32.dll", "SystemParametersInfoA", {0x2000, 0, 0, 0}) == 0,
           "unknown SPI actions fail");
     // The input gate is not linked here; use the same user32 cursor bridge

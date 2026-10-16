@@ -576,11 +576,25 @@ void u_SystemParametersInfoA(X86 *c) {
     const uint32_t SPI_GETWORKAREA = 48;
     uint32_t action = arg(c, 0), param = arg(c, 2);
     if (action == SPI_GETWORKAREA && param) {
-        Window *w = find_window(host_main_window());
+        // SPI_GETWORKAREA is the primary display's work area, not the calling
+        // program's own window. This is routinely asked BEFORE any window
+        // exists - a program reads the desktop to size its first frame - so it
+        // cannot be derived from a host window at all: that read the first
+        // window's client area, and before one existed it fell back to the
+        // hard-coded 640x480. Catz 5 calls it in CShlGlobals::LoadGlobals
+        // (00478d41), before its first CreateWindowExA, stores the rectangle in
+        // ShlGlobals+0x29c and sizes its whole play window to it, so the answer
+        // pinned the game to 640x480.
+        //
+        // The port has no taskbar, so the work area is the whole virtual
+        // desktop: the selected DirectDraw/DXGI mode, or the fallback that
+        // GetSystemMetrics already reports (SMOKE_DRAWABLE, else 1024x768).
+        uint32_t width = 0, height = 0, bpp = 0;
+        win32_display_mode(&width, &height, &bpp);
         wr32(param + 0, 0);
         wr32(param + 4, 0);
-        wr32(param + 8, (uint32_t)(w ? w->w : 640));
-        wr32(param + 12, (uint32_t)(w ? w->h : 480));
+        wr32(param + 8, width);
+        wr32(param + 12, height);
         set_eax(c, 1);
         return;
     }

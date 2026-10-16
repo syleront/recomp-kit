@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Report the primary display's work area, not a window's client area, from
+  `SystemParametersInfoA(SPI_GETWORKAREA)`: the shim read the first top-level
+  window's client rect and, before any window existed, fell back to a hard-coded
+  640x480. A program that reads the desktop to size its first window (Catz 5
+  calls it in its globals load, before its first window, and sizes its play
+  window to the answer) was therefore pinned to 640x480. The work area is now
+  the whole virtual desktop - the selected DirectDraw/DXGI mode or the fallback
+  `GetSystemMetrics` already reports (`SMOKE_DRAWABLE`, else 1024x768), which has
+  no taskbar. The SDL host also logs the window size it resizes to for a
+  presented frame.
 - Deliver a windowed mouse event in guest screen pixels: the SDL host used to
   add the first top-level window's client origin to the input gate's hit, which
   shifted every click by that window's position (an off-screen helper meant all
