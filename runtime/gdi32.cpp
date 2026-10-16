@@ -891,7 +891,11 @@ Surface *surface_of(DeviceContext &dc) {
     auto *window = user32::find_window(dc.surface);
     if (!window)
         return nullptr;
-    int w = std::max(0, window->w), h = std::max(0, window->h);
+    // A framed dialog's surface is its whole window, frame included; the client
+    // drawing is inset into it (see offset). Frameless windows have zero
+    // insets, so this is their client size exactly as before.
+    int w = std::max(0, window->w + window->nc_left + window->nc_right),
+        h = std::max(0, window->h + window->nc_top + window->nc_bottom);
     if (uint64_t(w) * h > GUEST_SIZE / 4)
         return nullptr;
     auto &s = window->surface;
@@ -913,9 +917,20 @@ void offset(DeviceContext &dc, int64_t *x, int64_t *y) {
     if (dc.window && dc.window != dc.surface) {
         int32_t wx = 0, wy = 0, sx = 0, sy = 0;
         user32::client_origin(dc.window, &wx, &wy);
-        user32::client_origin(dc.surface, &sx, &sy);
+        // The surface's storage starts at its OUTER origin, so a child's client
+        // offset is measured from there - which also puts a framed dialog's own
+        // client at (nc_left, nc_top) inside its surface.
+        user32::window_origin(dc.surface, &sx, &sy);
         *x += int64_t(wx) - sx;
         *y += int64_t(wy) - sy;
+    } else if (dc.window) {
+        // The DC names the top-level window itself: client (0,0) sits at the
+        // non-client inset inside the surface (zero on a frameless window).
+        int32_t cx = 0, cy = 0, ox = 0, oy = 0;
+        user32::client_origin(dc.window, &cx, &cy);
+        user32::window_origin(dc.window, &ox, &oy);
+        *x += int64_t(cx) - ox;
+        *y += int64_t(cy) - oy;
     }
 }
 bool contains(Rect r, int64_t x, int64_t y) {
@@ -928,7 +943,7 @@ Rect client_bounds(DeviceContext &dc, int w, int h) {
     if (!dc.window || !dc.surface)
         return r;
     int32_t root_x = 0, root_y = 0;
-    user32::client_origin(dc.surface, &root_x, &root_y);
+    user32::window_origin(dc.surface, &root_x, &root_y);
     uint32_t current = dc.window;
     for (size_t hop = 0; current && current != dc.surface && hop < user32::windows().size();
          ++hop) {
@@ -1092,9 +1107,15 @@ bool prepare_target(uint32_t hdc, PixelTarget *target) {
     if (dc->window && dc->window != dc->surface) {
         int32_t wx = 0, wy = 0, sx = 0, sy = 0;
         user32::client_origin(dc->window, &wx, &wy);
-        user32::client_origin(dc->surface, &sx, &sy);
+        user32::window_origin(dc->surface, &sx, &sy);
         target->off_x += int64_t(wx) - sx;
         target->off_y += int64_t(wy) - sy;
+    } else if (dc->window) {
+        int32_t cx = 0, cy = 0, ox = 0, oy = 0;
+        user32::client_origin(dc->window, &cx, &cy);
+        user32::window_origin(dc->window, &ox, &oy);
+        target->off_x += int64_t(cx) - ox;
+        target->off_y += int64_t(cy) - oy;
     }
     target->bounds = d ? Rect{} : client_bounds(*dc, int(target->w), int(target->h));
     return true;
@@ -1211,7 +1232,7 @@ std::vector<Rect> clipped_children(uint32_t hwnd, uint32_t surface) {
     if (!self || !(self->style & 0x02000000u))
         return out;
     int32_t root_x = 0, root_y = 0;
-    user32::client_origin(surface, &root_x, &root_y);
+    user32::window_origin(surface, &root_x, &root_y);
     for (uint32_t child : user32::window_z_order(hwnd)) {
         auto *w = user32::find_window(child);
         if (!w || !w->visible || !(w->style & 0x40000000u) || w->w <= 0 || w->h <= 0)
@@ -1297,10 +1318,10 @@ void gdi_composite_windows(uint32_t *argb, int w, int h) {
         const uint32_t key = gdi::argb(window->layered_key) & 0xffffffu;
         const uint32_t alpha = (window->layered_flags & 2) ? window->layered_alpha : 255u;
         // A child's position is relative to its parent, so the walk up the
-        // parent chain is what places it; for a top-level window this is its
-        // own position, as before.
+        // parent chain is what places it; a window's own surface starts at its
+        // OUTER origin (a framed dialog includes its non-client frame).
         int32_t ax = 0, ay = 0;
-        user32::client_origin(window->hwnd, &ax, &ay);
+        user32::window_origin(window->hwnd, &ax, &ay);
         int64_t dx = int64_t(ax) - origin_x, dy = int64_t(ay) - origin_y;
         // Clipped to every ancestor, so a control cannot paint outside the
         // window that owns it.

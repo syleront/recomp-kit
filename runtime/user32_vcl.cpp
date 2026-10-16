@@ -84,9 +84,19 @@ uint32_t mouse_window(uint32_t parent, int32_t x, int32_t y, size_t depth = 0) {
         auto *w = find_window(*i);
         int32_t wx, wy;
         client_origin(*i, &wx, &wy);
-        if (!w->visible || !w->enabled || x < wx || y < wy || int64_t(x) >= int64_t(wx) + w->w ||
-            int64_t(y) >= int64_t(wy) + w->h)
+        // A framed dialog is hit anywhere in its window rectangle; a point in
+        // the non-client area (caption, close box, border) belongs to the
+        // window itself, never to a child. A frameless window's window and
+        // client rectangles are identical, so this changes nothing for it.
+        const int32_t ox = wx - w->nc_left, oy = wy - w->nc_top;
+        const int64_t ow = int64_t(w->w) + w->nc_left + w->nc_right;
+        const int64_t oh = int64_t(w->h) + w->nc_top + w->nc_bottom;
+        if (!w->visible || !w->enabled || x < ox || y < oy || int64_t(x) >= int64_t(ox) + ow ||
+            int64_t(y) >= int64_t(oy) + oh)
             continue;
+        if (x < wx || y < wy || int64_t(x) >= int64_t(wx) + w->w ||
+            int64_t(y) >= int64_t(wy) + w->h)
+            return *i; // the frame is the window's, not a child's
         // A STATIC control is transparent to the mouse unless it has SS_NOTIFY
         // (0x100), which is why a caption drawn over a button does not eat its
         // click. Windows reports HTTRANSPARENT from WM_NCHITTEST here.
@@ -147,6 +157,35 @@ void pump_mouse_input(X86 *c) {
     }
     if (!find_window(hwnd))
         return; // activation may destroy its recipient
+    // A press on a framed dialog's non-client area is the frame's, not a
+    // control's: the close box cancels the dialog and the rest of the frame is
+    // swallowed (dragging a dialog by its title bar is not modelled, TD-070).
+    if (Window *fw = find_window(hwnd)) {
+        if (fw->nc_left || fw->nc_top || fw->nc_right || fw->nc_bottom) {
+            int32_t cx, cy;
+            client_origin(hwnd, &cx, &cy);
+            const int32_t cxp = input.x - cx, cyp = input.y - cy;
+            const bool in_client = cxp >= 0 && cyp >= 0 && cxp < fw->w && cyp < fw->h;
+            if (!in_client) {
+                if (input.message == 0x0201 /* WM_LBUTTONDOWN */) {
+                    // The close box occupies the cap_h-4 square 3 px in from
+                    // the right edge of the caption; DC coordinates here are
+                    // client-relative, the same space the chrome painter uses.
+                    const int32_t box = fw->nc_top - 4;
+                    const int32_t x1 = fw->w + fw->nc_right - 3;
+                    const int32_t y0 = -fw->nc_top + 2;
+                    if (fw->nc_caption && (fw->style & 0x00080000u) && cxp >= x1 - box &&
+                        cxp < x1 && cyp >= y0 && cyp < y0 + box) {
+                        host_dispatch_to_wndproc(c, hwnd, 0x0111 /* WM_COMMAND */, 2 /* IDCANCEL */,
+                                                 hwnd);
+                        return;
+                    }
+                }
+                if (input.message >= 0x0200 && input.message <= 0x0209)
+                    return; // the frame consumes button and move messages
+            }
+        }
+    }
     int32_t x, y;
     client_origin(hwnd, &x, &y);
     // WM_MOUSEWHEEL is the one mouse message whose lParam is SCREEN pixels;
@@ -224,6 +263,37 @@ void client_origin(uint32_t hwnd, int32_t *x, int32_t *y) {
     // call - enough to make a software blit miss the game's frame timer. The
     // ancestor chain is a handful of windows deep, so a small fixed ring of
     // visited handles stops a malformed cycle without allocating.
+    constexpr size_t kMaxWindowChain = 64;
+    uint32_t seen[kMaxWindowChain];
+    size_t seen_n = 0;
+    while (hwnd) {
+        bool repeat = false;
+        for (size_t i = 0; i < seen_n; ++i)
+            if (seen[i] == hwnd) {
+                repeat = true;
+                break;
+            }
+        if (repeat)
+            break;
+        if (seen_n < kMaxWindowChain)
+            seen[seen_n++] = hwnd;
+        Window *w = find_window(hwnd);
+        if (!w)
+            break;
+        // The client origin is the window's own origin plus its non-client
+        // inset (zero on everything but a framed dialog), and each level adds
+        // its parent's client-relative offset the same way.
+        *x += w->x + w->nc_left;
+        *y += w->y + w->nc_top;
+        hwnd = w->parent;
+    }
+}
+// A window's OUTER origin: the same walk as client_origin without the
+// non-client insets. It is where a framed dialog's whole surface is placed and
+// where its DC maps storage (0,0). Equal to client_origin on a frameless
+// window, so the game's frame and controls are unchanged.
+void window_origin(uint32_t hwnd, int32_t *x, int32_t *y) {
+    *x = *y = 0;
     constexpr size_t kMaxWindowChain = 64;
     uint32_t seen[kMaxWindowChain];
     size_t seen_n = 0;

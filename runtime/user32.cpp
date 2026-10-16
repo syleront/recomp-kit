@@ -142,6 +142,52 @@ void store_msg(uint32_t p, const Msg &m) {
 using namespace user32;
 
 // ---------------------------------------------------------------------------
+// Dialog non-client area
+// ---------------------------------------------------------------------------
+// Classic (non-themed) metrics for a dialog's non-client area. A dialog's
+// template rectangle is its CLIENT size (Windows AdjustWindowRect semantics),
+// so these insets grow the window around the DLU-mapped client: the non-client
+// area is what pushes the client origin in. Only the dialog class (#32770) is
+// framed this way — the game's own frame window, its popups and its menus are
+// created as other classes and keep their frameless geometry exactly as before.
+struct NcInsets {
+    int32_t left = 0, top = 0, right = 0, bottom = 0;
+    bool caption = false;
+};
+NcInsets dialog_nc_insets(uint32_t style, uint32_t exstyle) {
+    const uint32_t WS_BORDER = 0x00800000u, WS_DLGFRAME = 0x00400000u, WS_CAPTION = 0x00c00000u;
+    const uint32_t DS_MODALFRAME = 0x00000080u;
+    const uint32_t WS_EX_WINDOWEDGE = 0x00000100u, WS_EX_CLIENTEDGE = 0x00000200u;
+    int32_t border = 0;
+    if (style & WS_CAPTION) // WS_CAPTION is WS_BORDER|WS_DLGFRAME
+        border = 3;         // SM_CXDLGFRAME
+    else if (style & (WS_DLGFRAME | DS_MODALFRAME))
+        border = 3; // a modal frame without a title bar
+    else if (style & WS_BORDER)
+        border = 1; // SM_CXBORDER
+    if (exstyle & WS_EX_CLIENTEDGE)
+        border += 2; // an etched edge around the client
+    else if ((exstyle & WS_EX_WINDOWEDGE) && border < 1)
+        border = 1;
+    NcInsets n;
+    n.left = n.right = n.bottom = border;
+    // Windows draws the caption at the very top of the window; its height
+    // includes what would otherwise be the top border, so the title bar sits
+    // flush against the outer edge as it does on XP.
+    n.caption = (style & WS_CAPTION) == WS_CAPTION;
+    n.top = n.caption ? 19 /*SM_CYCAPTION*/ : border;
+    return n;
+}
+static void apply_dialog_nc(Window &w) {
+    NcInsets n = dialog_nc_insets(w.style, w.exstyle);
+    w.nc_left = n.left;
+    w.nc_top = n.top;
+    w.nc_right = n.right;
+    w.nc_bottom = n.bottom;
+    w.nc_caption = n.caption;
+}
+
+// ---------------------------------------------------------------------------
 // Host bridge
 // ---------------------------------------------------------------------------
 void host_post_message(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lparam) {
@@ -381,6 +427,11 @@ void create_window_body(X86 *c, bool wide) {
     win.thread = guest_current_thread_id();
     win.hinstance = hinst;
     win.extra.assign((ci->second.wnd_extra + 3) / 4, 0);
+    // The dialog class is framed by the engine (create_dialog_window); a
+    // CreateWindowExA of it directly gets the same non-client area, exactly as
+    // Windows does for the #32770 class. Every other class stays frameless.
+    if (cls == "#32770" || ci->second.name == "Dialog")
+        apply_dialog_nc(win);
     windows()[hwnd] = win;
     if (!g_main_hwnd)
         g_main_hwnd = hwnd;
@@ -596,10 +647,12 @@ void u_GetWindowRect(X86 *c) {
     }
     int32_t x, y;
     client_origin(w->hwnd, &x, &y);
-    wr32(r, x);
-    wr32(r + 4, y);
-    wr32(r + 8, x + w->w);
-    wr32(r + 12, y + w->h);
+    // The window rectangle is the frame around the client: the client origin
+    // is inside the non-client insets (zero on a frameless window).
+    wr32(r, x - w->nc_left);
+    wr32(r + 4, y - w->nc_top);
+    wr32(r + 8, x + w->w + w->nc_right);
+    wr32(r + 12, y + w->h + w->nc_bottom);
     set_eax(c, 1);
 }
 
@@ -2240,6 +2293,165 @@ bool owner_draw_listbox(X86 *c, Window *w, uint32_t hwnd, uint32_t hdc, int32_t 
     }
     return true;
 }
+// Classic, non-themed chrome for a framed dialog: a raised 3D frame, a solid
+// active-caption title bar with white text and (with WS_SYSMENU) a close box,
+// and a COLOR_BTNFACE client fill unless the dialog's own WM_CTLCOLORDLG
+// returns a brush. Windows erases the client and paints the frame before the
+// client WM_PAINT; this runs in that place, for the dialog the pump is about
+// to paint. The frame only ever goes to the window's own surface (the client DC
+// maps client (0,0) onto the surface at the non-client inset).
+void paint_dialog_chrome(X86 *c, uint32_t hwnd) {
+    Window *w = find_window(hwnd);
+    if (!w || !w->visible)
+        return;
+    const int32_t l = w->nc_left, t = w->nc_top, r = w->nc_right, b = w->nc_bottom;
+    if (!l && !t && !r && !b)
+        return;
+    const bool caption = w->nc_caption;
+    const int32_t cw = w->w, ch = w->h;
+    const uint32_t style = w->style;
+    const std::string title = w->title_utf8;
+    uint32_t hdc = gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (hdc)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const int32_t right = cw + r, bottom = ch + b;
+    const uint32_t face = gdi::argb(0x00d4d0c8); // COLOR_BTNFACE
+    const uint32_t hi = gdi::argb(0x00ffffff);   // COLOR_3DHILIGHT
+    const uint32_t lo = gdi::argb(0x00808080);   // COLOR_3DSHADOW
+    const uint32_t dk = gdi::argb(0x00000000);   // COLOR_3DDKSHADOW
+    // The whole window starts as frame face, then the caption bar on top.
+    gdi::fill(hdc, {-l, -t, right, bottom}, face);
+    if (caption)
+        gdi::fill(hdc, {-l, -t, right, 0}, gdi::argb(0x000a246a)); // COLOR_ACTIVECAPTION
+    // The client background: the brush the dialog proc returns for
+    // WM_CTLCOLORDLG, else COLOR_BTNFACE. Sent before the client is filled; the
+    // window is re-found afterwards because a guest handler may destroy it.
+    uint32_t bg = face;
+    if (uint32_t brush = host_dispatch_to_wndproc(c, hwnd, 0x0131 /* WM_CTLCOLORDLG */, hdc, hwnd))
+        if (!gdi::brush_color(brush, &bg))
+            bg = face;
+    w = find_window(hwnd);
+    if (!w) {
+        gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    gdi::fill(hdc, {0, 0, cw, ch}, bg);
+    // Raised outer edge: highlight on the top/left, dark shadow on the bottom
+    // and right, with a shadow just inside the dark edge.
+    gdi::fill(hdc, {-l, -t, right, -t + 1}, hi);
+    gdi::fill(hdc, {-l, -t, -l + 1, bottom}, hi);
+    gdi::fill(hdc, {-l, bottom - 1, right, bottom}, dk);
+    gdi::fill(hdc, {right - 1, -t, right, bottom}, dk);
+    if (caption) {
+        gdi::fill(hdc, {-l + 1, bottom - 2, right - 1, bottom - 1}, lo);
+        gdi::fill(hdc, {right - 2, -t + 1, right - 1, bottom - 1}, lo);
+        gdi::fill(hdc, {-l, -1, right, 0}, dk); // rule under the caption
+    }
+    if (!caption)
+        goto skip_caption;
+    {
+        const bool sysmenu = (style & 0x00080000u) != 0; // WS_SYSMENU
+        int32_t box = 0;
+        if (sysmenu) {
+            box = t - 4;
+            const int32_t cx1 = right - 3, cy0 = -t + 2, cx0 = cx1 - box, cy1 = cy0 + box;
+            gdi::fill(hdc, {cx0, cy0, cx1, cy1}, face);
+            gdi::fill(hdc, {cx0, cy0, cx1, cy0 + 1}, hi);
+            gdi::fill(hdc, {cx0, cy0, cx0 + 1, cy1}, hi);
+            gdi::fill(hdc, {cx0, cy1 - 1, cx1, cy1}, dk);
+            gdi::fill(hdc, {cx1 - 1, cy0, cx1, cy1}, dk);
+            gdi::line(hdc, cx0 + 3, cy0 + 3, cx1 - 4, cy1 - 4);
+            gdi::line(hdc, cx1 - 4, cy0 + 3, cx0 + 3, cy1 - 4);
+        }
+        uint32_t units = title.empty() ? 0 : wide_units(title);
+        const int32_t text_right = sysmenu ? right - 3 - box - 4 : right - 4;
+        if (units && units < (UINT32_MAX - 32) / 2 && text_right > 4) {
+            if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+                dc->text_color = 0x00ffffff;
+                dc->bk_mode = 1; // TRANSPARENT
+                wr32(block + 0, 4);
+                wr32(block + 4, uint32_t(-t));
+                wr32(block + 8, uint32_t(text_right));
+                wr32(block + 12, 0);
+                gm_put_wstr(block + 16, title, units + 1);
+                gdi::draw_text(hdc, block + 16, units, block,
+                               0x20 /*DT_SINGLELINE*/ | 0x4 /*DT_VCENTER*/ | 0x800 /*DT_NOPREFIX*/);
+                heap_free(block);
+            }
+        }
+    }
+skip_caption:
+    if (Window *after = find_window(hwnd))
+        after->update_pending = false;
+    gdi_release_window_dc(hwnd, hdc);
+}
+
+// A push button in a dialog: a COLOR_BTNFACE face with a raised 3D bevel, a
+// sunken one while the press is held, and the caption centred. BS_DEFPUSHBUTTON
+// (style 1) also gets the dark default-button border. Other button styles
+// (checkbox, radio, group box) fall back to the STATIC caption path.
+void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if ((w->style & 0x0fu) > 1u) {
+        paint_control(c, hwnd, into);
+        return;
+    }
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    const bool pressed = (w->userdata & 1u) != 0;
+    const bool is_default = (w->style & 0x0fu) == 1u;
+    const bool disabled = (w->style & 0x08000000u) != 0; // WS_DISABLED
+    const std::string text = w->title_utf8;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t face = gdi::argb(0x00d4d0c8), hi = gdi::argb(0x00ffffff),
+                   lo = gdi::argb(0x00808080), dk = gdi::argb(0x00000000);
+    gdi::fill(hdc, {0, 0, width, height}, face);
+    // The bevel swaps ends when the button is held down.
+    const uint32_t top_left = pressed ? lo : hi, bottom_right = pressed ? hi : dk;
+    gdi::fill(hdc, {0, 0, width, 1}, top_left);
+    gdi::fill(hdc, {0, 0, 1, height}, top_left);
+    gdi::fill(hdc, {0, height - 1, width, height}, bottom_right);
+    gdi::fill(hdc, {width - 1, 0, width, height}, bottom_right);
+    if (is_default) { // a dark 1 px border around a default push button
+        gdi::fill(hdc, {0, 0, width, 1}, dk);
+        gdi::fill(hdc, {0, 0, 1, height}, dk);
+        gdi::fill(hdc, {0, height - 1, width, height}, dk);
+        gdi::fill(hdc, {width - 1, 0, width, height}, dk);
+    }
+    uint32_t units = text.empty() ? 0 : wide_units(text);
+    if (units && units < (UINT32_MAX - 32) / 2) {
+        if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+            dc->text_color = disabled ? 0x00808080 : 0x00000000;
+            dc->bk_mode = 1; // TRANSPARENT
+            int32_t off = pressed ? 1 : 0;
+            wr32(block + 0, off);
+            wr32(block + 4, off);
+            wr32(block + 8, uint32_t(width));
+            wr32(block + 12, uint32_t(height));
+            gm_put_wstr(block + 16, text, units + 1);
+            gdi::draw_text(hdc, block + 16, units, block,
+                           0x1 /*DT_CENTER*/ | 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/ |
+                               0x800 /*DT_NOPREFIX*/);
+            heap_free(block);
+        }
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+}
+
 // A listbox control with strings (LBS_HASSTRINGS): paint the rows top to
 // bottom and highlight the selected one, each at the row height above. An
 // owner-draw listbox instead hands each row to the parent's WM_DRAWITEM.
@@ -2294,6 +2506,8 @@ void control_proc(X86 *c) {
     case 0x0318: // WM_PRINTCLIENT
         if (w && w->cls == "listbox")
             paint_listbox(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "button")
+            paint_button(c, hwnd, arg(c, 2));
         else
             paint_control(c, hwnd, arg(c, 2));
         set_eax(c, 0);
@@ -2584,15 +2798,20 @@ void control_proc(X86 *c) {
             set_eax(c, 0);
             return;
         }
-        if (w)
+        if (w) {
             w->userdata |= 1u;
+            w->update_pending = true; // the pressed bevel has to be drawn
+        }
         set_eax(c, 0);
         return;
     case 0x0202: { // WM_LBUTTONUP: a completed click reports WM_COMMAND
         uint32_t parent = w ? w->parent : 0, id = w ? w->id : 0;
         LOGW("control: WM_LBUTTONUP hwnd=%08x id=%u parent=%08x", hwnd, id, parent);
-        if (w)
+        if (w) {
             w->userdata &= ~1u;
+            if (w->cls == "button")
+                w->update_pending = true; // the bevel returns to raised
+        }
         if (parent)
             host_dispatch_to_wndproc(c, parent, 0x0111 /* WM_COMMAND */,
                                      id & 0xffffu /* BN_CLICKED is 0 */, hwnd);
@@ -2871,6 +3090,13 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
     w.dlg_base_y = base.y;
     w.w = dialog_map_unit(t.cx, base.x, 4);
     w.h = dialog_map_unit(t.cy, base.y, 8);
+    w.cls = "#32770";
+    // The template size above is the CLIENT size; the frame is fitted around
+    // it (Windows AdjustWindowRect). DS_CENTER centres the whole window, so it
+    // needs the outer size and x/y is the outer origin.
+    apply_dialog_nc(w);
+    const int32_t outer_w = w.w + w.nc_left + w.nc_right;
+    const int32_t outer_h = w.h + w.nc_top + w.nc_bottom;
     if (t.style & 0x800 /*DS_CENTER*/) {
         // Windows centres a DS_CENTER dialog in the working area of the monitor
         // that holds the owner. The port reports a 1024x768 desktop
@@ -2887,8 +3113,8 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
             ow = int32_t(dw);
             oh = int32_t(dh);
         }
-        w.x = (ow - w.w) / 2;
-        w.y = (oh - w.h) / 2;
+        w.x = (ow - outer_w) / 2;
+        w.y = (oh - outer_h) / 2;
         // A dialog larger than its owner would centre off the top-left; keep it
         // on screen rather than lose it (the port cannot drag a window back).
         if (w.x < 0)
@@ -2899,7 +3125,6 @@ uint32_t create_dialog_window(uint32_t hinst, uint32_t parent, uint32_t proc,
         w.x = dialog_map_unit(t.x, base.x, 4);
         w.y = dialog_map_unit(t.y, base.y, 8);
     }
-    w.cls = "#32770";
     w.title_utf8 = t.title;
     w.parent = parent;
     w.thread = guest_current_thread_id();
@@ -2990,6 +3215,9 @@ void u_DialogBoxParamA(X86 *c) {
         // synthesises WM_PAINT from an update region. Without this a dialog
         // engine that only drains the queue never paints anything.
         if (Window *pw = first_paint_window()) {
+            // The dialog's own frame and client background are painted before
+            // its client WM_PAINT, standing in for WM_NCPAINT/WM_ERASEBKGND.
+            paint_dialog_chrome(c, pw->hwnd);
             host_dispatch_to_wndproc(c, pw->hwnd, 0x000f /* WM_PAINT */, 0, 0);
             continue;
         }
