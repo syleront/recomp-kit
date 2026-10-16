@@ -71,6 +71,13 @@ double g_max_seconds = 180.0;
 uint32_t g_frame_every = 10;
 std::string g_frames_dir = "build/recomp/frames";
 bool g_activate = true;
+// A test seam, not a game input path: RECOMP_CLICK_AT=x,y posts one synthetic
+// move/press/release to the guest's input queue once RECOMP_CLICK_FRAME
+// presents have gone by. It exists so a dialog that waits for a button can be
+// driven without a display; a real host feeds the same queue from its window.
+uint32_t g_click_frame = 0;
+int32_t g_click_x = 0, g_click_y = 0;
+bool g_clicked = false;
 
 // --- run state -------------------------------------------------------------
 uint32_t g_present_count = 0; // host_present calls
@@ -502,6 +509,15 @@ void headless_tick() {
     // This is also the only thing that moves a play cursor here, so it runs
     // before the caps are looked at and on every turn.
     audio_pump();
+    if (g_click_frame && !g_clicked && g_present_count >= g_click_frame) {
+        g_clicked = true;
+        host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_click_x, g_click_y);
+        host_post_mouse_message(0x0201 /* WM_LBUTTONDOWN */, 1, g_click_x, g_click_y);
+        host_post_mouse_message(0x0202 /* WM_LBUTTONUP */, 0, g_click_x, g_click_y);
+        printf("[host] synthetic click at (%d,%d) after %u frames\n", g_click_x, g_click_y,
+               g_present_count);
+        fflush(stdout);
+    }
     if (boot_close_requested())
         return;
     if (g_present_count < g_max_frames)
@@ -610,6 +626,18 @@ int main(int argc, char **argv) {
         g_frames_dir = v;
     if (recomp_env("NO_ACTIVATE"))
         g_activate = false;
+    if (const char *v = recomp_env("CLICK_AT")) {
+        int x = 0, y = 0;
+        if (sscanf(v, "%d,%d", &x, &y) == 2) {
+            g_click_x = x;
+            g_click_y = y;
+            g_click_frame = 700; // past the splash; CLICK_FRAME overrides
+        } else {
+            fprintf(stderr, "[host] RECOMP_CLICK_AT wants x,y, not \"%s\"\n", v);
+        }
+    }
+    if (const char *v = recomp_env("CLICK_FRAME"))
+        g_click_frame = (uint32_t)strtoul(v, nullptr, 0);
 
     mkdir_p(g_frames_dir);
 
