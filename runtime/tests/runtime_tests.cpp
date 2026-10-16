@@ -2600,6 +2600,41 @@ static void test_dialog_close_box(X86 *c) {
     call_import(c, "USER32.dll", "DestroyWindow", {hwnd});
 }
 
+// A button click gives the button the keyboard focus, and BM_GETSTATE reports
+// it. Windows sets BST_FOCUS when a button is clicked, and Petz 5's profile
+// DLGPROC gates its Pick A Pet / Family Tree handlers on a non-zero
+// BM_GETSTATE, so a state of 0 made those buttons do nothing.
+static void test_button_state(X86 *c) {
+    section("USER32 button state and focus");
+    ensure_dialog_classes();
+    uint32_t cls = put_str("RTButtonParent");
+    uint32_t proc = imports_alloc_trampoline("test", "rt_button_parent", fake_guest_fn, 4);
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 0, 0);
+    wr32(wc + 4, proc);
+    wr32(wc + 36, cls);
+    check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0, "register the button parent");
+    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                  {0, cls, cls, 0x80000000u, 0, 0, 200, 100, 0, 0, 0, 0});
+    check(parent != 0, "create the button parent");
+    uint32_t btncls = put_str("button");
+    uint32_t btn =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, btncls, 0, 0x40000000u | 0x00010000u, 0, 0, 80, 24, parent, 42, 0, 0});
+    if (user32::Window *bw = user32::find_window(btn))
+        bw->cls = "button";
+    check(btn != 0, "create a child button");
+    check(call_import(c, "USER32.dll", "SendMessageA", {btn, 0x00f2 /* BM_GETSTATE */, 0, 0}) == 0,
+          "a button that is neither pushed nor focused reports state 0");
+    call_import(c, "USER32.dll", "SendMessageA", {btn, 0x0201 /* WM_LBUTTONDOWN */, 1, 0x00040008});
+    check((call_import(c, "USER32.dll", "SendMessageA", {btn, 0x00f2, 0, 0}) & 4u) != 0,
+          "a held button reports BST_PUSHED");
+    call_import(c, "USER32.dll", "SendMessageA", {btn, 0x0202 /* WM_LBUTTONUP */, 0, 0x00040008});
+    check(call_import(c, "USER32.dll", "SendMessageA", {btn, 0x00f2, 0, 0}) == 8u,
+          "the released button keeps BST_FOCUS, so a BM_GETSTATE gate passes");
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
+}
+
 static void test_windows(X86 *c) {
     section("USER32 windows and messages");
     // The window procedure is a stand-in the test-only recomp_call can reach;
@@ -7292,6 +7327,7 @@ int main(int argc, char **argv) {
     test_dialog_dlu_mapping(c);
     test_dialog_frame_geometry(c);
     test_dialog_close_box(c);
+    test_button_state(c);
     test_interp_extra_ops(c);
     test_acm_pcm_converter(c);
     test_guest_thunks(c);

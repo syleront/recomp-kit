@@ -40,6 +40,9 @@ void set_focus_window(uint32_t hwnd) {
     if (find_window(hwnd))
         focus = hwnd;
 }
+uint32_t focus_window() {
+    return focus;
+}
 std::vector<uint32_t> window_z_order(uint32_t parent) {
     std::vector<uint32_t> result;
     for (uint32_t hwnd : z_order) {

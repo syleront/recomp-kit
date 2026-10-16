@@ -109,6 +109,9 @@ bool paint_pending();
 void window_created(uint32_t hwnd);
 // Give the keyboard focus to a window (the dialog engine's first tab stop).
 void set_focus_window(uint32_t hwnd);
+// The window that currently has the keyboard focus (GetFocus's answer), so a
+// control can report it in BM_GETSTATE and an owner can decide a tab order.
+uint32_t focus_window();
 // Dialog base units: the pixels a dialog unit spans, in quarters across and
 // eighths down, from a DS_SETFONT face and point size. `dialog_map_unit` is the
 // same scaling (Windows' MulDiv rounding) the template engine lays a dialog out
@@ -136,6 +139,10 @@ void ensure_system_classes();
 // parent's WM_CTLCOLORSTATIC brush, then the text). Shared with the dialog
 // engine's control_proc.
 void paint_control(X86 *c, uint32_t hwnd, uint32_t into);
+// Paints an EDIT control: the parent's WM_CTLCOLOREDIT brush (COLOR_WINDOW
+// when the dialog answers nothing) inside its sunken border, then the control's
+// own text. The dialog engine's control_proc calls it for an "edit" window.
+void paint_edit(X86 *c, uint32_t hwnd, uint32_t into);
 } // namespace user32
 
 // The close box's rule (DefDlgProc): WM_COMMAND IDCANCEL, then WM_CLOSE when

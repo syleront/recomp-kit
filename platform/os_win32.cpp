@@ -497,9 +497,11 @@ int os_exe_path(char *buf, size_t cap) {
 // candidate return addresses, and the registered callback for the guest EIP.
 static OsFaultFn g_fault_fn;
 static uint64_t g_fault_addr = 0;
+static uint64_t g_fault_pc = 0;
 static LONG WINAPI fault_filter(EXCEPTION_POINTERS *info) {
     char line[256];
     const EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    g_fault_pc = (uint64_t)(uintptr_t)rec->ExceptionAddress;
     if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
         g_fault_addr = (uint64_t)rec->ExceptionInformation[1];
     else
@@ -536,6 +538,9 @@ int os_install_fault_handlers(OsFaultFn fn) {
 }
 uint64_t os_fault_address(void) {
     return g_fault_addr;
+}
+uint64_t os_fault_pc(void) {
+    return g_fault_pc;
 }
 void os_write_stderr_raw(const char *s, size_t n) {
     DWORD written = 0;

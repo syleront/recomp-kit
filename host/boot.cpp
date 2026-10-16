@@ -403,6 +403,36 @@ void sig_write_u32(uint32_t v) {
     sig_write(&buf[i + 1]);
 }
 
+// A raw guest frame-pointer walk. Signal-safe: bounds-checked reads of the
+// mapped guest arena, no allocation, no locks. A fault in recompiled code (or
+// in a shim it called) leaves the guest EBP chain intact, and that chain names
+// how the fault was reached - the one thing the registers alone cannot say.
+uint32_t guest_fault_word(uint32_t a) {
+    if (!g_mem || a > GUEST_SIZE - 4)
+        return 0xffffffffu;
+    return *(const uint32_t *)(g_mem + a);
+}
+
+void fault_dump_guest_chain(X86 *c) {
+    uint32_t ebp = c->r[R_EBP];
+    for (int i = 0; i < 16; ++i) {
+        if (ebp < STACK_LIMIT || ebp + 8 > STACK_TOP)
+            return;
+        uint32_t next = guest_fault_word(ebp);
+        uint32_t ret = guest_fault_word(ebp + 4);
+        sig_write("[host]   guest frame ");
+        sig_write_u32((uint32_t)i);
+        sig_write(" ebp=");
+        sig_write_hex8(ebp);
+        sig_write(" ret=");
+        sig_write_hex8(ret);
+        sig_write("\n");
+        if (next <= ebp)
+            return;
+        ebp = next;
+    }
+}
+
 void fault_handler(const char *name) {
     // guest_current_context() reads only thread-local state and a vector that
     // is never resized while guest code runs, so it is safe to ask here.
@@ -438,6 +468,10 @@ void fault_handler(const char *name) {
     sig_write_hex8(c->r[R_EDI]);
     sig_write(" EFX=");
     sig_write_hex8(x86_get_eflags(c));
+    sig_write("\n");
+    fault_dump_guest_chain(c);
+    sig_write("[host] fault_pc=");
+    sig_write_hex64(os_fault_pc());
     sig_write("\n");
     if (c->r[R_ESP] < STACK_LIMIT || c->r[R_ESP] >= STACK_TOP)
         sig_write("[host] the guest stack pointer is outside the main stack: it "

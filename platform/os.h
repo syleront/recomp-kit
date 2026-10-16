@@ -133,6 +133,10 @@ int os_install_fault_handlers(OsFaultFn fn);
 // being handled, or 0 when the platform did not report one. Valid only inside
 // the handler; async-signal-safe.
 uint64_t os_fault_address(void);
+// The instruction pointer at the fault, taken from the signal context (the
+// guest EIP is not written back by host code, so it can be stale when a shim
+// faults). Valid only inside the handler; async-signal-safe.
+uint64_t os_fault_pc(void);
 // For use inside a fault handler: a raw write to the error stream and an
 // immediate process exit, neither of which touches stdio or runs destructors.
 void os_write_stderr_raw(const char *s, size_t n);

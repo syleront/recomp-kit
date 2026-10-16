@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Keep the modal `DialogBoxParamA` pump from holding a message-queue iterator
+  across a guest call. The queue is process-wide and dispatching a message runs
+  guest code: a dialog procedure that opens a second modal dialog (Petz 5's
+  profile procedure calls `DialogBoxParamA` again for its Rename dialog) leaves
+  the outer pump's `std::deque` iterator pointing into storage the nested pump
+  has erased, so the next `*it` read a freed block and crashed the host. The
+  pump now copies `front()` and `pop_front()`s before dispatching, so no
+  iterator is alive across guest code.
+- Report `BM_GETSTATE` on a control instead of always answering 0: `BST_PUSHED`
+  while a button is held and `BST_FOCUS` while it owns the keyboard (a clicked
+  button takes the focus, as on Windows). A dialog procedure that gates a
+  handler on a non-zero `BM_GETSTATE` (Petz 5's profile does, for Pick A Pet and
+  Family Tree) ran nothing before this. `focus_window()` exposes the focus.
+- Paint an EDIT control: its own text (set with `SetDlgItemTextA`/`WM_SETTEXT`)
+  inside the parent's `WM_CTLCOLOREDIT` brush - `COLOR_WINDOW` when the dialog
+  answers nothing, `WM_CTLCOLORSTATIC` for a read-only edit - and its sunken
+  `WS_BORDER`/`WS_EX_CLIENTEDGE` edge. The dialog engine's control path only
+  knew a STATIC caption, so an edit's text was never drawn at all.
+- Leave a control's background alone when its parent answers `WM_CTLCOLORSTATIC`
+  with a null brush, rather than substituting `COLOR_BTNFACE`. A null brush is
+  Windows' "do not erase", and a dialog procedure that has drawn a picture into
+  its own client DC at a control's rectangle (Petz 5's profile draws the pet's
+  portrait with a `BitBlt` into its `BeginPaint` DC) keeps it.
+- Name the fault inside a shim: the fault report gains the guest EBP chain
+  (signal-safe, bounds-checked reads) and `os_fault_pc()`, the interrupted PC
+  from the signal/exception context. A shim fault leaves the guest EIP stale at
+  the call that entered the runtime, so the guest registers alone pointed at the
+  wrong instruction.
+
 - Map a dialog template's rectangles through the dialog's own font metrics
   instead of treating dialog units as pixels: a `DS_SETFONT` face's average
   character width (a quarter of it per unit across) and cell height (an eighth

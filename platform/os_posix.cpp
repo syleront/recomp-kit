@@ -330,6 +330,7 @@ int os_exe_path(char *buf, size_t cap) {
 static OsFaultFn g_fault_fn = nullptr;
 static volatile sig_atomic_t g_fault_reported = 0;
 static uint64_t g_fault_addr = 0;
+static uint64_t g_fault_pc = 0;
 static void fault_trampoline(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
     // The faulting address is the one thing the guest register file cannot
@@ -338,6 +339,10 @@ static void fault_trampoline(int sig, siginfo_t *info, void *ctx) {
     // handler runs. Keep it for the reporter.
     g_fault_addr = info ? (uint64_t)(uintptr_t)info->si_addr : 0;
     g_fault_reported = 1;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (ctx)
+        g_fault_pc = ((ucontext_t *)ctx)->uc_mcontext->__ss.__pc;
+#endif
     const char *what = sig == SIGSEGV   ? "SIGSEGV"
                        : sig == SIGBUS  ? "SIGBUS"
                        : sig == SIGABRT ? "an abort from the runtime"
@@ -346,6 +351,9 @@ static void fault_trampoline(int sig, siginfo_t *info, void *ctx) {
 }
 uint64_t os_fault_address(void) {
     return g_fault_reported ? g_fault_addr : 0;
+}
+uint64_t os_fault_pc(void) {
+    return g_fault_reported ? g_fault_pc : 0;
 }
 int os_install_fault_handlers(OsFaultFn fn) {
     g_fault_fn = fn;

@@ -2598,6 +2598,8 @@ void control_proc(X86 *c) {
             paint_listbox(c, hwnd, arg(c, 2));
         else if (w && w->cls == "button")
             paint_button(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "edit")
+            paint_edit(c, hwnd, arg(c, 2));
         else
             paint_control(c, hwnd, arg(c, 2));
         set_eax(c, 0);
@@ -2864,11 +2866,23 @@ void control_proc(X86 *c) {
     case 0x00f0: // BM_GETCHECK
         set_eax(c, w ? w->userdata : 0);
         return;
-    case 0x00f2: // BM_GETSTATE
-        set_eax(c, 0);
+    case 0x00f2: { // BM_GETSTATE
+        // BST_PUSHED while the button is held, BST_FOCUS while it owns the
+        // keyboard. Windows sets the focus bit when a button is clicked, and
+        // Petz 5's profile gates its Pick A Pet and Family Tree handlers on a
+        // non-zero BM_GETSTATE - they did nothing while this always answered 0.
+        uint32_t state = 0;
+        if (w && w->cls == "button" && (w->userdata & 1u))
+            state |= 4u; // BST_PUSHED
+        if (focus_window() == hwnd)
+            state |= 8u; // BST_FOCUS
+        set_eax(c, state);
         return;
+    }
     case 0x0201: // WM_LBUTTONDOWN: remember the press so the click is a pair
         LOGW("control: WM_LBUTTONDOWN hwnd=%08x id=%u", hwnd, w ? w->id : 0);
+        if (w && w->cls == "button")
+            set_focus_window(hwnd); // a clicked button keeps the focus (BST_FOCUS)
         if (w && w->cls == "listbox") {
             // Windows gives the keyboard to a listbox that is clicked, so the
             // arrow keys that follow reach it. The dialog manager otherwise
@@ -3282,10 +3296,18 @@ void u_DialogBoxParamA(X86 *c) {
         pump_mouse_input(c);
         gdi_present_windows();
         bool dispatched = false;
+        // Take one message out of the queue *before* dispatching it. The queue
+        // is process-wide, and dispatching a message runs guest code: Petz 5's
+        // profile DLGPROC calls DialogBoxParamA again for its Rename dialog, and
+        // that nested pump drains and refills the same deque. An iterator left
+        // pointing into the deque across the dispatch is invalidated by the
+        // nested pump's erase, so the next `*it` reads a freed block (the
+        // profile-rename SIGSEGV). Copy front()/pop_front() keeps no iterator
+        // alive across guest code.
         auto &q = queue();
-        for (auto it = q.begin(); it != q.end();) {
-            Msg m = *it;
-            it = q.erase(it);
+        while (!q.empty()) {
+            Msg m = q.front();
+            q.pop_front();
             if (m.message == 0x0012) { // WM_QUIT ends the dialog
                 dialog_running[hwnd] = false;
                 break;
