@@ -84,15 +84,19 @@ uint32_t g_clicked = 0;
 // each `FRAME:action`:
 //   x,y            click at (x,y)
 //   x1,y1>x2,y2    drag: press at (x1,y1), release at (x2,y2)
-//   move=x,y       move the cursor only (no press), for hover-driven menus
+//   move=x,y       move the cursor only (no press), for hover-driven menus; a
+//                  move may also be posted while a press is held, which is how
+//                  a slow drag is scripted (the release then lands at the last
+//                  move, not at the drag's x2,y2)
 //   key=VK         press and release the virtual key VK
+//   hold=N         set the press-hold length (frames) for the steps that follow
 // A press is *held* for RECOMP_CLICK_HOLD presented frames (default 8) before
 // the release is posted. That hold is the whole point: the game samples the
 // button state once per frame (PetzApp::PrepareDrawFrame copies its
 // down/up flags into ShlGlobals), so a press and release delivered between two
 // frames is invisible to it. A real click holds the button for many frames.
 struct ClickStep {
-    enum Kind { Click, Drag, Key, Move, Text };
+    enum Kind { Click, Drag, Key, Move, Text, Hold };
     uint32_t frame = 0;
     Kind kind = Click;
     int x = 0, y = 0, x2 = 0, y2 = 0;
@@ -105,6 +109,10 @@ uint32_t g_click_hold = 8;
 bool g_press_active = false;
 uint32_t g_press_frame = 0;
 ClickStep g_press_step;
+// The cursor's last scripted position, so a release lands where the moves left
+// it (see run_click_script); and whether a move was posted during the hold.
+int g_cur_x = 0, g_cur_y = 0;
+bool g_moved_while_held = false;
 
 // --- run state -------------------------------------------------------------
 uint32_t g_present_count = 0; // host_present calls
@@ -549,6 +557,9 @@ void parse_clicks(const char *v) {
         if (action.rfind("key=", 0) == 0) {
             st.kind = ClickStep::Key;
             st.vk = (uint32_t)strtoul(action.c_str() + 4, nullptr, 0);
+        } else if (action.rfind("hold=", 0) == 0) {
+            st.kind = ClickStep::Hold;
+            st.vk = (uint32_t)strtoul(action.c_str() + 5, nullptr, 0);
         } else if (action.rfind("text=", 0) == 0) {
             st.kind = ClickStep::Text;
             st.text = action.substr(5);
@@ -582,25 +593,42 @@ void parse_clicks(const char *v) {
 // Advance the script. One press is held at a time; the release is posted once
 // g_click_hold presented frames have gone by, so the game sees the press on at
 // least one frame boundary. See the ClickStep comment.
+//
+// A `move=` step is honoured *while a press is held* too, which is how a slow,
+// realistic drag is scripted: the press is a plain `x,y` click step, then a run
+// of `move=` steps walks the cursor across the target while the button stays
+// down, and the release lands wherever the last move left the cursor. A drag
+// (`x1,y1>x2,y2`) keeps its old meaning: with no interleaved move the release
+// still jumps to (x2,y2). This matters for Petz 5, which throws a toy that is
+// released after a single-frame cursor jump, so a one-jump drag flings the toy
+// into the wallpaper instead of placing it.
 void run_click_script() {
     if (g_press_active && g_present_count - g_press_frame >= g_click_hold) {
         if (g_press_step.kind == ClickStep::Key) {
             host_set_key_state((int)g_press_step.vk, false);
             host_post_key_message(0x0101 /* WM_KEYUP */, g_press_step.vk, 0);
         } else {
-            host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_press_step.x2, g_press_step.y2);
-            host_post_mouse_message(0x0202 /* WM_LBUTTONUP */, 0, g_press_step.x2, g_press_step.y2);
+            if (!g_moved_while_held) {
+                host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_press_step.x2,
+                                        g_press_step.y2);
+                g_cur_x = g_press_step.x2;
+                g_cur_y = g_press_step.y2;
+            }
+            host_post_mouse_message(0x0202 /* WM_LBUTTONUP */, 0, g_cur_x, g_cur_y);
         }
         printf("[host] scripted release %s at (%d,%d) after %u frames\n",
-               g_press_step.kind == ClickStep::Key ? "key" : "click", g_press_step.x2,
-               g_press_step.y2, g_present_count);
+               g_press_step.kind == ClickStep::Key ? "key" : "click", g_cur_x, g_cur_y,
+               g_present_count);
         fflush(stdout);
         g_press_active = false;
+        g_moved_while_held = false;
     }
-    while (!g_press_active && g_next_click < g_clicks.size() &&
-           g_present_count >= g_clicks[g_next_click].frame) {
+    while (g_next_click < g_clicks.size() && g_present_count >= g_clicks[g_next_click].frame) {
+        if (g_press_active && g_clicks[g_next_click].kind != ClickStep::Move)
+            break; // only a move may interrupt a held press
         g_press_step = g_clicks[g_next_click++];
-        g_press_frame = g_present_count;
+        if (!g_press_active)
+            g_press_frame = g_present_count;
         if (g_press_step.kind == ClickStep::Text) {
             // Type into the focused control: one WM_CHAR per byte, the message
             // an edit control actually consumes. TranslateMessage would turn a
@@ -613,14 +641,30 @@ void run_click_script() {
             fflush(stdout);
             continue;
         }
+        if (g_press_step.kind == ClickStep::Hold) {
+            // A per-step hold: set the press-hold length for the steps that
+            // follow, so a menu click and a slow toy drag can share one script.
+            g_click_hold = g_press_step.vk;
+            printf("[host] scripted hold=%u from frame %u\n", g_click_hold, g_present_count);
+            fflush(stdout);
+            continue;
+        }
         if (g_press_step.kind == ClickStep::Move) {
-            host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, 0, g_press_step.x, g_press_step.y);
+            host_post_mouse_message(0x0200 /* WM_MOUSEMOVE */, g_press_active ? 1 : 0,
+                                    g_press_step.x, g_press_step.y);
+            g_cur_x = g_press_step.x;
+            g_cur_y = g_press_step.y;
+            if (g_press_active)
+                g_moved_while_held = true;
             printf("[host] scripted move to (%d,%d) after %u frames\n", g_press_step.x,
                    g_press_step.y, g_present_count);
             fflush(stdout);
             continue;
         }
         g_press_active = true;
+        g_moved_while_held = false;
+        g_cur_x = g_press_step.x;
+        g_cur_y = g_press_step.y;
         if (g_press_step.kind == ClickStep::Key) {
             host_set_key_state((int)g_press_step.vk, true);
             host_post_key_message(0x0100 /* WM_KEYDOWN */, g_press_step.vk, 0);

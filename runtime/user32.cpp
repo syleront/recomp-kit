@@ -2024,9 +2024,63 @@ void u_EndDialog(X86 *c) {
     set_eax(c, 1);
 }
 
+// An owner-draw listbox (LBS_OWNERDRAWFIXED 0x10 / LBS_OWNERDRAWVARIABLE 0x20)
+// does not draw its own rows: Windows asks the parent for the row height with
+// WM_MEASUREITEM, then asks it to draw each visible row with WM_DRAWITEM. The
+// two structs are built in guest memory with the exact Windows layout, so a
+// guest's own handler reads them unchanged. Returns false when the parent does
+// not handle WM_DRAWITEM (return 0), so the plain-string fallback can run.
+bool owner_draw_listbox(X86 *c, Window *w, uint32_t hwnd, uint32_t hdc, int32_t width,
+                        int32_t height, int32_t *out_height) {
+    if (!w->parent || !(w->style & (0x10 | 0x20)))
+        return false;
+    int32_t ih = 16;
+    uint32_t ms = heap_alloc(0x18, true);
+    if (ms) {
+        for (int k = 0; k < 0x18; k += 4)
+            wr32(ms + k, 0);
+        wr32(ms + 0x00, 2);     // CtlType = ODT_LISTBOX
+        wr32(ms + 0x04, w->id); // CtlID
+        wr32(ms + 0x08, 0);     // itemID
+        host_dispatch_to_wndproc(c, w->parent, 0x002c /* WM_MEASUREITEM */, w->id, ms);
+        int32_t measured = (int32_t)rd32(ms + 0x10); // itemHeight
+        if (measured > 0)
+            ih = measured;
+        heap_free(ms);
+    }
+    *out_height = ih;
+    int32_t y = 0;
+    for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i, y += ih) {
+        uint32_t ds = heap_alloc(0x30, true);
+        if (!ds)
+            return false;
+        for (int k = 0; k < 0x30; k += 4)
+            wr32(ds + k, 0);
+        wr32(ds + 0x00, 2);                          // CtlType = ODT_LISTBOX
+        wr32(ds + 0x04, w->id);                      // CtlID
+        wr32(ds + 0x08, uint32_t(i));                // itemID = the row index
+        wr32(ds + 0x0c, 1);                          // itemAction = ODA_DRAWENTIRE
+        wr32(ds + 0x10, i == w->list_sel ? 1u : 0u); // itemState = ODS_SELECTED
+        wr32(ds + 0x14, hwnd);                       // hwndItem
+        wr32(ds + 0x18, hdc);                        // hDC
+        wr32(ds + 0x1c, 0);                          // rcItem.left
+        wr32(ds + 0x20, uint32_t(y));                // rcItem.top
+        wr32(ds + 0x24, uint32_t(width));            // rcItem.right
+        wr32(ds + 0x28, uint32_t(y + ih));           // rcItem.bottom
+        wr32(ds + 0x2c, 0);                          // itemData
+        uint32_t r = host_dispatch_to_wndproc(c, w->parent, 0x002b /* WM_DRAWITEM */, w->id, ds);
+        heap_free(ds);
+        if (!r) {
+            *out_height = ih;
+            return false;
+        }
+    }
+    return true;
+}
 // A listbox control with strings (LBS_HASSTRINGS): paint the rows top to
 // bottom and highlight the selected one. Item height is the 8pt system font's
-// 16 pixels, which is what MapDialogRect uses for a dialog unit's height.
+// 16 pixels, which is what MapDialogRect uses for a dialog unit's height. An
+// owner-draw listbox instead hands each row to the parent's WM_DRAWITEM.
 void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
     if (!w)
@@ -2038,9 +2092,12 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
     if (!gdi::dc_of(hdc))
         return;
     gdi::fill(hdc, {0, 0, width, height}, 0x00ffffff);
-    const int32_t ih = 16;
+    int32_t ih = 16;
+    bool owner_draw = owner_draw_listbox(c, w, hwnd, hdc, width, height, &ih);
     int32_t y = 0;
     for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i, y += ih) {
+        if (owner_draw)
+            continue; // the parent drew this row
         if (i == w->list_sel)
             gdi::fill(hdc, {0, y, width, y + ih}, 0x00c00000);
         uint32_t units = wide_units(w->list_items[i]);
