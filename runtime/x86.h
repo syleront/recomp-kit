@@ -519,6 +519,36 @@ int recomp_module_is_call_return(uint32_t target);
 /* Dispatches target through the owning module's tables; 0 when no module owns it. */
 int recomp_module_call(X86 *c, uint32_t target);
 
+/* Every RET asks whether its target is a CALL continuation. That answer is a
+ * binary search over tens of thousands of addresses plus a lookup in the module
+ * registry, and it is asked millions of times a second - the single hottest
+ * thing the runtime did before this cache. The answer for an address cannot
+ * change after load, so a direct-mapped cache answers the repeat (well over
+ * 99%) in one load. A slot holds (target << 32) | answer, written with one
+ * relaxed store, so a racing reader sees an old or a new entry, both correct. */
+#define RECOMP_RET_CACHE_BITS 14
+/* The cache storage. It is a weak definition in the header so every consumer of
+ * x86.h gets one - including a test harness that compiles translated code
+ * without linking the runtime - and the linker coalesces the copies into a
+ * single block. Zero-initialised, so an empty slot matches target 0 and answers
+ * "not a continuation", which is right. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak)) uint64_t recomp_ret_cache[1u << RECOMP_RET_CACHE_BITS];
+#else
+uint64_t recomp_ret_cache[1u << RECOMP_RET_CACHE_BITS];
+#endif
+
+static inline int recomp_is_call_return_cached(uint32_t target) {
+    const uint32_t slot = (target * 2654435761u) >> (32 - RECOMP_RET_CACHE_BITS);
+    const uint64_t e = __atomic_load_n(&recomp_ret_cache[slot], __ATOMIC_RELAXED);
+    if ((uint32_t)(e >> 32) == target)
+        return (int)(e & 1u);
+    const int r = recomp_is_call_return(target) || recomp_module_is_call_return(target);
+    __atomic_store_n(&recomp_ret_cache[slot], ((uint64_t)target << 32) | (uint64_t)r,
+                     __ATOMIC_RELAXED);
+    return r;
+}
+
 /* RET has already popped EIP and applied any immediate stack adjustment.
  * A CALL continuation belongs to the pending host caller, even when it is
  * also an alternate entry. Other entries are tail calls, as in interface
@@ -532,7 +562,7 @@ static inline void recomp_return(X86 *c) {
     }
     if (recomp_resumable_stacks)
         return;
-    if (recomp_is_call_return(c->eip) || recomp_module_is_call_return(c->eip))
+    if (recomp_is_call_return_cached(c->eip))
         return;
     if ((c->eip >= GUEST_SHIM_BASE && c->eip < GUEST_SHIM_END) || recomp_index_of(c->eip) >= 0 ||
         recomp_module_lookup(c->eip) >= 0)

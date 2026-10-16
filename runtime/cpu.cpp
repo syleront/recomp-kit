@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <map>
 #include <vector>
 
@@ -72,6 +73,22 @@ std::vector<const RecompModule *> &modules() {
     static std::vector<const RecompModule *> v;
     return v;
 }
+// recomp_module_containing is called on every indirect call that is neither a
+// main-image function nor - before the range check - an import shim, so a
+// linear scan over hundreds of content modules was several percent of a frame.
+// A base-sorted index turns it into a binary search; it is rebuilt when the
+// registry's size changes (a module registers from a static constructor, or a
+// data module loads at run time).
+std::vector<const RecompModule *> &modules_by_base() {
+    static std::vector<const RecompModule *> v;
+    return v;
+}
+void refresh_module_index() {
+    auto &by = modules_by_base();
+    by = modules();
+    std::sort(by.begin(), by.end(),
+              [](const RecompModule *a, const RecompModule *b) { return a->base < b->base; });
+}
 int32_t module_index(const RecompModule *m, uint32_t target) {
     uint32_t lo = 0, hi = m->func_count;
     while (lo < hi) {
@@ -118,10 +135,24 @@ const RecompModule *recomp_module_named(const char *name) {
     return nullptr;
 }
 const RecompModule *recomp_module_containing(uint32_t addr) {
-    for (const RecompModule *m : modules())
-        if (addr >= m->base && addr < m->end)
-            return m;
-    return nullptr;
+    auto &by = modules_by_base();
+    if (by.size() != modules().size())
+        refresh_module_index();
+    if (by.empty())
+        return nullptr;
+    // The last module whose base is <= addr.
+    size_t lo = 0, hi = by.size();
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (by[mid]->base <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo == 0)
+        return nullptr;
+    const RecompModule *m = by[lo - 1];
+    return addr < m->end ? m : nullptr;
 }
 int32_t recomp_module_lookup(uint32_t target) {
     const RecompModule *m = recomp_module_containing(target);
