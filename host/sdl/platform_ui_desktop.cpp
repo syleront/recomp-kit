@@ -268,3 +268,11 @@ void platform_ui_device_rumble(uint16_t low, uint16_t high) {
     // Desktop: no-op.
 #endif
 }
+
+#ifndef __APPLE__
+// macOS has platform_ui_mac.mm, which installs the native NSSavePanel/NSAlert
+// presenters. Every other desktop platform leaves the platform layer's
+// deterministic fallback (RECOMP_FILE_DIALOG_RESULT / RECOMP_MESSAGEBOX_RESULT)
+// in place.
+void platform_ui_install_dialogs() {}
+#endif

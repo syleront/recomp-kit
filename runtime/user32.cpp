@@ -1614,54 +1614,90 @@ void u_GetKeyboardLayout(X86 *c) {
 // ---------------------------------------------------------------------------
 // Message boxes and formatting
 // ---------------------------------------------------------------------------
-// The answer a message box gets when there is nobody to click it.
+// A message box is shown by the platform's own alert (the macOS host's
+// NSAlert) through os_message_box(); the runtime reduces the MB_* type to the
+// button set, the default button and an icon, and maps the chosen index back to
+// a Win32 id. With no presenter - a headless host, the unit tests - the
+// platform answers deterministically, so a box is never answered with a button
+// the caller did not offer.
 //
-// There is no display, so the box cannot be shown and cannot be answered by a
-// person. What it must not do is answer with a button the caller never
-// offered: returning IDOK to an MB_YESNO box is not one of that box's two
-// possible answers, and a caller that switches on the result then takes a path
-// Windows could never have produced. So the reply is the default button of the
-// button set the caller asked for, which is what pressing Return on the box
-// gives, and MB_DEFBUTTON1/2/3 select which of them that is.
-uint32_t message_box_default(uint32_t type) {
+// The default button is what pressing Return gives, and MB_DEFBUTTON1/2/3
+// selects it; the platform returns it when nothing overrides the answer.
+uint32_t message_box_icon(uint32_t type) {
+    switch (type & 0x000000f0u) { // MB_ICONMASK
+    case 0x10:                    // MB_ICONHAND / MB_ICONERROR
+        return 3;
+    case 0x20: // MB_ICONQUESTION
+        return 4;
+    case 0x30: // MB_ICONEXCLAMATION / MB_ICONWARNING
+        return 2;
+    case 0x40: // MB_ICONASTERISK / MB_ICONINFORMATION
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+uint32_t message_box_answer(const std::string &text, const std::string &title, uint32_t type) {
     // MB_OK, MB_OKCANCEL, MB_ABORTRETRYIGNORE, MB_YESNOCANCEL, MB_YESNO,
     // MB_RETRYCANCEL, MB_CANCELTRYCONTINUE, indexed by type & MB_TYPEMASK.
-    static const uint8_t sets[7][3] = {
-        {1, 0, 0},   // IDOK
-        {1, 2, 0},   // IDOK, IDCANCEL
-        {3, 4, 5},   // IDABORT, IDRETRY, IDIGNORE
-        {6, 7, 2},   // IDYES, IDNO, IDCANCEL
-        {6, 7, 0},   // IDYES, IDNO
-        {4, 2, 0},   // IDRETRY, IDCANCEL
-        {2, 10, 11}, // IDCANCEL, IDTRYAGAIN, IDCONTINUE
+    struct Button {
+        uint32_t id;
+        const char *label;
+    };
+    static const Button sets[7][3] = {
+        {{1, "OK"}, {0, nullptr}, {0, nullptr}},              // IDOK
+        {{1, "OK"}, {2, "Cancel"}, {0, nullptr}},             // IDOK, IDCANCEL
+        {{3, "Abort"}, {4, "Retry"}, {5, "Ignore"}},          // IDABORT, IDRETRY, IDIGNORE
+        {{6, "Yes"}, {7, "No"}, {2, "Cancel"}},               // IDYES, IDNO, IDCANCEL
+        {{6, "Yes"}, {7, "No"}, {0, nullptr}},                // IDYES, IDNO
+        {{4, "Retry"}, {2, "Cancel"}, {0, nullptr}},          // IDRETRY, IDCANCEL
+        {{2, "Cancel"}, {10, "Try Again"}, {11, "Continue"}}, // IDCANCEL, IDTRYAGAIN, IDCONTINUE
     };
     uint32_t set = type & 0x0000000fu;
     if (set > 6)
         set = 0;
     uint32_t want = (type & 0x00000f00u) >> 8; // MB_DEFBUTTON1/2/3
-    if (want > 2 || sets[set][want] == 0)
+    if (want > 2 || sets[set][want].id == 0)
         want = 0;
-    return sets[set][want];
+
+    const char *labels[3] = {nullptr, nullptr, nullptr};
+    uint32_t ids[3] = {0, 0, 0};
+    int count = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (sets[set][i].id == 0)
+            break;
+        labels[count] = sets[set][i].label;
+        ids[count] = sets[set][i].id;
+        ++count;
+    }
+    OsMessageBox m{};
+    m.title = title.empty() ? nullptr : title.c_str();
+    m.text = text.c_str();
+    m.labels = labels;
+    m.ids = ids;
+    m.count = count;
+    m.default_index = (int)want;
+    m.icon = (int)message_box_icon(type);
+    int index = os_message_box(&m);
+    if (index < 0 || index >= count)
+        index = (int)want;
+    return ids[index];
 }
 
 void u_MessageBoxA(X86 *c) {
-    uint32_t answer = message_box_default(arg(c, 3));
-    LOGW("MessageBoxA: [%s] %s -> default button %u", gm_str(arg(c, 2), 256).c_str(),
-         gm_str(arg(c, 1), 1024).c_str(), answer);
+    std::string text = gm_str(arg(c, 1), 4096);
+    std::string title = gm_str(arg(c, 2), 512);
+    uint32_t answer = message_box_answer(text, title, arg(c, 3));
+    LOGW("MessageBoxA: [%s] %s -> id %u", title.c_str(), text.c_str(), answer);
     set_eax(c, answer);
 }
 
 void u_MessageBoxW(X86 *c) {
-    std::string text;
-    uint32_t p = arg(c, 1);
-    for (int i = 0; i < 1024; ++i) {
-        uint16_t w = rd16(p + 2 * i);
-        if (!w)
-            break;
-        text.push_back((char)(w < 256 ? w : '?'));
-    }
-    uint32_t answer = message_box_default(arg(c, 3));
-    LOGW("MessageBoxW: %s -> default button %u", text.c_str(), answer);
+    std::string text = gm_wstr(arg(c, 1), 4096);
+    std::string title = gm_wstr(arg(c, 2), 512);
+    uint32_t answer = message_box_answer(text, title, arg(c, 3));
+    LOGW("MessageBoxW: [%s] %s -> id %u", title.c_str(), text.c_str(), answer);
     set_eax(c, answer);
 }
 
@@ -2113,10 +2149,18 @@ void u_DrawStateA(X86 *c) {
     heap_free(block);
     set_eax(c, 1);
 }
-// WinHelp opens the old WinHelp engine, which does not exist here. Reporting
-// success lets a caller that bails out on failure carry on.
+// WinHelp opens the old WinHelp engine, which does not exist here. The
+// platform seam logs it (and opens a URL when the caller gave one instead of a
+// .hlp file); reporting success lets a caller that bails out on failure carry
+// on. Never fatal, never blocking on a missing engine.
+bool help_target_is_url(const std::string &target) {
+    return target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0 ||
+           target.rfind("file:", 0) == 0 || target.rfind("mailto:", 0) == 0;
+}
 void u_WinHelpA(X86 *c) {
-    log_once("WinHelpA", "WinHelpA: help is unavailable; reporting success");
+    uint32_t p = arg(c, 1);
+    std::string file = p ? gm_str(p, 1024) : std::string();
+    os_help("WinHelpA", file.c_str(), help_target_is_url(file) ? file.c_str() : nullptr);
     set_eax(c, 1);
 }
 

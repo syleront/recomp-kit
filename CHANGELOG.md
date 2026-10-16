@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Show the platform's own system dialogs instead of faking them. A new
+  `platform/os.h` seam (`os_file_dialog`, `os_message_box`, `os_help`) carries a
+  picker, an alert and a help request across the runtime/host boundary; the
+  macOS host installs `NSSavePanel`/`NSOpenPanel` and `NSAlert` presenters
+  (`host/sdl/platform_ui_mac.mm`), and a host with none answers deterministically
+  from `RECOMP_FILE_DIALOG_RESULT` and `RECOMP_MESSAGEBOX_RESULT` so a headless
+  run and the unit tests stay reproducible. `comdlg32!GetOpenFileNameA`/
+  `GetSaveFileNameA` parse the whole `OPENFILENAMEA` (filter pairs, initial
+  directory and name, flags) and write the chosen path back within `nMaxFile`
+  with `nFileOffset`/`nFileExtension`; a cancel is `FALSE` with
+  `CommDlgExtendedError` 0, a short struct is `CDERR_STRUCTSIZE`, a too-small
+  buffer is `FNERR_BUFFERTOOSMALL`. `MessageBoxA`/`W` reduce `MB_*` to the
+  button set, default and icon and map the chosen button back to its id.
+  `WinHelpA` and `hhctrl.ocx!HtmlHelpA`/`W` are non-fatal and open a URL only
+  when the target is one.
 - Keep the modal `DialogBoxParamA` pump from holding a message-queue iterator
   across a guest call. The queue is process-wide and dispatching a message runs
   guest code: a dialog procedure that opens a second modal dialog (Petz 5's

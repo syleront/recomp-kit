@@ -249,6 +249,61 @@ void test_switch_names() {
     os_unsetenv("POP_RECOMP_SWITCH_PROBE");
 }
 
+// The system-dialog seam: with no native presenter installed the deterministic
+// fallback answers from the environment, so a scripted run and the unit tests
+// are reproducible. The result-writing helper is shared with a native presenter.
+void test_system_dialogs() {
+    char buf[64] = {0};
+    OsFileDialog d{};
+    int off = -1, ext = -1;
+    d.file = buf;
+    d.file_cap = sizeof buf;
+    d.file_offset = &off;
+    d.file_extension = &ext;
+    CHECK(os_file_dialog_set_result(&d, "/a/Name.pet") == 1);
+    CHECK(strcmp(buf, "/a/Name.pet") == 0);
+    CHECK(off == 3 && ext == 7);
+    // A name with no extension leaves the extension offset at 0.
+    CHECK(os_file_dialog_set_result(&d, "plain") == 1 && off == 0 && ext == 0);
+    // A path that does not fit is -2, with a truncated prefix left behind.
+    char tiny[6] = {0};
+    d.file = tiny;
+    d.file_cap = sizeof tiny;
+    CHECK(os_file_dialog_set_result(&d, "/too/long/for/it") == -2);
+    CHECK(strlen(tiny) == 5);
+
+    // The fallback: a cancel by default, the named path otherwise.
+    OsFileDialog f{};
+    f.file = buf;
+    f.file_cap = sizeof buf;
+    os_unsetenv("RECOMP_FILE_DIALOG_RESULT");
+    CHECK(os_file_dialog(&f) == 0);
+    CHECK(os_setenv("RECOMP_FILE_DIALOG_RESULT", "/env/Chosen.pet") == 0);
+    CHECK(os_file_dialog(&f) == 1 && strcmp(buf, "/env/Chosen.pet") == 0);
+    CHECK(os_setenv("RECOMP_FILE_DIALOG_RESULT", "cancel") == 0);
+    CHECK(os_file_dialog(&f) == 0);
+    os_unsetenv("RECOMP_FILE_DIALOG_RESULT");
+
+    // The message box: the default index, then an id by name and by number.
+    const char *labels[] = {"OK", "Cancel"};
+    const uint32_t ids[] = {1, 2};
+    OsMessageBox m{};
+    m.text = "?";
+    m.labels = labels;
+    m.ids = ids;
+    m.count = 2;
+    m.default_index = 0;
+    os_unsetenv("RECOMP_MESSAGEBOX_RESULT");
+    CHECK(os_message_box(&m) == 0);
+    CHECK(os_setenv("RECOMP_MESSAGEBOX_RESULT", "IDCANCEL") == 0);
+    CHECK(os_message_box(&m) == 1);
+    CHECK(os_setenv("RECOMP_MESSAGEBOX_RESULT", "1") == 0);
+    CHECK(os_message_box(&m) == 0);
+    CHECK(os_setenv("RECOMP_MESSAGEBOX_RESULT", "IDYES") == 0); // not in the set
+    CHECK(os_message_box(&m) == 0);
+    os_unsetenv("RECOMP_MESSAGEBOX_RESULT");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -261,6 +316,7 @@ int main(int argc, char **argv) {
     test_vm();
     test_paths_and_descriptors();
     test_process_and_strings();
+    test_system_dialogs();
     printf("%d checks, %d failures\n", g_checks, g_failures);
     if (!g_failures)
         printf("all platform tests passed\n");

@@ -139,11 +139,18 @@ here, so continuing would run the guest past a point Windows never reaches.
   **Threads** below for ownership, suspension and deadlock diagnostics.
 - **`VirtualAlloc` works in whole pages**, base and size, and `MEM_DECOMMIT`
   discards the contents so a recommit sees zeroes.
-- **A message box is answered with its default button.** There is no display,
-  so nobody can click it, but replying `IDOK` to an `MB_YESNO` box would hand
-  the caller an answer that box never offered. `MessageBoxA`/`W` return the
-  default button of the button set the caller asked for, honouring
-  `MB_DEFBUTTON1/2/3`, which is what pressing Return would have given.
+- **A message box is shown by the platform's own alert.** `MessageBoxA`/`W`
+  reduce the `MB_*` type to its button set, default button and icon and call
+  `os_message_box()`; the macOS host shows an `NSAlert`, and a headless host or
+  the unit tests answer deterministically (`RECOMP_MESSAGEBOX_RESULT`), so a box
+  is never answered with a button the caller did not offer. `MB_DEFBUTTON1/2/3`
+  selects the default, which is what pressing Return gives.
+- **The common file dialogs are the platform's picker.** `GetOpenFileNameA`/
+  `GetSaveFileNameA` parse `OPENFILENAMEA` and call `os_file_dialog()`: the
+  macOS host shows `NSOpenPanel`/`NSSavePanel`, and a headless host answers from
+  `RECOMP_FILE_DIALOG_RESULT` (a path or `cancel`). The chosen path is written
+  back within `nMaxFile`, with `nFileOffset`/`nFileExtension`; a cancel is
+  `FALSE` with `CommDlgExtendedError` 0.
 
 ## Threads
 
