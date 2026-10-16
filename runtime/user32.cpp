@@ -2024,33 +2024,88 @@ void u_EndDialog(X86 *c) {
     set_eax(c, 1);
 }
 
-// An owner-draw listbox (LBS_OWNERDRAWFIXED 0x10 / LBS_OWNERDRAWVARIABLE 0x20)
-// does not draw its own rows: Windows asks the parent for the row height with
+// One row height, asked of the parent with WM_MEASUREITEM. An owner-draw box
+// owns its row height, so the same value must drive drawing, hit-testing, the
+// item rects and the scroll — a click at the wrong divisor lands on the wrong
+// row (the farther down, the worse). LBS_OWNERDRAWFIXED (0x10) has one height;
+// LBS_OWNERDRAWVARIABLE (0x20) gives a different one per row index. A box that
+// is neither, or whose parent leaves itemHeight zero, uses the 8x16 system
+// font's line height, which is what MapDialogRect measures a dialog unit with.
+int32_t listbox_measure_row(X86 *c, Window *w, int32_t item) {
+    if (!w->parent || !(w->style & (0x10 | 0x20)))
+        return 16;
+    uint32_t ms = heap_alloc(0x18, true);
+    if (!ms)
+        return 16;
+    for (int k = 0; k < 0x18; k += 4)
+        wr32(ms + k, 0);
+    wr32(ms + 0x00, 2);                                       // CtlType = ODT_LISTBOX
+    wr32(ms + 0x04, w->id);                                   // CtlID
+    wr32(ms + 0x08, (w->style & 0x20) ? uint32_t(item) : 0u); // itemID
+    host_dispatch_to_wndproc(c, w->parent, 0x002c /* WM_MEASUREITEM */, w->id, ms);
+    int32_t measured = (int32_t)rd32(ms + 0x10); // itemHeight
+    heap_free(ms);
+    return measured > 0 ? measured : 16;
+}
+
+// The height of row `item`, at one source for every consumer of it. A fixed
+// box measures once and caches; a variable box caches per row.
+int32_t listbox_item_height(X86 *c, Window *w, int32_t item) {
+    if (!(w->style & 0x20)) { // LBS_OWNERDRAWFIXED, LBS_HASSTRINGS or neither
+        if (w->list_item_height <= 0)
+            w->list_item_height = listbox_measure_row(c, w, 0);
+        return w->list_item_height;
+    }
+    if (item >= 0 && item < (int32_t)w->list_item_heights.size() && w->list_item_heights[item] > 0)
+        return w->list_item_heights[item];
+    int32_t h = listbox_measure_row(c, w, item);
+    if (item >= 0) {
+        if ((int32_t)w->list_item_heights.size() <= item)
+            w->list_item_heights.resize(item + 1, 0);
+        w->list_item_heights[item] = h;
+    }
+    return h;
+}
+
+// Client y of row `item`'s top edge: the heights of the rows scrolled above it,
+// from the same source as the drawing.
+int32_t listbox_item_top(X86 *c, Window *w, int32_t item) {
+    int32_t y = 0;
+    for (int32_t i = w->list_top; i < item && i < (int32_t)w->list_items.size(); ++i)
+        y += listbox_item_height(c, w, i);
+    return y;
+}
+
+// The row under client y, or -1 past the last one. The same heights the paint
+// and LB_GETITEMRECT use, so a click selects the row the user sees.
+int32_t listbox_item_from_y(X86 *c, Window *w, int32_t y) {
+    if (y < 0)
+        return -1;
+    int32_t top = 0;
+    for (int32_t i = w->list_top; i < (int32_t)w->list_items.size(); ++i) {
+        int32_t h = listbox_item_height(c, w, i);
+        if (h <= 0)
+            h = 1;
+        if (y < top + h)
+            return i;
+        top += h;
+    }
+    return -1;
+}
+
+// An owner-draw listbox (LBS_OWNERDRAWFIXED / LBS_OWNERDRAWVARIABLE) does not
+// draw its own rows: Windows asks the parent for the row height with
 // WM_MEASUREITEM, then asks it to draw each visible row with WM_DRAWITEM. The
-// two structs are built in guest memory with the exact Windows layout, so a
-// guest's own handler reads them unchanged. Returns false when the parent does
-// not handle WM_DRAWITEM (return 0), so the plain-string fallback can run.
+// struct is built in guest memory with the exact Windows layout, so a guest's
+// own handler reads it unchanged. Returns false when the parent does not handle
+// WM_DRAWITEM (return 0), so the plain-string fallback can run.
 bool owner_draw_listbox(X86 *c, Window *w, uint32_t hwnd, uint32_t hdc, int32_t width,
-                        int32_t height, int32_t *out_height) {
+                        int32_t height) {
     if (!w->parent || !(w->style & (0x10 | 0x20)))
         return false;
-    int32_t ih = 16;
-    uint32_t ms = heap_alloc(0x18, true);
-    if (ms) {
-        for (int k = 0; k < 0x18; k += 4)
-            wr32(ms + k, 0);
-        wr32(ms + 0x00, 2);     // CtlType = ODT_LISTBOX
-        wr32(ms + 0x04, w->id); // CtlID
-        wr32(ms + 0x08, 0);     // itemID
-        host_dispatch_to_wndproc(c, w->parent, 0x002c /* WM_MEASUREITEM */, w->id, ms);
-        int32_t measured = (int32_t)rd32(ms + 0x10); // itemHeight
-        if (measured > 0)
-            ih = measured;
-        heap_free(ms);
-    }
-    *out_height = ih;
     int32_t y = 0;
-    for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i, y += ih) {
+    for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i) {
+        int32_t ih = listbox_item_height(c, w, i);
         uint32_t ds = heap_alloc(0x30, true);
         if (!ds)
             return false;
@@ -2070,16 +2125,14 @@ bool owner_draw_listbox(X86 *c, Window *w, uint32_t hwnd, uint32_t hdc, int32_t 
         wr32(ds + 0x2c, 0);                          // itemData
         uint32_t r = host_dispatch_to_wndproc(c, w->parent, 0x002b /* WM_DRAWITEM */, w->id, ds);
         heap_free(ds);
-        if (!r) {
-            *out_height = ih;
+        if (!r)
             return false;
-        }
+        y += ih;
     }
     return true;
 }
 // A listbox control with strings (LBS_HASSTRINGS): paint the rows top to
-// bottom and highlight the selected one. Item height is the 8pt system font's
-// 16 pixels, which is what MapDialogRect uses for a dialog unit's height. An
+// bottom and highlight the selected one, each at the row height above. An
 // owner-draw listbox instead hands each row to the parent's WM_DRAWITEM.
 void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
@@ -2092,17 +2145,22 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
     if (!gdi::dc_of(hdc))
         return;
     gdi::fill(hdc, {0, 0, width, height}, 0x00ffffff);
-    int32_t ih = 16;
-    bool owner_draw = owner_draw_listbox(c, w, hwnd, hdc, width, height, &ih);
+    bool drawn = owner_draw_listbox(c, w, hwnd, hdc, width, height);
+    if (drawn) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
     int32_t y = 0;
-    for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i, y += ih) {
-        if (owner_draw)
-            continue; // the parent drew this row
+    for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i) {
+        int32_t ih = listbox_item_height(c, w, i);
         if (i == w->list_sel)
             gdi::fill(hdc, {0, y, width, y + ih}, 0x00c00000);
         uint32_t units = wide_units(w->list_items[i]);
-        if (!units)
+        if (!units) {
+            y += ih;
             continue;
+        }
         if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
             wr32(block + 0, 2);
             wr32(block + 4, y);
@@ -2112,6 +2170,7 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
             gdi::draw_text(hdc, block + 16, units, block, 0x24 /* DT_SINGLELINE|DT_VCENTER */);
             heap_free(block);
         }
+        y += ih;
     }
     if (!into)
         gdi_release_window_dc(hwnd, hdc);
@@ -2172,6 +2231,9 @@ void control_proc(X86 *c) {
             if (i < 0 || i > int32_t(w->list_items.size()))
                 i = int32_t(w->list_items.size());
             w->list_items.insert(w->list_items.begin() + i, gm_str(arg(c, 3)));
+            // Inserting shifts every later row's index; the per-row height cache
+            // is keyed by index, so drop it and measure the moved rows again.
+            w->list_item_heights.clear();
             w->update_pending = true;
             set_eax(c, uint32_t(i));
         } else {
@@ -2184,6 +2246,7 @@ void control_proc(X86 *c) {
             w->list_items.clear();
             w->list_sel = -1;
             w->list_top = 0;
+            w->list_item_heights.clear();
             w->update_pending = true;
         }
         set_eax(c, 0);
@@ -2215,6 +2278,9 @@ void control_proc(X86 *c) {
     }
     case 0x018b: // LB_GETCOUNT
         set_eax(c, w ? uint32_t(w->list_items.size()) : 0);
+        return;
+    case 0x018e: // LB_GETTOPINDEX
+        set_eax(c, w ? uint32_t(w->list_top) : 0);
         return;
     case 0x018f: { // LB_FINDSTRING: first item after the start with the prefix
         std::string want = gm_str(arg(c, 3));
@@ -2248,6 +2314,70 @@ void control_proc(X86 *c) {
         set_eax(c, found < 0 ? 0xffffffffu : uint32_t(found));
         return;
     }
+    case 0x0197: // LB_SETTOPINDEX
+        if (w) {
+            int32_t t = int32_t(arg(c, 2));
+            int32_t n = int32_t(w->list_items.size());
+            w->list_top = t < 0 ? 0 : (t > n ? n : t);
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    // The row rectangle is the same geometry the hit test and the paint use, so
+    // a caller asking where row k is gets the band a click there would select.
+    case 0x0198: { // LB_GETITEMRECT
+        int32_t i = int32_t(arg(c, 2));
+        uint32_t rp = arg(c, 3);
+        if (!w || i < 0 || i >= int32_t(w->list_items.size()) || !gm_valid(rp, 16)) {
+            set_eax(c, 0xffffffffu); // LB_ERR on a bad index
+            return;
+        }
+        int32_t top = listbox_item_top(c, w, i);
+        wr32(rp + 0, 0);
+        wr32(rp + 4, uint32_t(top));
+        wr32(rp + 8, uint32_t(w->w));
+        wr32(rp + 12, uint32_t(top + listbox_item_height(c, w, i)));
+        set_eax(c, 1);
+        return;
+    }
+    case 0x01a0: { // LB_SETITEMHEIGHT: an explicit height overrides WM_MEASUREITEM
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        int32_t i = int32_t(arg(c, 2)), h = int32_t(arg(c, 3));
+        if (w->style & 0x20) { // LBS_OWNERDRAWVARIABLE sets one row
+            if (i < 0) {
+                set_eax(c, 0xffffffffu);
+                return;
+            }
+            if (int32_t(w->list_item_heights.size()) <= i)
+                w->list_item_heights.resize(i + 1, 0);
+            w->list_item_heights[i] = h;
+        } else {
+            w->list_item_height = h; // the box has a single height
+        }
+        w->update_pending = true;
+        set_eax(c, 0);
+        return;
+    }
+    case 0x01a1: { // LB_GETITEMHEIGHT
+        set_eax(c, w ? uint32_t(listbox_item_height(c, w, int32_t(arg(c, 2)))) : 0xffffffffu);
+        return;
+    }
+    case 0x01a9: { // LB_ITEMFROMPOINT: LOWORD row, HIWORD non-zero when outside
+        int32_t x = int16_t(arg(c, 3) & 0xffff);
+        int32_t y = int16_t((arg(c, 3) >> 16) & 0xffff);
+        if (!w) {
+            set_eax(c, 0x10000u); // no rows: 0xffff index, outside the client area
+            return;
+        }
+        bool outside = x < 0 || x >= w->w || y < 0 || y >= w->h;
+        int32_t idx = outside ? -1 : listbox_item_from_y(c, w, y);
+        uint32_t out = idx < 0 ? 0xffffu : uint32_t(idx);
+        set_eax(c, out | (outside ? 0x10000u : 0u));
+        return;
+    }
     case 0x00f1: // BM_SETCHECK
         if (w)
             w->userdata = arg(c, 2);
@@ -2262,8 +2392,11 @@ void control_proc(X86 *c) {
     case 0x0201: // WM_LBUTTONDOWN: remember the press so the click is a pair
         LOGW("control: WM_LBUTTONDOWN hwnd=%08x id=%u", hwnd, w ? w->id : 0);
         if (w && w->cls == "listbox") {
-            int32_t row = w->list_top + (int16_t((arg(c, 3) >> 16) & 0xffff) / 16);
-            if (row >= 0 && row < int32_t(w->list_items.size()) && row != w->list_sel) {
+            // The click row comes from the same heights the paint and
+            // LB_GETITEMRECT use; a hard 16 px divisor here selected the wrong
+            // row once WM_MEASUREITEM gave the box a different height.
+            int32_t row = listbox_item_from_y(c, w, int16_t((arg(c, 3) >> 16) & 0xffff));
+            if (row >= 0 && row != w->list_sel) {
                 w->list_sel = row;
                 w->update_pending = true;
                 if (w->parent)

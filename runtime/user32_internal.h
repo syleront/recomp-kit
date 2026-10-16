@@ -58,6 +58,12 @@ struct Window {
     std::vector<std::string> list_items;
     int32_t list_sel = -1;
     int32_t list_top = 0;
+    // The row height is one value for drawing, hit-testing, the item rects and
+    // the scroll. It comes from LB_SETITEMHEIGHT or the parent's WM_MEASUREITEM
+    // for an owner-draw box (0 until measured); an LBS_OWNERDRAWVARIABLE box can
+    // give a different height per row, cached in list_item_heights.
+    int32_t list_item_height = 0;
+    std::vector<int32_t> list_item_heights;
 };
 
 struct Msg {
@@ -106,6 +112,10 @@ void ensure_system_classes();
 // engine's control_proc.
 void paint_control(X86 *c, uint32_t hwnd, uint32_t into);
 } // namespace user32
+// Registers the dialog control classes ("button", "edit", "listbox", ...) on
+// first use. The message loop calls it before a dialog is created; a direct
+// CreateWindowExA of a control class has to as well.
+void ensure_dialog_classes();
 void user32_wide_register();
 
 void user32_vcl_register();

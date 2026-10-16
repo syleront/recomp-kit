@@ -13,6 +13,7 @@
 #include "../discovery.h"
 #include "../memory.h"
 #include "../win32.h"
+#include "../user32_internal.h"
 #include "../../platform/os.h"
 #include "game_config.h"
 
@@ -2219,6 +2220,125 @@ static void test_synchronous_geometry(X86 *c) {
     check(g_geometry_messages == std::vector<uint32_t>({0x47}) && g_geometry_width == 560,
           "handling WM_WINDOWPOSCHANGED without DefWindowProc suppresses WM_MOVE and WM_SIZE");
     call_import(c, "USER32.dll", "DestroyWindow", {hwnd});
+}
+
+// The parent of an owner-draw listbox. It answers WM_MEASUREITEM with the row
+// height the test asks for (a fixed height, or 12+7*item for a variable box)
+// and claims WM_DRAWITEM so the owner-draw path stays selected.
+static int g_lb_measure_mode = 0; // 0 fixed, 1 variable
+static uint32_t g_lb_fixed_height = 0;
+static void listbox_owner_wndproc(X86 *c) {
+    uint32_t hwnd = arg(c, 0), msg = arg(c, 1), wp = arg(c, 2), lp = arg(c, 3);
+    if (msg == 0x002c /* WM_MEASUREITEM */) {
+        uint32_t item = rd32(lp + 8); // itemID
+        if (g_lb_measure_mode == 1)
+            wr32(lp + 0x10, 12u + item * 7u); // LBS_OWNERDRAWVARIABLE
+        else if (g_lb_fixed_height)
+            wr32(lp + 0x10, g_lb_fixed_height);
+        set_eax(c, 1);
+        return;
+    }
+    if (msg == 0x002b /* WM_DRAWITEM */) {
+        set_eax(c, 1); // handled
+        return;
+    }
+    call_import(c, "USER32.dll", "DefWindowProcA", {hwnd, msg, wp, lp});
+}
+
+static void test_listbox_ownerdraw_hit(X86 *c) {
+    section("USER32 owner-draw listbox hit test");
+    ensure_dialog_classes();
+    uint32_t proc =
+        imports_alloc_trampoline("test", "listbox_owner_wndproc", listbox_owner_wndproc, 4);
+    uint32_t cls = put_str("ListBoxOwnerTest");
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 4, proc);
+    wr32(wc + 36, cls);
+    check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0,
+          "RegisterClassA for the owner-draw parent");
+    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                  {0, cls, cls, 0x80000000u, 0, 0, 320, 400, 0, 0, 0, 0});
+    check(parent != 0, "create the owner-draw parent");
+    uint32_t lbcls = put_str("listbox");
+    const char *names[6] = {"Beach",           "Family Room", "Fantasy Castle",
+                            "Haunted Mansion", "Kitchen",     "Salon"};
+    // CreateWindowExA records the class atom as the window's class; the control
+    // procedure dispatches on the plain class name a dialog template gives its
+    // controls, so name the child after creation.
+    auto make_listbox = [&](uint32_t style, uint32_t id) -> uint32_t {
+        uint32_t h =
+            call_import(c, "USER32.dll", "CreateWindowExA",
+                        {0, lbcls, 0, 0x40000000u | style, 0, 0, 200, 300, parent, id, 0, 0});
+        if (user32::Window *lw = user32::find_window(h))
+            lw->cls = "listbox";
+        return h;
+    };
+
+    // WM_MEASUREITEM gives every row H px; a click at k*H + H/2 must select k,
+    // for every k, which the old fixed 16 px divisor did not.
+    uint32_t lb = make_listbox(0x10u /* LBS_OWNERDRAWFIXED */, 101);
+    check(lb != 0, "create an LBS_OWNERDRAWFIXED listbox");
+    for (const char *n : names)
+        call_import(c, "USER32.dll", "SendMessageA",
+                    {lb, 0x0180 /* LB_ADDSTRING */, 0, put_str(n)});
+    check(call_import(c, "USER32.dll", "SendMessageA", {lb, 0x018b /* LB_GETCOUNT */, 0, 0}) == 6,
+          "the listbox holds six rows");
+    g_lb_measure_mode = 0;
+    g_lb_fixed_height = 40;
+    for (int k = 0; k < 6; ++k) {
+        int32_t y = k * 40 + 20;
+        call_import(c, "USER32.dll", "SendMessageA",
+                    {lb, 0x0201 /* WM_LBUTTONDOWN */, 1, uint32_t(y << 16) | 5u});
+        check(call_import(c, "USER32.dll", "SendMessageA", {lb, 0x0188 /* LB_GETCURSEL */, 0, 0}) ==
+                  uint32_t(k),
+              "a click at y=%d selects row %d", y, k);
+    }
+    uint32_t rect = scratch_block(16);
+    check(call_import(c, "USER32.dll", "SendMessageA",
+                      {lb, 0x0198 /* LB_GETITEMRECT */, 3, rect}) == 1 &&
+              rd32(rect + 4) == 120 && rd32(rect + 12) == 160,
+          "LB_GETITEMRECT row 3 is [%u,%u]", rd32(rect + 4), rd32(rect + 12));
+    // Point (x=5, y=50) with 40 px rows: index 1, HIWORD 0 (inside).
+    check(call_import(c, "USER32.dll", "SendMessageA",
+                      {lb, 0x01a9 /* LB_ITEMFROMPOINT */, 0, (50u << 16) | 5u}) == 1,
+          "LB_ITEMFROMPOINT(5,50) is row 1 inside the client area");
+
+    // An explicit LB_SETITEMHEIGHT overrides the measured height everywhere.
+    check(call_import(c, "USER32.dll", "SendMessageA",
+                      {lb, 0x01a0 /* LB_SETITEMHEIGHT */, 0, 20}) == 0,
+          "LB_SETITEMHEIGHT succeeds");
+    check(call_import(c, "USER32.dll", "SendMessageA", {lb, 0x01a1 /* LB_GETITEMHEIGHT */, 0, 0}) ==
+              20,
+          "LB_GETITEMHEIGHT returns the override");
+    call_import(c, "USER32.dll", "SendMessageA", {lb, 0x0201, 1, (30u << 16) | 5u});
+    check(call_import(c, "USER32.dll", "SendMessageA", {lb, 0x0188, 0, 0}) == 1,
+          "an override of 20 px puts a click at y=30 on row 1");
+
+    // LBS_OWNERDRAWVARIABLE: row i is 12+7*i px (tops 0,12,31,57). The click,
+    // LB_GETITEMRECT and LB_GETITEMHEIGHT all read the per-row height.
+    g_lb_measure_mode = 1;
+    uint32_t vlb = make_listbox(0x20u /* LBS_OWNERDRAWVARIABLE */, 102);
+    check(vlb != 0, "create an LBS_OWNERDRAWVARIABLE listbox");
+    for (int i = 0; i < 4; ++i)
+        call_import(c, "USER32.dll", "SendMessageA", {vlb, 0x0180, 0, put_str(names[i])});
+    check(call_import(c, "USER32.dll", "SendMessageA", {vlb, 0x01a1, 0, 0}) == 12 &&
+              call_import(c, "USER32.dll", "SendMessageA", {vlb, 0x01a1, 1, 0}) == 19,
+          "LBS_OWNERDRAWVARIABLE gives row 0 12 px and row 1 19 px");
+    check(call_import(c, "USER32.dll", "SendMessageA", {vlb, 0x0198, 2, rect}) == 1 &&
+              rd32(rect + 4) == 31 && rd32(rect + 12) == 57,
+          "variable LB_GETITEMRECT row 2 is [%u,%u]", rd32(rect + 4), rd32(rect + 12));
+    struct {
+        int32_t y, row;
+    } cases[4] = {{5, 0}, {20, 1}, {44, 2}, {60, 3}};
+    for (auto &e : cases) {
+        call_import(c, "USER32.dll", "SendMessageA", {vlb, 0x0201, 1, uint32_t(e.y << 16) | 5u});
+        check(call_import(c, "USER32.dll", "SendMessageA", {vlb, 0x0188, 0, 0}) == uint32_t(e.row),
+              "variable box: a click at y=%d selects row %d", e.y, e.row);
+    }
+
+    call_import(c, "USER32.dll", "DestroyWindow", {vlb});
+    call_import(c, "USER32.dll", "DestroyWindow", {lb});
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
 }
 
 static void test_windows(X86 *c) {
@@ -6888,6 +7008,7 @@ int main(int argc, char **argv) {
     test_midi(c);
     test_windows(c);
     test_synchronous_geometry(c);
+    test_listbox_ownerdraw_hit(c);
     test_guest_thunks(c);
     test_callbacks(c);
     test_scheduling(c);
