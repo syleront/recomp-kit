@@ -1351,6 +1351,116 @@ void ms_istrstream_str_ctor(X86 *c) {
     wi(ios_of(obj) + IOS_DELBUF, 1);
     set_eax(c, obj);
 }
+// --- Imports reached only from content modules (aux PEs) --------------------
+// Petz 5.exe imports 55 MSVCIRT names; a content module (a .toy/.env/.cat/.dog)
+// imports a few more from the same VC6 library. The object model is identical,
+// so each shim reuses the helpers above.
+void ms_ostream_put(X86 *c);
+void ms_ostream_write(X86 *c);
+void ms_ostream_print_char(X86 *c);
+void ms_istream_read(X86 *c);
+void ms_istrstream_strn_ctor(X86 *c) {
+    // istrstream(char *s, int n): the same object as the char* form but with an
+    // explicit buffer length instead of strlen.
+    uint32_t obj = c->r[R_ECX];
+    uint32_t str = arg(c, 0);
+    int len = (int32_t)arg(c, 1);
+    int virt_init = (int32_t)arg(c, 2);
+    uint32_t ssb = heap_alloc(SS_SIZE, true);
+    strstreambuf_buffer_ctor_impl(ssb, str, len, 0);
+    istream_sb_ctor_impl(c, obj, ssb, virt_init);
+    wi(ios_of(obj) + IOS_DELBUF, 1);
+    set_eax(c, obj);
+}
+void ms_istream_vbase_dtor(X86 *c) {
+    istream_vbase_dtor_impl(c, c->r[R_ECX]);
+    set_eax(c, 0);
+}
+void ms_ostrstream_vbase_dtor(X86 *c) {
+    ostream_vbase_dtor_impl(c, c->r[R_ECX]);
+    set_eax(c, 0);
+}
+void ms_ios_eof(X86 *c) {
+    set_eax(c, (uint32_t)(gi(ios_of(c->r[R_ECX]) + IOS_STATE) & ST_EOF));
+}
+void ms_ios_fail(X86 *c) {
+    set_eax(c, (uint32_t)(gi(ios_of(c->r[R_ECX]) + IOS_STATE) & (ST_FAIL | ST_BAD)));
+}
+void ms_ios_good(X86 *c) {
+    set_eax(c, (uint32_t)(gi(ios_of(c->r[R_ECX]) + IOS_STATE) == ST_GOOD));
+}
+void ms_ios_clear(X86 *c) {
+    ios_setstate(ios_of(c->r[R_ECX]), (int32_t)arg(c, 0));
+    set_eax(c, 0);
+}
+void ms_istream_gcount(X86 *c) {
+    set_eax(c, (uint32_t)gi(c->r[R_ECX] + IST_COUNT));
+}
+// The filebuf behind an ifstream/ofstream: its fd is the open state.
+uint32_t stream_filebuf(uint32_t obj) {
+    uint32_t io = ios_of(obj);
+    return io ? sb_of_ios(io) : 0;
+}
+void ms_ifstream_is_open(X86 *c) {
+    uint32_t fb = stream_filebuf(c->r[R_ECX]);
+    set_eax(c, (uint32_t)(fb && fb_fd(fb) >= 0));
+}
+void ms_ifstream_fd(X86 *c) {
+    uint32_t fb = stream_filebuf(c->r[R_ECX]);
+    set_eax(c, (uint32_t)(fb ? fb_fd(fb) : -1));
+}
+void ms_ofstream_setmode(X86 *c) {
+    uint32_t fb = stream_filebuf(c->r[R_ECX]);
+    int mode = (int32_t)arg(c, 0);
+    if (!fb || (mode != 0x4000 && mode != 0x8000)) { // _O_TEXT / _O_BINARY
+        set_eax(c, 0xffffffffu);
+        return;
+    }
+    if ((int32_t)vt0(c, fb, VT_SYNC) == VEOF) {
+        set_eax(c, 0xffffffffu);
+        return;
+    }
+    g_fb_text[fb] = mode == 0x4000;
+    set_eax(c, (uint32_t)mode);
+}
+void ms_ostrstream_str(X86 *c) {
+    uint32_t s = sb_of_ios(ios_of(c->r[R_ECX]));
+    if (s)
+        wi(s + SS_DYNAMIC, 0); // freeze(1), then hand back the buffer
+    set_eax(c, s ? sb_base(s) : 0);
+}
+void ms_streambuf_sputc(X86 *c) {
+    set_eax(c, (uint32_t)sb_sputc(c, c->r[R_ECX], (int32_t)arg(c, 0)));
+}
+void ms_streambuf_setp(X86 *c) {
+    sb_setp(c->r[R_ECX], arg(c, 0), arg(c, 1));
+    set_eax(c, 0);
+}
+void ms_streambuf_pptr(X86 *c) {
+    set_eax(c, sb_pptr(c->r[R_ECX]));
+}
+void ms_streambuf_epptr(X86 *c) {
+    set_eax(c, sb_epptr(c->r[R_ECX]));
+}
+void ms_streambuf_pbase(X86 *c) {
+    set_eax(c, sb_pbase(c->r[R_ECX]));
+}
+void ms_istream_sb_ctor(X86 *c) {
+    istream_sb_ctor_impl(c, c->r[R_ECX], arg(c, 0), (int32_t)arg(c, 1));
+    set_eax(c, c->r[R_ECX]);
+}
+void ms_strstreambuf_buffer_ctor(X86 *c) {
+    strstreambuf_buffer_ctor_impl(c->r[R_ECX], arg(c, 0), (int32_t)arg(c, 1), arg(c, 2));
+    set_eax(c, c->r[R_ECX]);
+}
+void ms_strstreambuf_dtor(X86 *c) {
+    strstreambuf_dtor_impl(c->r[R_ECX]);
+    set_eax(c, 0);
+}
+void ms_ostream_manip(X86 *c) {
+    uint32_t obj = c->r[R_ECX];
+    set_eax(c, guest_call(c, arg(c, 0), obj));
+}
 void ms_ostrstream_ctor(X86 *c) {
     uint32_t obj = c->r[R_ECX];
     int virt_init = (int32_t)arg(c, 0);
@@ -1994,6 +2104,35 @@ const ImportShim shims[] = {
     TC("?peek@istream@@QAEHXZ", 0, ms_istream_peek),
     TC("?setbuf@streambuf@@UAEPAV1@PADH@Z", 2, ms_streambuf_setbuf),
     TC("??0streambuf@@IAE@XZ", 0, ms_streambuf_ctor),
+
+    // Imports reached only from content modules (aux PEs). See the block above.
+    TC("??0istrstream@@QAE@PADH@Z", 3, ms_istrstream_strn_ctor),
+    TC("??_Distrstream@@QAEXXZ", 0, ms_istream_vbase_dtor),
+    TC("??_Dostrstream@@QAEXXZ", 0, ms_ostrstream_vbase_dtor),
+    TC("??_Distream@@QAEXXZ", 0, ms_istream_vbase_dtor),
+    TC("?eof@ios@@QBEHXZ", 0, ms_ios_eof),
+    TC("?fail@ios@@QBEHXZ", 0, ms_ios_fail),
+    TC("?good@ios@@QBEHXZ", 0, ms_ios_good),
+    TC("?clear@ios@@QAEXH@Z", 1, ms_ios_clear),
+    TC("?gcount@istream@@QBEHXZ", 0, ms_istream_gcount),
+    TC("?is_open@ifstream@@QBEHXZ", 0, ms_ifstream_is_open),
+    TC("?is_open@ofstream@@QBEHXZ", 0, ms_ifstream_is_open),
+    TC("?fd@ifstream@@QBEHXZ", 0, ms_ifstream_fd),
+    TC("?setmode@ofstream@@QAEHH@Z", 1, ms_ofstream_setmode),
+    TC("?str@ostrstream@@QAEPADXZ", 0, ms_ostrstream_str),
+    TC("?put@ostream@@QAEAAV1@D@Z", 1, ms_ostream_put),
+    TC("??6ostream@@QAEAAV0@D@Z", 1, ms_ostream_print_char),
+    TC("?write@ostream@@QAEAAV1@PBEH@Z", 2, ms_ostream_write),
+    TC("?read@istream@@QAEAAV1@PAEH@Z", 2, ms_istream_read),
+    TC("?sputc@streambuf@@QAEHH@Z", 1, ms_streambuf_sputc),
+    TC("?setp@streambuf@@IAEXPAD0@Z", 2, ms_streambuf_setp),
+    TC("?pptr@streambuf@@IBEPADXZ", 0, ms_streambuf_pptr),
+    TC("?epptr@streambuf@@IBEPADXZ", 0, ms_streambuf_epptr),
+    TC("?pbase@streambuf@@IBEPADXZ", 0, ms_streambuf_pbase),
+    TC("??0istream@@QAE@PAVstreambuf@@@Z", 2, ms_istream_sb_ctor),
+    TC("??0strstreambuf@@QAE@PADH0@Z", 3, ms_strstreambuf_buffer_ctor),
+    TC("??1strstreambuf@@UAE@XZ", 0, ms_strstreambuf_dtor),
+    TC("??6ostream@@QAEAAV0@P6AAAV0@AAV0@@Z@Z", 1, ms_ostream_manip),
 
     // Virtual base implementations the guest vtables point at but the exe does
     // not import by name.

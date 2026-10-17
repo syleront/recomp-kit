@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Implement the MSVCIRT entry points a content module imports but the
+  executable does not. A content module (a `.toy`/`.env`/`.cat`/`.dog`) is a
+  separate PE that imports a few more names from the same VC6 old-iostreams
+  library; an unregistered name returned 0 and the caller then crashed. The
+  Playscene Editor (`Editor.env`) was one: its `istrstream(char*, int)`
+  constructor, its scalar/vbase destructors and its `ios` state accessors are
+  now bound, and opening the Editor no longer faults. The rest of the module
+  library's surface (state predicates, `streambuf` put/get pointers, the
+  `ostrstream`/`strstreambuf` forms) is bound the same way.
 - Draw a dialog's group boxes (`BS_GROUPBOX`). The BUTTON class fell through to
   the STATIC caption path, whose `text_flags` returns 0 for a button style, so a
   group box drew neither its etched frame nor its caption and a dialog's
