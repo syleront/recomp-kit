@@ -69,10 +69,36 @@ struct Window {
     // window. Both are honoured where the window surfaces are composited.
     uint32_t layered_flags = 0, layered_key = 0, layered_alpha = 255;
     // Listbox content (LB_ADDSTRING and friends). A dialog listbox has strings
-    // and one selection; the engine paints them and a click selects one.
+    // and one selection; the engine paints them and a click selects one. A
+    // combo box's drop-down and a tab control's tabs share the same model, since
+    // none of the three ever coexists on one window.
     std::vector<std::string> list_items;
     int32_t list_sel = -1;
     int32_t list_top = 0;
+    // A range control's model, shared by the trackbar, the scrollbar and the
+    // up-down: `range_min`/`range_max` are the inclusive bounds, `range_pos` the
+    // current value, `range_page` a page step and `range_line` a line step. The
+    // progress bar uses min/max/pos too.
+    int32_t range_min = 0, range_max = 100, range_pos = 0;
+    int32_t range_page = 0, range_line = 1; // 0 = the class default page step
+    // A combo box's dropped state and the row the pointer is over while it is
+    // open (`combo_hot`, -1 when none).
+    bool combo_open = false;
+    int32_t combo_hot = -1;
+    // A combo box's DROPPED height in pixels (the template's cy for a drop-down;
+    // Windows creates the control at its one-row closed height and the list
+    // extends to this). Zero for a non-combo window.
+    int32_t combo_drop_h = 0;
+    // The combo's open drop-down: a top-level popup window with its own surface,
+    // so the list is composited over the dialog rather than drawn into it (a
+    // control's DC is clipped to its own rectangle, and a dialog's client may be
+    // transparent). Zero when closed.
+    uint32_t combo_popup = 0;
+    // An up-down's buddy edit (UDM_SETBUDDY) and its number base.
+    uint32_t spin_buddy = 0;
+    int32_t spin_base = 10;
+    // A trackbar/scrollbar thumb drag in progress.
+    bool thumb_drag = false;
     // The row height is one value for drawing, hit-testing, the item rects and
     // the scroll. It comes from LB_SETITEMHEIGHT or the parent's WM_MEASUREITEM
     // for an owner-draw box (0 until measured); an LBS_OWNERDRAWVARIABLE box can
@@ -161,6 +187,24 @@ int32_t dialog_map_unit(int32_t dlu, int32_t base, int32_t denom);
 std::vector<uint32_t> window_z_order(uint32_t parent);
 void reorder_window(uint32_t hwnd, uint32_t after);
 void pump_mouse_input(X86 *c);
+// Mouse capture (SetCapture): the window that receives every pointer message
+// regardless of where the pointer is. Exposed so a runtime-owned control that
+// needs the pointer (a combo box's open drop-down) can take it, and the input
+// pump can release it when the drag/drop finishes.
+void set_capture_window(uint32_t hwnd);
+uint32_t capture_window();
+// A framed dialog's non-client hit test, exactly as DefWindowProc answers
+// WM_NCHITTEST: HTCLOSE on the close box, HTCAPTION on the caption, HTBORDER on
+// the frame, HTCLIENT in the client area. `x`/`y` are CLIENT coordinates (a
+// point in the non-client area is negative or past the client size).
+int32_t dialog_hit_test(const Window *w, int32_t x, int32_t y);
+// A caption drag (Windows' HTCAPTION move loop): begin it at a screen point on
+// a framed dialog's caption, move the window with the pointer, and end it on
+// the button release. The input pump drives all three.
+bool dialog_begin_move(X86 *c, uint32_t hwnd, int32_t screen_x, int32_t screen_y);
+void dialog_move_to(X86 *c, int32_t screen_x, int32_t screen_y);
+void dialog_end_move();
+bool dialog_move_active();
 void forget_window_services(uint32_t hwnd);
 bool destroy_window(X86 *c, uint32_t hwnd);
 // Ask every visible window to repaint: what a hidden or destroyed window

@@ -2781,6 +2781,246 @@ static void test_group_box(X86 *c) {
     call_import(c, "USER32.dll", "DestroyWindow", {parent});
 }
 
+// A dialog/control parent that records the scroll and command notifications a
+// range control or a combo box sends it.
+static uint32_t g_range_scroll_msg = 0, g_range_scroll_code = 0, g_range_scroll_pos = 0;
+static uint32_t g_range_cmd = 0;
+static void range_parent_proc(X86 *c) {
+    uint32_t hwnd = arg(c, 0), msg = arg(c, 1), wp = arg(c, 2), lp = arg(c, 3);
+    if (msg == 0x0114 /*WM_HSCROLL*/ || msg == 0x0115 /*WM_VSCROLL*/) {
+        g_range_scroll_msg = msg;
+        g_range_scroll_code = wp & 0xffff;
+        g_range_scroll_pos = wp >> 16;
+        set_eax(c, 0);
+        return;
+    }
+    if (msg == 0x0111 /*WM_COMMAND*/ || msg == 0x004e /*WM_NOTIFY*/) {
+        g_range_cmd = wp;
+        set_eax(c, 0);
+        return;
+    }
+    call_import(c, "USER32.dll", "DefWindowProcA", {hwnd, msg, wp, lp});
+}
+// A window procedure that answers WM_NCHITTEST through DefWindowProc, so the
+// runtime's own hit test is what comes back.
+static void nchit_proc(X86 *c) {
+    uint32_t hwnd = arg(c, 0), msg = arg(c, 1), wp = arg(c, 2), lp = arg(c, 3);
+    set_eax(c, call_import(c, "USER32.dll", "DefWindowProcA", {hwnd, msg, wp, lp}));
+}
+
+// The common controls a dialog template names by class: a trackbar, a combo box,
+// a progress bar, an up-down, a tab control and a scrollbar. Each is a window
+// with its own class and message set, painted into its parent's surface.
+static void test_range_and_common_controls(X86 *c) {
+    section("USER32 range and common controls");
+    ensure_dialog_classes();
+    uint32_t cls = put_str("RTRangeParent");
+    uint32_t proc = imports_alloc_trampoline("test", "rt_range_parent", range_parent_proc, 4);
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 0, 0);
+    wr32(wc + 4, proc);
+    wr32(wc + 36, cls);
+    check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0, "register the range parent");
+    uint32_t parent =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, cls, cls, 0x80000000u | 0x10000000u, 0, 0, 320, 300, 0, 0, 0, 0});
+    check(parent != 0, "create the range parent");
+    // CreateWindowExA records the class atom as the window's class; the control
+    // procedure dispatches on the plain class name, so name the child after
+    // creation, exactly as a dialog template's class name does.
+    auto make = [&](const char *cn, uint32_t style, int32_t x, int32_t y, int32_t w, int32_t h,
+                    uint32_t id) -> uint32_t {
+        uint32_t cname = put_str(cn);
+        uint32_t child = call_import(c, "USER32.dll", "CreateWindowExA",
+                                     {0, cname, 0, 0x40000000u | 0x10000000u | style, uint32_t(x),
+                                      uint32_t(y), uint32_t(w), uint32_t(h), parent, id, 0, 0});
+        if (user32::Window *cw = user32::find_window(child))
+            cw->cls = cn;
+        return child;
+    };
+    auto send = [&](uint32_t h, uint32_t m, uint32_t wp, uint32_t lp) -> uint32_t {
+        return call_import(c, "USER32.dll", "SendMessageA", {h, m, wp, lp});
+    };
+
+    // --- trackbar: range, position, a click and its WM_HSCROLL ---
+    uint32_t tb = make("msctls_trackbar32", 0, 0, 0, 200, 20, 1300);
+    check(tb != 0 && user32::find_window(tb), "create a horizontal trackbar");
+    send(tb, 0x0406 /*TBM_SETRANGE*/, 1, (100u << 16) | 0u); // min 0, max 100
+    check(send(tb, 0x0401, 0, 0) == 0 && send(tb, 0x0402, 0, 0) == 100,
+          "TBM_SETRANGE sets the inclusive bounds");
+    send(tb, 0x0405 /*TBM_SETPOS*/, 1, 25);
+    check(send(tb, 0x0400 /*TBM_GETPOS*/, 0, 0) == 25, "TBM_SETPOS is readable through TBM_GETPOS");
+    send(tb, 0x0405, 1, 250);
+    check(send(tb, 0x0400, 0, 0) == 100, "a position past the max is clamped");
+    g_range_scroll_code = 0xdead;
+    g_range_scroll_pos = 0xdead;
+    send(tb, 0x0201 /*WM_LBUTTONDOWN*/, 1, (10u << 16) | 5u); // x=5 -> min
+    check(send(tb, 0x0400, 0, 0) == 0, "a click at the left end is the minimum");
+    check(g_range_scroll_msg == 0x0114 && g_range_scroll_code == 5 && g_range_scroll_pos == 0,
+          "a trackbar drag reports WM_HSCROLL TB_THUMBTRACK (code %u pos %u)", g_range_scroll_code,
+          g_range_scroll_pos);
+    send(tb, 0x0202 /*WM_LBUTTONUP*/, 0, 0);
+    check(g_range_scroll_code == 8, "the release reports TB_ENDTRACK (code %u)",
+          g_range_scroll_code);
+    send(tb, 0x0201, 1, (10u << 16) | 195u); // x=195 -> max
+    check(send(tb, 0x0400, 0, 0) == 100, "a click at the right end is the maximum");
+    send(tb, 0x0202, 0, 0);
+
+    // --- combo box: items, selection, the open drop-down and a row click ---
+    uint32_t cb = make("combobox", 3 /*CBS_DROPDOWNLIST*/, 0, 30, 120, 20, 1301);
+    check(cb != 0, "create a drop-down-list combo box");
+    for (const char *s : {"One", "Two", "Three"})
+        send(cb, 0x0143 /*CB_ADDSTRING*/, 0, put_str(s));
+    check(send(cb, 0x0146 /*CB_GETCOUNT*/, 0, 0) == 3, "CB_ADDSTRING builds the item list");
+    check(send(cb, 0x014e /*CB_SETCURSEL*/, 1, 0) == 1 &&
+              send(cb, 0x0147 /*CB_GETCURSEL*/, 0, 0) == 1,
+          "CB_SETCURSEL is readable through CB_GETCURSEL");
+    check(user32::find_window(cb)->title_utf8 == "Two",
+          "a drop-down list shows the selection in its closed field");
+    uint32_t buf = scratch_block(32);
+    send(cb, 0x0148 /*CB_GETLBTEXT*/, 2, buf);
+    check(strcmp(reinterpret_cast<const char *>(g_mem + buf), "Three") == 0,
+          "CB_GETLBTEXT returns the item text");
+    send(cb, 0x0201, 1, (5u << 16) | 5u); // click the closed field -> open
+    check(user32::find_window(cb)->combo_open, "a click opens the drop-down");
+    uint32_t pop = user32::find_window(cb)->combo_popup;
+    check(pop != 0 && user32::find_window(pop), "the drop-down is a popup window");
+    check(user32::find_window(pop)->list_items.size() == 3, "the popup lists the items");
+    check(user32::capture_window() == pop, "the popup takes the pointer capture");
+    send(cb, 0x0202, 0, 0); // the opening click's release does not select
+    check(user32::find_window(cb)->combo_open, "the opening release leaves it open");
+    g_range_cmd = 0;
+    // Row 2 of the popup starts at 1 + 2*16 = 33; y=41 is on it.
+    send(pop, 0x0201, 1, (41u << 16) | 5u);
+    check(!user32::find_window(cb)->combo_open, "clicking a row closes the drop-down");
+    check(user32::find_window(cb)->combo_popup == 0 && !user32::find_window(pop),
+          "the popup window is destroyed");
+    check(send(cb, 0x0147, 0, 0) == 2 && user32::find_window(cb)->title_utf8 == "Three",
+          "the clicked row becomes the selection");
+    check((g_range_cmd >> 16) == 1 /*CBN_SELCHANGE*/, "the combo reports CBN_SELCHANGE (got %u)",
+          g_range_cmd >> 16);
+    check(user32::capture_window() == 0, "closing the drop-down releases the pointer capture");
+    send(cb, 0x014b /*CB_RESETCONTENT*/, 0, 0);
+    check(send(cb, 0x0146, 0, 0) == 0, "CB_RESETCONTENT empties the list");
+
+    // --- progress bar ---
+    uint32_t pb = make("msctls_progress32", 0, 0, 60, 120, 20, 1302);
+    check(pb != 0, "create a progress bar");
+    send(pb, 0x0406 /*PBM_SETRANGE32*/, 0, 200);
+    send(pb, 0x0402 /*PBM_SETPOS*/, 50, 0);
+    check(send(pb, 0x0408 /*PBM_GETPOS*/, 0, 0) == 50, "PBM_SETPOS is readable through PBM_GETPOS");
+    send(pb, 0x0404 /*PBM_SETSTEP*/, 25, 0);
+    send(pb, 0x0405 /*PBM_STEPIT*/, 0, 0);
+    check(send(pb, 0x0408, 0, 0) == 75, "PBM_STEPIT advances by the step");
+    send(pb, 0x0403 /*PBM_DELTAPOS*/, uint32_t(-100), 0);
+    check(send(pb, 0x0408, 0, 0) == 0, "PBM_DELTAPOS clamps at the minimum");
+
+    // --- up-down (spin) ---
+    uint32_t sp = make("msctls_updown32", 0, 0, 90, 20, 20, 1303);
+    check(sp != 0, "create an up-down");
+    send(sp, 0x046f /*UDM_SETRANGE32*/, 0, 10);
+    send(sp, 0x0471 /*UDM_SETPOS32*/, 5, 0);
+    check(send(sp, 0x0472 /*UDM_GETPOS32*/, 0, 0) == 5, "UDM_SETPOS32 round trips");
+    send(sp, 0x0201 /*WM_LBUTTONDOWN*/, 1, (2u << 16) | 10u); // top half -> +1
+    check(send(sp, 0x0472, 0, 0) == 6, "the up arrow increments");
+    send(sp, 0x0201, 1, (18u << 16) | 10u); // bottom half -> -1
+    check(send(sp, 0x0472, 0, 0) == 5, "the down arrow decrements");
+
+    // --- tab control ---
+    uint32_t tab = make("systabcontrol32", 0, 0, 120, 160, 80, 1304);
+    check(tab != 0, "create a tab control");
+    const char *tabnames[2] = {"Alpha", "Beta"};
+    for (int i = 0; i < 2; ++i) {
+        uint32_t item = scratch_block(28);
+        wr32(item + 0, 1u); // TCIF_TEXT
+        wr32(item + 12, put_str(tabnames[i]));
+        wr32(item + 16, 16);
+        send(tab, 0x1307 /*TCM_INSERTITEM*/, uint32_t(i), item);
+    }
+    check(send(tab, 0x1304 /*TCM_GETITEMCOUNT*/, 0, 0) == 2, "TCM_INSERTITEM builds the tabs");
+    send(tab, 0x130c /*TCM_SETCURSEL*/, 1, 0);
+    check(send(tab, 0x130b /*TCM_GETCURSEL*/, 0, 0) == 1, "TCM_SETCURSEL round trips");
+    uint32_t gitem = scratch_block(28), gtext = scratch_block(16);
+    wr32(gitem + 0, 1u);
+    wr32(gitem + 12, gtext);
+    wr32(gitem + 16, 16);
+    check(send(tab, 0x1305 /*TCM_GETITEM*/, 1, gitem) == 1 &&
+              strcmp(reinterpret_cast<const char *>(g_mem + gtext), "Beta") == 0,
+          "TCM_GETITEM returns the tab text");
+
+    // --- scrollbar control ---
+    uint32_t sb = make("scrollbar", 0, 0, 150, 160, 16, 1305);
+    check(sb != 0, "create a horizontal scrollbar control");
+    send(sb, 0x00e2 /*SBM_SETRANGE*/, 0, 100);
+    send(sb, 0x00e0 /*SBM_SETPOS*/, 50, 1);
+    check(send(sb, 0x00e1 /*SBM_GETPOS*/, 0, 0) == 50, "SBM_SETPOS round trips");
+    uint32_t rlo = scratch_block(4), rhi = scratch_block(4);
+    send(sb, 0x00e3 /*SBM_GETRANGE*/, rlo, rhi);
+    check(rd32(rlo) == 0 && rd32(rhi) == 100, "SBM_GETRANGE returns the bounds");
+    g_range_scroll_code = 0xdead;
+    send(sb, 0x0201 /*WM_LBUTTONDOWN*/, 1, (8u << 16) | 4u); // the left arrow (x<16)
+    check(send(sb, 0x00e1, 0, 0) == 49, "the left arrow scrolls one line");
+    check(g_range_scroll_code == 0 /*SB_LINEUP*/, "the scrollbar reports SB_LINEUP (code %u)",
+          g_range_scroll_code);
+
+    // --- radio groups (TD-081): a click clears the group's other buttons ---
+    uint32_t r1 =
+        make("button", 9u | 0x20000u /*BS_AUTORADIOBUTTON|WS_GROUP*/, 0, 180, 80, 12, 1400);
+    uint32_t r2 = make("button", 9u, 0, 194, 80, 12, 1401);
+    uint32_t r3 = make("button", 9u | 0x20000u, 0, 208, 80, 12, 1402);
+    uint32_t r4 = make("button", 9u, 0, 222, 80, 12, 1403);
+    send(r1, 0x00f1 /*BM_SETCHECK*/, 1, 0);
+    check(send(r1, 0x00f0 /*BM_GETCHECK*/, 0, 0) == 1, "the first radio is checked");
+    send(r2, 0x0202 /*WM_LBUTTONUP*/, 0, 0); // click r2
+    check(send(r1, 0x00f0, 0, 0) == 0 && send(r2, 0x00f0, 0, 0) == 1,
+          "clicking a radio clears its group sibling");
+    send(r3, 0x0202, 0, 0); // click r3 (a new group)
+    check(send(r2, 0x00f0, 0, 0) == 1, "a radio in the next WS_GROUP is unaffected");
+    send(r4, 0x0202, 0, 0); // click r4
+    check(send(r3, 0x00f0, 0, 0) == 0 && send(r4, 0x00f0, 0, 0) == 1,
+          "clicking r4 clears r3 and keeps r2");
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
+
+    // --- a dialog caption drags the window (TD-070) ---
+    uint32_t dproc = imports_alloc_trampoline("test", "rt_nchit_dialog", nchit_proc, 4);
+    uint32_t dcls = put_str("#32770");
+    uint32_t dtitle = put_str("Drag Me");
+    // WS_POPUP|WS_VISIBLE|WS_CAPTION|WS_SYSMENU.
+    uint32_t dlg =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, dcls, dtitle, 0x80000000u | 0x10000000u | 0x00c00000u | 0x00080000u, 100,
+                     120, 200, 150, 0, 0, 0, 0});
+    check(dlg != 0, "create a captioned #32770 dialog");
+    call_import(c, "USER32.dll", "SetWindowLongA", {dlg, uint32_t(-4) /*GWL_WNDPROC*/, dproc});
+    user32::Window *dw = user32::find_window(dlg);
+    check(dw && dw->nc_top == 19 && dw->nc_caption, "the dialog has a caption bar");
+    check(user32::dialog_hit_test(dw, 50, -9) == 2, "the caption is HTCAPTION");
+    check(user32::dialog_hit_test(dw, 50, 50) == 1, "the client area is HTCLIENT");
+    check(user32::dialog_hit_test(dw, -1, 50) == 18, "the left border is HTBORDER");
+    check(user32::dialog_hit_test(dw, 190, -10) == 20, "the close box is HTCLOSE");
+    // WM_NCHITTEST through the window procedure's DefWindowProc gives the same.
+    uint32_t scr = (uint32_t(uint16_t(130)) << 16) | uint16_t(150);
+    check(call_import(c, "USER32.dll", "SendMessageA", {dlg, 0x0084 /*WM_NCHITTEST*/, 0, scr}) == 2,
+          "DefWindowProc answers WM_NCHITTEST with HTCAPTION");
+    // Drag: a caption press begins the move loop, the move walks the window, the
+    // release ends it.
+    uint32_t msg = scratch_block(28);
+    host_post_mouse_message(0x0201 /*WM_LBUTTONDOWN*/, 1, 150, 130); // in the caption
+    call_import(c, "USER32.dll", "PeekMessageA", {msg, dlg, 0x200, 0x209, 1});
+    check(user32::dialog_move_active(), "a caption press begins the move loop");
+    host_post_mouse_message(0x0200 /*WM_MOUSEMOVE*/, 1, 170, 140);
+    call_import(c, "USER32.dll", "PeekMessageA", {msg, dlg, 0x200, 0x209, 1});
+    check(user32::find_window(dlg) && user32::find_window(dlg)->x == 120 &&
+              user32::find_window(dlg)->y == 130,
+          "the drag moves the window by the pointer delta (%d,%d)",
+          user32::find_window(dlg) ? user32::find_window(dlg)->x : -1,
+          user32::find_window(dlg) ? user32::find_window(dlg)->y : -1);
+    host_post_mouse_message(0x0202 /*WM_LBUTTONUP*/, 0, 170, 140);
+    call_import(c, "USER32.dll", "PeekMessageA", {msg, dlg, 0x200, 0x209, 1});
+    check(!user32::dialog_move_active(), "the release ends the move loop");
+    call_import(c, "USER32.dll", "DestroyWindow", {dlg});
+}
+
 // An edit control's text model: caret, selection and the editing keys.
 static void test_edit_text_model(X86 *c) {
     section("USER32 edit caret and selection");
@@ -7924,6 +8164,7 @@ int main(int argc, char **argv) {
     test_button_state(c);
     test_edit_click_preserves_userdata(c);
     test_group_box(c);
+    test_range_and_common_controls(c);
     test_edit_text_model(c);
     test_dialog_key_routing(c);
     test_interp_extra_ops(c);

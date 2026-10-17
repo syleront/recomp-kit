@@ -130,6 +130,17 @@ void pump_mouse_input(X86 *c) {
     } guard;
     MouseInput input = mouse_input.front();
     mouse_input.pop_front();
+    // A caption drag owns the pointer until the button is released: a move walks
+    // the window and the release ends it. Handled before the point routing
+    // because the pointer leaves the window as soon as it is dragged.
+    if (dialog_move_active()) {
+        host_set_cursor_pos(input.x, input.y);
+        if (input.message == 0x0200 /*WM_MOUSEMOVE*/)
+            dialog_move_to(c, input.x, input.y);
+        else if (input.message == 0x0202 || input.message == 0x0203) // LBUTTONUP / LBUTTONDBLCLK
+            dialog_end_move();
+        return;
+    }
     uint32_t hwnd = find_window(capture) ? capture : mouse_window(0, input.x, input.y);
     // A wheel event has no button to capture it: Windows sends it to the window
     // under the cursor, and to the focus window when the point is over none of
@@ -165,8 +176,10 @@ void pump_mouse_input(X86 *c) {
     if (!find_window(hwnd))
         return; // activation may destroy its recipient
     // A press on a framed dialog's non-client area is the frame's, not a
-    // control's: the close box cancels the dialog and the rest of the frame is
-    // swallowed (dragging a dialog by its title bar is not modelled, TD-070).
+    // control's: the close box cancels the dialog, the caption starts a move
+    // loop, and the rest of the frame is swallowed. WM_NCHITTEST tells the parts
+    // apart; the dialog procedure may answer it, and DefWindowProc's geometry
+    // answer (dialog_hit_test) is the fallback when it does not.
     if (Window *fw = find_window(hwnd)) {
         if (fw->nc_left || fw->nc_top || fw->nc_right || fw->nc_bottom) {
             int32_t cx, cy;
@@ -174,17 +187,24 @@ void pump_mouse_input(X86 *c) {
             const int32_t cxp = input.x - cx, cyp = input.y - cy;
             const bool in_client = cxp >= 0 && cyp >= 0 && cxp < fw->w && cyp < fw->h;
             if (!in_client) {
+                uint32_t hit = host_dispatch_to_wndproc(c, hwnd, 0x0084 /*WM_NCHITTEST*/, 0,
+                                                        (uint32_t(uint16_t(input.y)) << 16) |
+                                                            uint16_t(input.x));
+                if (!find_window(hwnd))
+                    return; // the hit test may have destroyed the dialog
+                // Only a meaningful non-client answer overrides the geometry; a
+                // procedure that returns 0 (HTNOWHERE, the default for an
+                // unhandled message here) keeps DefWindowProc's answer.
+                if (hit < 2 || hit > 21)
+                    hit = uint32_t(dialog_hit_test(fw, cxp, cyp));
                 if (input.message == 0x0201 /* WM_LBUTTONDOWN */) {
-                    // The close box occupies the cap_h-4 square 3 px in from
-                    // the right edge of the caption; DC coordinates here are
-                    // client-relative, the same space the chrome painter uses.
-                    const int32_t box = fw->nc_top - 4;
-                    const int32_t x1 = fw->w + fw->nc_right - 3;
-                    const int32_t y0 = -fw->nc_top + 2;
-                    if (fw->nc_caption && (fw->style & 0x00080000u) && cxp >= x1 - box &&
-                        cxp < x1 && cyp >= y0 && cyp < y0 + box) {
+                    if (hit == 20 /*HTCLOSE*/) {
                         ::close_box_request(c, hwnd); // IDCANCEL, then WM_CLOSE if unanswered
                         return;
+                    }
+                    if (hit == 2 /*HTCAPTION*/) {
+                        if (dialog_begin_move(c, hwnd, input.x, input.y))
+                            return; // the move loop owns the pointer from here
                     }
                 }
                 if (input.message >= 0x0200 && input.message <= 0x0209)
@@ -599,6 +619,21 @@ void release_capture(X86 *c) {
     capture = 0;
     set_eax(c, 1);
 }
+} // namespace
+namespace user32 {
+// The capture state, for the runtime's own controls. A combo box's open
+// drop-down takes the pointer so a click anywhere selects a row or dismisses
+// it, exactly as the class does; the shim's SetCapture above is the guest's.
+// `capture` lives in the unnamed namespace above and is visible here through
+// its implicit using-directive.
+void set_capture_window(uint32_t hwnd) {
+    capture = find_window(hwnd) ? hwnd : 0;
+}
+uint32_t capture_window() {
+    return capture;
+}
+} // namespace user32
+namespace {
 void window_at_point(X86 *c) {
     set_eax(c, mouse_window(0, int32_t(arg(c, 0)), int32_t(arg(c, 1))));
 }

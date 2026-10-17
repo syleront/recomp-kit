@@ -661,6 +661,76 @@ void u_SetWindowPos(X86 *c) {
                        int32_t(arg(c, 5)), arg(c, 6));
     set_eax(c, 1);
 }
+// A framed dialog's non-client hit test, DefWindowProc's answer to
+// WM_NCHITTEST. `x`/`y` are CLIENT coordinates: a point in the caption is
+// negative y, a point in the left border negative x, and one past the client
+// size is the right/bottom border. The close box is the same square the chrome
+// painter draws (TD-061), so what a click cancels is what the user sees.
+int32_t dialog_hit_test(const Window *w, int32_t x, int32_t y) {
+    if (!w)
+        return 0; // HTNOWHERE
+    if (x >= 0 && y >= 0 && x < w->w && y < w->h)
+        return 1; // HTCLIENT
+    const int32_t right = w->w + w->nc_right, bottom = w->h + w->nc_bottom;
+    if (x < -w->nc_left || y < -w->nc_top || x >= right || y >= bottom)
+        return 0; // HTNOWHERE: outside the window entirely
+    if (w->nc_caption && (w->style & 0x00080000u /*WS_SYSMENU*/)) {
+        const int32_t box = w->nc_top - 4;
+        const int32_t x1 = w->w + w->nc_right - 3;
+        const int32_t y0 = -w->nc_top + 2;
+        if (x >= x1 - box && x < x1 && y >= y0 && y < y0 + box)
+            return 20; // HTCLOSE
+    }
+    if (w->nc_caption && y < 0)
+        return 2; // HTCAPTION
+    return 18;    // HTBORDER
+}
+// A caption drag, Windows' HTCAPTION move loop. The runtime models it as state
+// rather than a nested message loop: the pointer capture is the pump's, and a
+// move walks the window while the button is held. That keeps the modal pump
+// (which owns the queue and the paint synthesis) untouched.
+namespace {
+uint32_t g_move_hwnd = 0;
+int32_t g_move_grab_x = 0, g_move_grab_y = 0;
+} // namespace
+bool dialog_begin_move(X86 *c, uint32_t hwnd, int32_t screen_x, int32_t screen_y) {
+    (void)c;
+    Window *w = find_window(hwnd);
+    if (!w || !w->nc_caption)
+        return false;
+    g_move_hwnd = hwnd;
+    // The offset from the window origin the caption was grabbed at, so the
+    // window does not jump to put its corner under the pointer.
+    g_move_grab_x = screen_x - w->x;
+    g_move_grab_y = screen_y - w->y;
+    return true;
+}
+void dialog_move_to(X86 *c, int32_t screen_x, int32_t screen_y) {
+    Window *w = find_window(g_move_hwnd);
+    if (!w) {
+        g_move_hwnd = 0;
+        return;
+    }
+    const int32_t nx = screen_x - g_move_grab_x, ny = screen_y - g_move_grab_y;
+    if (nx == w->x && ny == w->y)
+        return;
+    const uint32_t hwnd = g_move_hwnd;
+    const int32_t cw = w->w, ch = w->h;
+    // Move only: SWP_NOSIZE | SWP_NOZORDER. This dispatches WM_WINDOWPOSCHANGED
+    // (and so WM_MOVE) exactly as a real move does, then repaints what the
+    // dialog uncovered.
+    set_window_pos(c, w, 0, nx, ny, cw, ch, 0x0001u /*SWP_NOSIZE*/ | 0x0004u /*SWP_NOZORDER*/);
+    if (Window *after = find_window(hwnd)) {
+        after->update_pending = true;
+        repaint_exposed_windows();
+    }
+}
+void dialog_end_move() {
+    g_move_hwnd = 0;
+}
+bool dialog_move_active() {
+    return g_move_hwnd != 0;
+}
 // The bounds a window had before a display took it over, by handle.
 std::map<uint32_t, std::array<int32_t, 4>> &covered_bounds() {
     static std::map<uint32_t, std::array<int32_t, 4>> m;
@@ -1229,6 +1299,18 @@ void def_window_proc(X86 *c, bool wide) {
                        ? host_dispatch_to_wndproc(c, w->parent, msg, arg(c, 2), arg(c, 3))
                        : 1);
         return;
+    case 0x0084: { // WM_NCHITTEST: DefWindowProc answers from the frame geometry.
+        if (!w) {
+            set_eax(c, 0);
+            return;
+        }
+        const int32_t sx = int16_t(arg(c, 3) & 0xffff);
+        const int32_t sy = int16_t((arg(c, 3) >> 16) & 0xffff);
+        int32_t cx, cy;
+        client_origin(hwnd, &cx, &cy);
+        set_eax(c, uint32_t(dialog_hit_test(w, sx - cx, sy - cy)));
+        return;
+    }
     case 0x0047: { // WM_WINDOWPOSCHANGED
         uint32_t pos = arg(c, 3);
         if (w && pos) {
@@ -3181,6 +3263,807 @@ void paint_edit(X86 *c, uint32_t hwnd, uint32_t into) {
         caller->bk_mode = caller_bk_mode;
     }
 }
+// ---------------------------------------------------------------------------
+// The range controls and the common controls (trackbar, combo box, progress,
+// up-down, tab, scrollbar). Each is a control with its own class name, painted
+// into the parent's surface (a control has no surface of its own) and driven by
+// its own message set. They share the list model (`list_items`) and the range
+// model (`range_min`/`range_max`/`range_pos`) on Window.
+// ---------------------------------------------------------------------------
+// The background pixel for a control that uses the static colour protocol: the
+// parent's WM_CTLCOLORSTATIC brush, else the dialog's WM_CTLCOLORDLG brush, else
+// the classic COLOR_BTNFACE. False when the parent chose no brush at all, in
+// which case the caller leaves what is underneath. The window is re-found after
+// the dispatch because a guest handler may destroy it.
+bool control_background(X86 *c, uint32_t hwnd, uint32_t hdc, uint32_t *pixel) {
+    *pixel = gdi::argb(0x00c8d0d4); // COLOR_BTNFACE, RGB(0xD4,0xD0,0xC8)
+    Window *w = find_window(hwnd);
+    if (!w || !w->parent)
+        return false;
+    const uint32_t parent = w->parent;
+    uint32_t brush = host_dispatch_to_wndproc(c, parent, 0x0138 /*WM_CTLCOLORSTATIC*/, hdc, hwnd);
+    if (brush && gdi::brush_color(brush, pixel))
+        return true;
+    if (Window *pw = find_window(parent); pw && pw->cls == "#32770") {
+        uint32_t b = host_dispatch_to_wndproc(c, parent, 0x0131 /*WM_CTLCOLORDLG*/, hdc, parent);
+        if (b && gdi::brush_color(b, pixel))
+            return true;
+        return true; // the dialog face default
+    }
+    return false;
+}
+// A control's orientation: TBS_VERT (2) for a trackbar, SBS_VERT (1) for a
+// scrollbar, horizontal otherwise.
+bool range_vertical(const Window *w) {
+    if (w->cls == "msctls_trackbar32")
+        return (w->style & 2u) != 0;
+    if (w->cls == "scrollbar")
+        return (w->style & 1u) != 0;
+    return false;
+}
+int32_t range_thumb_length(const Window *w) {
+    return w->cls == "msctls_trackbar32" ? 11 : 16;
+}
+int32_t range_clamp(const Window *w, int32_t pos) {
+    if (pos < w->range_min)
+        return w->range_min;
+    if (pos > w->range_max)
+        return w->range_max;
+    return pos;
+}
+// The coordinate (along the axis) of the thumb's leading edge for the current
+// position: 0 at the min end. A vertical control's min is at the bottom, so the
+// coordinate is measured from the bottom there.
+int32_t range_thumb_start(const Window *w) {
+    const bool vert = range_vertical(w);
+    const int32_t span = (vert ? w->h : w->w) - range_thumb_length(w);
+    const int32_t range = w->range_max - w->range_min;
+    if (span <= 0 || range <= 0)
+        return 0;
+    int32_t t = int32_t((int64_t(w->range_pos - w->range_min) * span + range / 2) / range);
+    if (t < 0)
+        t = 0;
+    if (t > span)
+        t = span;
+    return vert ? span - t : t;
+}
+// The coordinate of a value's tick centre, for the tick marks.
+int32_t range_value_coord(const Window *w, int32_t value) {
+    const bool vert = range_vertical(w);
+    const int32_t thumb = range_thumb_length(w);
+    const int32_t span = (vert ? w->h : w->w) - thumb;
+    const int32_t range = w->range_max - w->range_min;
+    if (span <= 0 || range <= 0)
+        return thumb / 2;
+    int32_t t = int32_t((int64_t(value - w->range_min) * span + range / 2) / range);
+    if (t < 0)
+        t = 0;
+    if (t > span)
+        t = span;
+    return (vert ? span - t : t) + thumb / 2;
+}
+// The position a pointer at client (x,y) asks for.
+int32_t range_pos_from_point(const Window *w, int32_t x, int32_t y) {
+    const bool vert = range_vertical(w);
+    const int32_t thumb = range_thumb_length(w);
+    const int32_t span = (vert ? w->h : w->w) - thumb;
+    const int32_t range = w->range_max - w->range_min;
+    if (span <= 0 || range <= 0)
+        return w->range_min;
+    int32_t along = vert ? (w->h - thumb / 2 - y) : (x - thumb / 2);
+    if (along < 0)
+        along = 0;
+    if (along > span)
+        along = span;
+    return w->range_min + int32_t((int64_t(along) * range + span / 2) / span);
+}
+// A trackbar's page step: TBM_SETPAGESIZE's value, else the class default of a
+// fifth of the range.
+int32_t trackbar_page(const Window *w) {
+    if (w->range_page > 0)
+        return w->range_page;
+    const int32_t range = w->range_max - w->range_min;
+    return range > 5 ? range / 5 : 1;
+}
+// A trackbar/scrollbar move reports WM_HSCROLL or WM_VSCROLL to its parent, with
+// the notification code in the low word and (for the thumb codes) the position
+// in the high word.
+void range_notify(X86 *c, uint32_t hwnd, uint32_t code, int32_t pos) {
+    Window *w = find_window(hwnd);
+    if (!w || !w->parent)
+        return;
+    const uint32_t msg = range_vertical(w) ? 0x0115u /*WM_VSCROLL*/ : 0x0114u /*WM_HSCROLL*/;
+    const uint32_t hi = (code == 4 || code == 5) ? uint32_t(uint16_t(pos)) : 0u;
+    host_dispatch_to_wndproc(c, w->parent, msg, (hi << 16) | (code & 0xffffu), hwnd);
+}
+// A filled triangle pointing up or down, by horizontal spans (the runtime has
+// no polygon fill a control paint can reach).
+void fill_triangle(uint32_t hdc, int32_t cx, int32_t cy, int32_t half, uint32_t color, bool down) {
+    for (int32_t i = 0; i <= half; ++i) {
+        const int32_t w = half - i;
+        const int32_t y = down ? cy - half + i : cy + half - i;
+        gdi::fill(hdc, {cx - w, y, cx + w + 1, y + 1}, color);
+    }
+}
+void paint_trackbar(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    const bool vert = range_vertical(w);
+    const uint32_t style = w->style;
+    const int32_t lo = w->range_min, hi = w->range_max;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
+    uint32_t face = gdi::argb(0x00c8d0d4);
+    control_background(c, hwnd, hdc, &face);
+    gdi::fill(hdc, {0, 0, width, height}, face);
+    if (!find_window(hwnd)) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t shadow = gdi::argb(0x00808080), dark = gdi::argb(0x00404040),
+                   light = gdi::argb(0x00ffffff);
+    const int32_t thumb = range_thumb_length(w);
+    // The channel: a 4 px sunken groove down the middle.
+    if (vert) {
+        const int32_t cx = width / 2;
+        gdi::fill(hdc, {cx - 2, thumb / 2, cx + 2, height - thumb / 2}, shadow);
+        gdi::fill(hdc, {cx - 2, thumb / 2, cx - 1, height - thumb / 2}, dark);
+    } else {
+        const int32_t cy = height / 2;
+        gdi::fill(hdc, {thumb / 2, cy - 2, width - thumb / 2, cy + 2}, shadow);
+        gdi::fill(hdc, {thumb / 2, cy - 2, width - thumb / 2, cy - 1}, dark);
+    }
+    // Ticks, unless TBS_NOTICKS (0x10). TBS_AUTOTICKS (1) puts one at every
+    // step; the runtime draws at most eleven so a wide range stays readable.
+    if (!(style & 0x10u)) {
+        const int32_t range = hi - lo;
+        int32_t step = range > 0 ? (range + 10) / 11 : 1;
+        if (step < 1)
+            step = 1;
+        const bool both = (style & 8u) != 0; // TBS_BOTH
+        const bool top = (style & 4u) != 0;  // TBS_TOP (left when vertical)
+        for (int32_t v = lo; v <= hi; v += step) {
+            const int32_t coord = range_value_coord(w, v);
+            if (vert) {
+                if (both || top)
+                    gdi::fill(hdc, {width / 2 - 6, coord, width / 2 - 2, coord + 1}, shadow);
+                if (both || !top)
+                    gdi::fill(hdc, {width / 2 + 2, coord, width / 2 + 6, coord + 1}, shadow);
+            } else {
+                if (both || !top)
+                    gdi::fill(hdc, {coord, height / 2 + 2, coord + 1, height / 2 + 6}, shadow);
+                if (both || top)
+                    gdi::fill(hdc, {coord, height / 2 - 6, coord + 1, height / 2 - 2}, shadow);
+            }
+        }
+        if (range > 0 && (hi - lo) % step != 0) {
+            const int32_t coord = range_value_coord(w, hi);
+            if (vert)
+                gdi::fill(hdc, {width / 2 - 6, coord, width / 2 - 2, coord + 1}, shadow);
+            else
+                gdi::fill(hdc, {coord, height / 2 + 2, coord + 1, height / 2 + 6}, shadow);
+        }
+    }
+    // The thumb: a raised 11 px box spanning the control's cross axis, with a
+    // grip line down its middle.
+    const int32_t ts = range_thumb_start(w);
+    int32_t tl, tt, tr, tb;
+    if (vert) {
+        tl = 0;
+        tr = width;
+        tt = ts;
+        tb = ts + thumb;
+    } else {
+        tl = ts;
+        tr = ts + thumb;
+        tt = 0;
+        tb = height;
+    }
+    gdi::fill(hdc, {tl, tt, tr, tb}, face);
+    gdi::fill(hdc, {tl, tt, tr, tt + 1}, light);
+    gdi::fill(hdc, {tl, tt, tl + 1, tb}, light);
+    gdi::fill(hdc, {tl, tb - 1, tr, tb}, dark);
+    gdi::fill(hdc, {tr - 1, tt, tr, tb}, dark);
+    if (vert)
+        gdi::fill(hdc, {width / 2 - 1, tt + 3, width / 2, tb - 3}, shadow);
+    else
+        gdi::fill(hdc, {tl + 3, height / 2 - 1, tr - 3, height / 2}, shadow);
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk;
+    }
+}
+// A combo box's row height in the drop-down: CB_SETITEMHEIGHT's value, else the
+// 8x16 system line.
+int32_t combo_row_height(const Window *w) {
+    return w->list_item_height > 0 ? w->list_item_height : 16;
+}
+// The height of an open combo box's drop-down list in pixels: the template's
+// dropped height when there is one, else the rows plus a 2 px border.
+int32_t combo_drop_height(const Window *w) {
+    const int32_t rh = combo_row_height(w);
+    int32_t h = int32_t(w->list_items.size()) * rh + 2;
+    if (w->combo_drop_h > w->h)
+        h = w->combo_drop_h - w->h;
+    return h < rh + 2 ? rh + 2 : h;
+}
+// The row under client y in the popup list (y = 1 + row*row_height), or -1.
+int32_t combo_popup_row(const Window *w, int32_t y) {
+    const int32_t rh = combo_row_height(w);
+    const int32_t row = y < 1 ? -1 : (y - 1) / (rh > 0 ? rh : 1);
+    if (row < 0 || row >= int32_t(w->list_items.size()))
+        return -1;
+    return row;
+}
+// The popup list's paint: a white field with a sunken border, the rows, and the
+// selected/hot row highlighted. It is its own window, so the list never writes
+// into the dialog's surface.
+void paint_combo_popup(X86 *c, uint32_t hwnd, uint32_t into) {
+    (void)c;
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    const int32_t rh = combo_row_height(w);
+    const std::vector<std::string> items = w->list_items;
+    const int32_t sel = w->list_sel, hot = w->combo_hot;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
+    const uint32_t white = gdi::argb(0x00ffffff), shadow = gdi::argb(0x00808080),
+                   dark = gdi::argb(0x00404040), navy = gdi::argb(0x00a80000);
+    gdi::fill(hdc, {0, 0, width, height}, white);
+    gdi::fill(hdc, {0, 0, width, 1}, shadow);
+    gdi::fill(hdc, {0, 0, 1, height}, shadow);
+    gdi::fill(hdc, {0, height - 1, width, height}, dark);
+    gdi::fill(hdc, {width - 1, 0, width, height}, dark);
+    dc->bk_mode = 1; // TRANSPARENT
+    for (size_t i = 0; i < items.size(); ++i) {
+        const int32_t y = 1 + int32_t(i) * rh;
+        if (y + rh > height - 1)
+            break;
+        const bool selected = int32_t(i) == sel;
+        const bool hotrow = int32_t(i) == hot;
+        if (selected || hotrow) {
+            gdi::fill(hdc, {1, y, width - 1, y + rh}, navy);
+            dc->text_color = 0x00ffffff;
+        } else {
+            dc->text_color = 0x00000000;
+        }
+        uint32_t units = wide_units(items[i]);
+        if (units && units < (UINT32_MAX - 32) / 2) {
+            if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+                wr32(block + 0, 2);
+                wr32(block + 4, uint32_t(y));
+                wr32(block + 8, uint32_t(width - 2));
+                wr32(block + 12, uint32_t(y + rh));
+                gm_put_wstr(block + 16, items[i], units + 1);
+                gdi::draw_text(hdc, block + 16, units, block,
+                               0x24 /*DT_SINGLELINE|DT_VCENTER*/ | 0x800 /*DT_NOPREFIX*/);
+                heap_free(block);
+            }
+        }
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk;
+    }
+}
+// Close an open drop-down: destroy the popup (which repaints whatever it
+// covered) and clear the combo's state. `c` is needed for the WM_DESTROY.
+void combo_close_popup(X86 *c, uint32_t combo_hwnd) {
+    Window *w = find_window(combo_hwnd);
+    if (!w)
+        return;
+    const uint32_t pop = w->combo_popup;
+    w->combo_open = false;
+    w->combo_hot = -1;
+    w->combo_popup = 0;
+    w->update_pending = true;
+    if (pop) {
+        if (capture_window() == pop)
+            set_capture_window(0);
+        destroy_window(c, pop);
+    }
+}
+// The drop-down popup's window procedure: it paints itself and, on a press,
+// selects the row under the pointer (or dismisses when the point is off the
+// list) and reports CBN_SELCHANGE to the combo's parent.
+void combo_drop_proc(X86 *c) {
+    uint32_t hwnd = arg(c, 0), msg = arg(c, 1);
+    Window *w = find_window(hwnd);
+    switch (msg) {
+    case 0x000f: // WM_PAINT
+    case 0x0318: // WM_PRINTCLIENT
+        paint_combo_popup(c, hwnd, arg(c, 2));
+        set_eax(c, 0);
+        return;
+    case 0x0200: { // WM_MOUSEMOVE: the hot row follows the pointer
+        if (w) {
+            const int32_t row = combo_popup_row(w, int16_t((arg(c, 3) >> 16) & 0xffff));
+            if (row != w->combo_hot) {
+                w->combo_hot = row;
+                w->update_pending = true;
+            }
+        }
+        set_eax(c, 0);
+        return;
+    }
+    case 0x0201: { // WM_LBUTTONDOWN: select a row, or dismiss
+        const uint32_t owner = w ? w->owner : 0;
+        const int32_t row = w ? combo_popup_row(w, int16_t((arg(c, 3) >> 16) & 0xffff)) : -1;
+        uint32_t parent = 0, cid = 0;
+        if (owner) {
+            Window *combo = find_window(owner);
+            if (combo) {
+                parent = combo->parent;
+                cid = combo->id;
+                if (row >= 0) {
+                    combo->list_sel = row;
+                    if ((combo->style & 3u) == 3u /*CBS_DROPDOWNLIST*/)
+                        combo->title_utf8 = combo->list_items[row];
+                    combo->update_pending = true;
+                }
+            }
+            combo_close_popup(c, owner);
+            if (row >= 0 && parent)
+                host_dispatch_to_wndproc(c, parent, 0x0111 /*WM_COMMAND*/,
+                                         (1u << 16) | (cid & 0xffffu), owner); // CBN_SELCHANGE
+        }
+        set_eax(c, 0);
+        return;
+    }
+    case 0x0202: // WM_LBUTTONUP
+        set_eax(c, 0);
+        return;
+    default:
+        def_window_proc(c, false);
+    }
+}
+uint32_t combo_drop_proc_addr() {
+    static uint32_t addr = 0;
+    if (!addr)
+        addr =
+            imports_alloc_trampoline("USER32.dll", "combo drop-down procedure", combo_drop_proc, 4);
+    return addr;
+}
+// Open or close a combo box's drop-down. The list is a top-level popup window
+// with its own surface placed just below the closed field, owned by the combo
+// (so destroying the combo destroys the list) and holding the pointer capture so
+// a click anywhere selects a row or dismisses the list.
+void combo_show_dropdown(X86 *c, uint32_t hwnd, bool open) {
+    Window *w = find_window(hwnd);
+    if (!w || w->combo_open == open)
+        return;
+    const uint32_t parent = w->parent, id = w->id;
+    if (open) {
+        int32_t sx = 0, sy = 0;
+        client_origin(hwnd, &sx, &sy);
+        const int32_t drop = combo_drop_height(w);
+        uint32_t pop = g_next_hwnd;
+        g_next_hwnd += 4;
+        Window p;
+        p.hwnd = pop;
+        p.wndproc = combo_drop_proc_addr();
+        p.style = 0x80000000u /*WS_POPUP*/ | WS_VISIBLE;
+        p.cls = "comboboxdrop";
+        p.x = sx;
+        p.y = sy + w->h;
+        p.w = w->w;
+        p.h = drop;
+        p.owner = hwnd;
+        p.id = id;
+        p.thread = guest_current_thread_id();
+        p.visible = true;
+        p.shown = true;
+        p.update_pending = true;
+        p.list_items = w->list_items;
+        p.list_sel = w->list_sel;
+        p.font = w->font;
+        windows()[pop] = p;
+        window_created(pop);
+        w->combo_popup = pop;
+        w->combo_open = true;
+        w->combo_hot = -1;
+        w->update_pending = true;
+        set_capture_window(pop);
+    } else {
+        combo_close_popup(c, hwnd);
+    }
+    // CBN_DROPDOWN (7) / CBN_CLOSEUP (8) to the parent.
+    if (parent)
+        host_dispatch_to_wndproc(c, parent, 0x0111 /*WM_COMMAND*/,
+                                 (uint32_t(open ? 7u : 8u) << 16) | (id & 0xffffu), hwnd);
+}
+void paint_combobox(X86 *c, uint32_t hwnd, uint32_t into) {
+    (void)c;
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    const std::string text = w->title_utf8;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
+    const uint32_t white = gdi::argb(0x00ffffff), shadow = gdi::argb(0x00808080),
+                   dark = gdi::argb(0x00404040), face = gdi::argb(0x00c8d0d4);
+    // The closed field: white inside a 2 px sunken border, the selected item's
+    // text left-aligned, and the arrow button on the right.
+    const int32_t arrow = 17;
+    gdi::fill(hdc, {0, 0, width, height}, white);
+    gdi::fill(hdc, {0, 0, width, 1}, shadow);
+    gdi::fill(hdc, {0, 0, 1, height}, shadow);
+    gdi::fill(hdc, {0, height - 1, width, height}, dark);
+    gdi::fill(hdc, {width - 1, 0, width, height}, dark);
+    // The arrow button (a raised bevel with a down triangle).
+    const int32_t ax0 = width - arrow - 1;
+    gdi::fill(hdc, {ax0, 1, width - 1, height - 1}, face);
+    gdi::fill(hdc, {ax0, 1, width - 1, 2}, gdi::argb(0x00ffffff));
+    gdi::fill(hdc, {ax0, 1, ax0 + 1, height - 1}, gdi::argb(0x00ffffff));
+    gdi::fill(hdc, {ax0, height - 2, width - 1, height - 1}, dark);
+    gdi::fill(hdc, {width - 2, 1, width - 1, height - 1}, dark);
+    fill_triangle(hdc, ax0 + arrow / 2, height / 2, 4, gdi::argb(0x00000000), true);
+    if (auto *paint_dc = gdi::dc_of(hdc)) {
+        paint_dc->bk_mode = 1; // TRANSPARENT
+        paint_dc->text_color = 0x00000000;
+    }
+    if (!text.empty()) {
+        uint32_t units = wide_units(text);
+        if (units && units < (UINT32_MAX - 32) / 2) {
+            if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+                wr32(block + 0, 3);
+                wr32(block + 4, 0);
+                wr32(block + 8, uint32_t(ax0 - 1));
+                wr32(block + 12, uint32_t(height));
+                gm_put_wstr(block + 16, text, units + 1);
+                gdi::draw_text(hdc, block + 16, units, block,
+                               0x0 /*DT_LEFT*/ | 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/ |
+                                   0x800 /*DT_NOPREFIX*/);
+                heap_free(block);
+            }
+        }
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk;
+    }
+}
+void paint_progress(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    const int32_t lo = w->range_min, hi = w->range_max, pos = w->range_pos;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
+    const uint32_t face = gdi::argb(0x00c8d0d4), shadow = gdi::argb(0x00808080),
+                   light = gdi::argb(0x00ffffff), bar = gdi::argb(0x00a80000);
+    gdi::fill(hdc, {0, 0, width, height}, face);
+    // The sunken field, then the bar filling from the left.
+    const int32_t in = 2;
+    gdi::fill(hdc, {0, 0, width, height}, face);
+    gdi::fill(hdc, {in, in, width - in, height - in}, gdi::argb(0x00ffffff));
+    gdi::fill(hdc, {0, 0, width, 1}, shadow);
+    gdi::fill(hdc, {0, 0, 1, height}, shadow);
+    gdi::fill(hdc, {0, height - 1, width, height}, light);
+    gdi::fill(hdc, {width - 1, 0, width, height}, light);
+    const int32_t range = hi - lo;
+    if (range > 0 && width > 2 * in) {
+        int64_t frac = int64_t(pos - lo) * (width - 2 * in) / range;
+        if (frac < 0)
+            frac = 0;
+        if (frac > width - 2 * in)
+            frac = width - 2 * in;
+        gdi::fill(hdc, {in, in, in + int32_t(frac), height - in}, bar);
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk;
+    }
+}
+void paint_spin(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk = dc->bk_mode;
+    const uint32_t face = gdi::argb(0x00c8d0d4), light = gdi::argb(0x00ffffff),
+                   dark = gdi::argb(0x00000000);
+    gdi::fill(hdc, {0, 0, width, height}, face);
+    // Two arrow halves. The up half is above, the down half below; a 1 px
+    // raised edge around the pair.
+    const int32_t mid = height / 2;
+    gdi::fill(hdc, {0, 0, width, 1}, light);
+    gdi::fill(hdc, {0, 0, 1, height}, light);
+    gdi::fill(hdc, {0, height - 1, width, height}, dark);
+    gdi::fill(hdc, {width - 1, 0, width, height}, dark);
+    gdi::fill(hdc, {1, mid, width - 1, mid + 1}, dark);
+    fill_triangle(hdc, width / 2, mid / 2, 4, gdi::argb(0x00000000), false);
+    fill_triangle(hdc, width / 2, mid + (height - mid) / 2, 4, gdi::argb(0x00000000), true);
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk;
+    }
+}
+void paint_tab(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    const std::vector<std::string> items = w->list_items;
+    const int32_t sel = w->list_sel;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
+    const uint32_t face = gdi::argb(0x00c8d0d4), light = gdi::argb(0x00ffffff),
+                   dark = gdi::argb(0x00000000), shadow = gdi::argb(0x00808080);
+    const int32_t tab_h = 20;
+    gdi::fill(hdc, {0, 0, width, height}, face);
+    if (auto *paint_dc = gdi::dc_of(hdc)) {
+        paint_dc->bk_mode = 1;
+        paint_dc->text_color = 0x00000000;
+    }
+    // The body: a sunken rect below the tab strip.
+    gdi::fill(hdc, {0, tab_h, width, height}, light);
+    gdi::fill(hdc, {0, tab_h, 1, height}, shadow);
+    gdi::fill(hdc, {0, height - 1, width, height}, dark);
+    gdi::fill(hdc, {width - 1, tab_h, width, height}, dark);
+    gdi::fill(hdc, {0, tab_h, width, tab_h + 1}, shadow);
+    // Each tab: a raised box; the selected one is taller and joins the body.
+    int32_t x = 2;
+    for (size_t i = 0; i < items.size(); ++i) {
+        uint32_t units = items[i].empty() ? 0 : wide_units(items[i]);
+        const int32_t tw = (units ? gdi::text_width(hdc, items[i]) : 0) + 12;
+        const bool selected = int32_t(i) == sel;
+        const int32_t ty = selected ? 1 : 3;
+        const int32_t tx1 = x + tw;
+        gdi::fill(hdc, {x, ty, tx1, tab_h + (selected ? 1 : 0)}, face);
+        gdi::fill(hdc, {x, ty, tx1, ty + 1}, light);
+        gdi::fill(hdc, {x, ty, x + 1, tab_h}, light);
+        gdi::fill(hdc, {tx1 - 1, ty, tx1, tab_h}, dark);
+        if (!selected)
+            gdi::fill(hdc, {x, tab_h - 1, tx1, tab_h}, dark);
+        if (units && units < (UINT32_MAX - 32) / 2) {
+            if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+                wr32(block + 0, x + 6);
+                wr32(block + 4, ty);
+                wr32(block + 8, tx1 - 4);
+                wr32(block + 12, tab_h);
+                gm_put_wstr(block + 16, items[i], units + 1);
+                gdi::draw_text(hdc, block + 16, units, block,
+                               0x1 /*DT_CENTER*/ | 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/ |
+                                   0x800 /*DT_NOPREFIX*/);
+                heap_free(block);
+            }
+        }
+        x = tx1 + 2;
+        if (x >= width)
+            break;
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk;
+    }
+}
+// The tab index under client (x,y), or -1. The same widths the paint lays the
+// strip out with (the label width plus the padding), so a click selects the tab
+// it is over.
+int32_t tab_index_from_point(Window *w, int32_t x, int32_t y) {
+    if (y < 0 || y >= 20)
+        return -1;
+    uint32_t hdc = gdi_window_dc(w->hwnd);
+    if (!gdi::dc_of(hdc))
+        return -1;
+    if (w->font)
+        if (auto *dc = gdi::dc_of(hdc))
+            dc->font = w->font;
+    int32_t cx = 2, found = -1;
+    for (size_t i = 0; i < w->list_items.size(); ++i) {
+        const int32_t tw =
+            (w->list_items[i].empty() ? 0 : gdi::text_width(hdc, w->list_items[i])) + 12;
+        if (x >= cx && x < cx + tw) {
+            found = int32_t(i);
+            break;
+        }
+        cx += tw + 2;
+        if (cx >= w->w)
+            break;
+    }
+    gdi_release_window_dc(w->hwnd, hdc);
+    return found;
+}
+void paint_scrollbar(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    const bool vert = range_vertical(w);
+    const int32_t arrow = 16;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk = dc->bk_mode;
+    const uint32_t face = gdi::argb(0x00c8d0d4), light = gdi::argb(0x00ffffff),
+                   dark = gdi::argb(0x00000000), shadow = gdi::argb(0x00808080);
+    gdi::fill(hdc, {0, 0, width, height}, face);
+    const int32_t span = (vert ? height : width) - 2 * arrow;
+    const int32_t range = w->range_max - w->range_min;
+    const int32_t thumb_len = 16;
+    int32_t tpos = 0;
+    if (span > 0 && range > 0) {
+        const int32_t track = span - thumb_len;
+        if (track > 0) {
+            int32_t t = int32_t((int64_t(w->range_pos - w->range_min) * track + range / 2) / range);
+            if (t < 0)
+                t = 0;
+            if (t > track)
+                t = track;
+            tpos = t;
+        }
+    }
+    // The two arrow boxes and the thumb, each a raised bevel.
+    auto bevel = [&](int32_t l, int32_t t, int32_t r, int32_t b) {
+        gdi::fill(hdc, {l, t, r, b}, face);
+        gdi::fill(hdc, {l, t, r, t + 1}, light);
+        gdi::fill(hdc, {l, t, l + 1, b}, light);
+        gdi::fill(hdc, {l, b - 1, r, b}, dark);
+        gdi::fill(hdc, {r - 1, t, r, b}, dark);
+    };
+    if (vert) {
+        bevel(0, 0, width, arrow);
+        bevel(0, height - arrow, width, height);
+        const int32_t t0 = arrow + tpos;
+        bevel(0, t0, width, t0 + thumb_len);
+        fill_triangle(hdc, width / 2, arrow / 2, 4, gdi::argb(0x00000000), false);
+        fill_triangle(hdc, width / 2, height - arrow / 2, 4, gdi::argb(0x00000000), true);
+        gdi::fill(hdc, {width / 2 - 2, t0 + 3, width / 2 + 2, t0 + 4}, shadow);
+        gdi::fill(hdc, {width / 2 - 2, t0 + 6, width / 2 + 2, t0 + 7}, shadow);
+    } else {
+        bevel(0, 0, arrow, height);
+        bevel(width - arrow, 0, width, height);
+        const int32_t t0 = arrow + tpos;
+        bevel(t0, 0, t0 + thumb_len, height);
+        fill_triangle(hdc, arrow / 2, height / 2, 4, gdi::argb(0x00000000), false);
+        fill_triangle(hdc, width - arrow / 2, height / 2, 4, gdi::argb(0x00000000), true);
+        gdi::fill(hdc, {t0 + 3, height / 2 - 2, t0 + 4, height / 2 + 2}, shadow);
+        gdi::fill(hdc, {t0 + 6, height / 2 - 2, t0 + 7, height / 2 + 2}, shadow);
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk;
+    }
+}
+// Windows' radio group rule (TD-081): BS_AUTORADIOBUTTON/BS_RADIOBUTTON
+// controls form a group that starts at a WS_GROUP (0x20000) control and runs to
+// the next one in tab order; checking one clears every other button in the same
+// group. The siblings are collected first and only their state is changed (no
+// guest dispatch), so no window is touched across a callback.
+void radio_group_clear(uint32_t hwnd) {
+    Window *w = find_window(hwnd);
+    if (!w || !w->parent || w->cls != "button")
+        return;
+    const uint32_t bs = w->style & 0x0fu;
+    if (bs != 4 && bs != 9) // BS_RADIOBUTTON / BS_AUTORADIOBUTTON
+        return;
+    std::vector<uint32_t> sibs;
+    for (const auto &kv : windows())
+        if (kv.second.parent == w->parent)
+            sibs.push_back(kv.first); // std::map order is handle order = creation order
+    size_t self = sibs.size();
+    for (size_t i = 0; i < sibs.size(); ++i)
+        if (sibs[i] == hwnd)
+            self = i;
+    if (self == sibs.size())
+        return;
+    size_t start = 0;
+    for (size_t j = self + 1; j-- > 0;) {
+        Window *s = find_window(sibs[j]);
+        if (s && (s->style & 0x20000u /*WS_GROUP*/)) {
+            start = j;
+            break;
+        }
+    }
+    for (size_t j = start; j < sibs.size(); ++j) {
+        if (j > start) {
+            Window *s = find_window(sibs[j]);
+            if (s && (s->style & 0x20000u))
+                break; // the next group begins
+        }
+        if (sibs[j] == hwnd)
+            continue;
+        Window *s = find_window(sibs[j]);
+        if (s && s->cls == "button" && ((s->style & 0x0fu) == 4 || (s->style & 0x0fu) == 9)) {
+            s->check_state = 0;
+            s->update_pending = true;
+        }
+    }
+}
 // Control windows answer the button-state and text messages the dialog helper
 // imports generate; everything else falls through to DefWindowProc.
 void control_proc(X86 *c) {
@@ -3195,6 +4078,18 @@ void control_proc(X86 *c) {
             paint_button(c, hwnd, arg(c, 2));
         else if (w && w->cls == "edit")
             paint_edit(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "combobox")
+            paint_combobox(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "msctls_trackbar32")
+            paint_trackbar(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "msctls_progress32")
+            paint_progress(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "msctls_updown32")
+            paint_spin(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "systabcontrol32")
+            paint_tab(c, hwnd, arg(c, 2));
+        else if (w && w->cls == "scrollbar")
+            paint_scrollbar(c, hwnd, arg(c, 2));
         else
             paint_control(c, hwnd, arg(c, 2));
         set_eax(c, 0);
@@ -3493,11 +4388,533 @@ void control_proc(X86 *c) {
         set_eax(c, out | (outside ? 0x10000u : 0u));
         return;
     }
-    case 0x00f1: // BM_SETCHECK
-        if (w)
-            w->check_state = arg(c, 2);
+    // -----------------------------------------------------------------------
+    // msctls_trackbar32 (TBM_*) and msctls_progress32 (PBM_*). The two message
+    // sets share WM_USER+1..+16, so a code is told apart by the control's class
+    // exactly as the two classes do on Windows. The range is inclusive; TBS_VERT
+    // (2) makes a trackbar vertical with the minimum at the bottom.
+    // -----------------------------------------------------------------------
+    case 0x0400: // TBM_GETPOS
+        set_eax(c, w ? uint32_t(w->range_pos) : 0);
+        return;
+    case 0x0401: // TBM_GETRANGEMIN / PBM_SETRANGE (lParam = MAKELONG(min,max))
+        if (w && w->cls == "msctls_progress32") {
+            w->range_min = int16_t(arg(c, 3) & 0xffff);
+            w->range_max = int16_t((arg(c, 3) >> 16) & 0xffff);
+            if (w->range_max < w->range_min)
+                std::swap(w->range_min, w->range_max);
+            w->range_pos = range_clamp(w, w->range_pos);
+            w->update_pending = true;
+            set_eax(c, 0);
+            return;
+        }
+        set_eax(c, w ? uint32_t(w->range_min) : 0);
+        return;
+    case 0x0402: // TBM_GETRANGEMAX / PBM_SETPOS
+        if (w && w->cls == "msctls_progress32") {
+            w->range_pos = range_clamp(w, int32_t(arg(c, 2)));
+            w->update_pending = true;
+            set_eax(c, uint32_t(w->range_pos));
+            return;
+        }
+        set_eax(c, w ? uint32_t(w->range_max) : 0);
+        return;
+    case 0x0403: // PBM_DELTAPOS
+        if (w) {
+            w->range_pos = range_clamp(w, w->range_pos + int32_t(arg(c, 2)));
+            w->update_pending = true;
+        }
+        set_eax(c, w ? uint32_t(w->range_pos) : 0);
+        return;
+    case 0x0404: // PBM_SETSTEP
+        if (w) {
+            w->range_line = int32_t(arg(c, 2));
+            if (w->range_line < 1)
+                w->range_line = 1;
+        }
+        set_eax(c, w ? uint32_t(w->range_line) : 0);
+        return;
+    case 0x0405: // TBM_SETPOS / PBM_STEPIT
+        if (w && w->cls == "msctls_progress32") {
+            w->range_pos = range_clamp(w, w->range_pos + w->range_line);
+            w->update_pending = true;
+            set_eax(c, uint32_t(w->range_pos));
+            return;
+        }
+        if (w) {
+            w->range_pos = range_clamp(w, int32_t(arg(c, 3)));
+            w->update_pending = true;
+        }
         set_eax(c, 0);
         return;
+    case 0x0406: // TBM_SETRANGE (lParam = MAKELONG(min,max)) / PBM_SETRANGE32
+        if (w) {
+            if (w->cls == "msctls_progress32") {
+                w->range_min = int32_t(arg(c, 2));
+                w->range_max = int32_t(arg(c, 3));
+            } else {
+                w->range_min = int16_t(arg(c, 3) & 0xffff);
+                w->range_max = int16_t((arg(c, 3) >> 16) & 0xffff);
+            }
+            if (w->range_max < w->range_min)
+                std::swap(w->range_min, w->range_max);
+            w->range_pos = range_clamp(w, w->range_pos);
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0407: // TBM_SETRANGEMIN / PBM_GETRANGE
+        if (w && w->cls == "msctls_progress32") {
+            uint32_t lo = arg(c, 2), hi = arg(c, 3);
+            if (lo && gm_valid(lo, 4))
+                wr32(lo, uint32_t(w->range_min));
+            if (hi && gm_valid(hi, 4))
+                wr32(hi, uint32_t(w->range_max));
+            set_eax(c, 1);
+            return;
+        }
+        if (w) {
+            w->range_min = int32_t(arg(c, 3));
+            if (w->range_max < w->range_min)
+                w->range_max = w->range_min;
+            w->range_pos = range_clamp(w, w->range_pos);
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0408: // TBM_SETRANGEMAX / PBM_GETPOS
+        if (w && w->cls == "msctls_progress32") {
+            set_eax(c, uint32_t(w->range_pos));
+            return;
+        }
+        if (w) {
+            w->range_max = int32_t(arg(c, 3));
+            if (w->range_max < w->range_min)
+                w->range_min = w->range_max;
+            w->range_pos = range_clamp(w, w->range_pos);
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0410: // TBM_GETNUMTICS / PBM_SETSTATE
+        if (w && w->cls == "msctls_progress32") {
+            set_eax(c, 0);
+            return;
+        }
+        {
+            int32_t n = 0;
+            if (w) {
+                const int32_t range = w->range_max - w->range_min;
+                n = range >= 0 ? range + 1 : 0;
+            }
+            set_eax(c, uint32_t(n));
+        }
+        return;
+    case 0x0414: // TBM_SETTICFREQ: accepted; ticks are drawn at a computed step
+        set_eax(c, 0);
+        return;
+    case 0x0415: // TBM_SETPAGESIZE
+        if (w) {
+            w->range_page = int32_t(arg(c, 3));
+            if (w->range_page < 0)
+                w->range_page = 0;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0416: // TBM_GETPAGESIZE
+        set_eax(c, w ? uint32_t(trackbar_page(w)) : 0);
+        return;
+    case 0x0417: // TBM_SETLINESIZE
+        if (w) {
+            w->range_line = int32_t(arg(c, 3));
+            if (w->range_line < 1)
+                w->range_line = 1;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0418: // TBM_GETLINESIZE
+        set_eax(c, w ? uint32_t(w->range_line) : 0);
+        return;
+    // -----------------------------------------------------------------------
+    // COMBOBOX (CB_*). The items live in `list_items`, the selection in
+    // `list_sel`; a drop-down list draws its closed field and, when open, the
+    // list below it.
+    // -----------------------------------------------------------------------
+    case 0x0143: // CB_ADDSTRING
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        w->list_items.push_back(gm_str(arg(c, 3)));
+        w->update_pending = true;
+        set_eax(c, uint32_t(w->list_items.size() - 1));
+        return;
+    case 0x014a: { // CB_INSERTSTRING
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        int32_t i = int32_t(arg(c, 2));
+        if (i < 0 || i > int32_t(w->list_items.size()))
+            i = int32_t(w->list_items.size());
+        w->list_items.insert(w->list_items.begin() + i, gm_str(arg(c, 3)));
+        w->update_pending = true;
+        set_eax(c, uint32_t(i));
+        return;
+    }
+    case 0x0144: { // CB_DELETESTRING
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        int32_t i = int32_t(arg(c, 2));
+        if (i < 0 || i >= int32_t(w->list_items.size())) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        w->list_items.erase(w->list_items.begin() + i);
+        if (w->list_sel == i)
+            w->list_sel = -1;
+        else if (w->list_sel > i)
+            --w->list_sel;
+        w->update_pending = true;
+        set_eax(c, uint32_t(w->list_items.size()));
+        return;
+    }
+    case 0x014b: // CB_RESETCONTENT
+        if (w) {
+            w->list_items.clear();
+            w->list_sel = -1;
+            w->combo_hot = -1;
+            w->title_utf8.clear();
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0146: // CB_GETCOUNT
+        set_eax(c, w ? uint32_t(w->list_items.size()) : 0);
+        return;
+    case 0x0147: // CB_GETCURSEL
+        set_eax(c, w ? uint32_t(w->list_sel) : 0xffffffffu);
+        return;
+    case 0x014e: { // CB_SETCURSEL
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        const int32_t i = int32_t(arg(c, 2));
+        if (i < 0 || i >= int32_t(w->list_items.size())) {
+            w->list_sel = -1; // Windows: -1 removes the selection
+        } else {
+            w->list_sel = i;
+            // A drop-down list shows the selected item in its closed field.
+            if ((w->style & 3u) == 3u /*CBS_DROPDOWNLIST*/)
+                w->title_utf8 = w->list_items[i];
+        }
+        w->update_pending = true;
+        set_eax(c, w->list_sel < 0 ? 0xffffffffu : uint32_t(w->list_sel));
+        return;
+    }
+    case 0x0148: { // CB_GETLBTEXT
+        const int32_t i = int32_t(arg(c, 2));
+        std::string s = (w && i >= 0 && i < int32_t(w->list_items.size())) ? w->list_items[i] : "";
+        set_eax(c, gm_put_str(arg(c, 3), s.c_str(), 0x10000));
+        return;
+    }
+    case 0x0149: { // CB_GETLBTEXTLEN
+        const int32_t i = int32_t(arg(c, 2));
+        set_eax(c, (w && i >= 0 && i < int32_t(w->list_items.size()))
+                       ? uint32_t(w->list_items[i].size())
+                       : 0xffffffffu);
+        return;
+    }
+    case 0x014c:   // CB_FINDSTRING (prefix)
+    case 0x0158: { // CB_FINDSTRINGEXACT
+        const std::string want = user32::lower(gm_str(arg(c, 3)));
+        const int32_t start = int32_t(arg(c, 2)) + 1;
+        int32_t found = -1;
+        if (w)
+            for (int32_t i = start; i < int32_t(w->list_items.size()); ++i) {
+                const std::string li = user32::lower(w->list_items[i]);
+                if (msg == 0x0158 ? li == want : li.rfind(want, 0) == 0) {
+                    found = i;
+                    break;
+                }
+            }
+        set_eax(c, found < 0 ? 0xffffffffu : uint32_t(found));
+        return;
+    }
+    case 0x014d: { // CB_SELECTSTRING
+        const std::string want = user32::lower(gm_str(arg(c, 3)));
+        const int32_t start = int32_t(arg(c, 2)) + 1;
+        int32_t found = -1;
+        if (w)
+            for (int32_t i = start; i < int32_t(w->list_items.size()); ++i)
+                if (user32::lower(w->list_items[i]).rfind(want, 0) == 0) {
+                    found = i;
+                    break;
+                }
+        if (w && found >= 0) {
+            w->list_sel = found;
+            if ((w->style & 3u) == 3u)
+                w->title_utf8 = w->list_items[found];
+            w->update_pending = true;
+        }
+        set_eax(c, found < 0 ? 0xffffffffu : uint32_t(found));
+        return;
+    }
+    case 0x014f: // CB_SHOWDROPDOWN
+        if (w)
+            combo_show_dropdown(c, hwnd, arg(c, 2) != 0);
+        set_eax(c, 0);
+        return;
+    case 0x0153: // CB_SETITEMHEIGHT
+        if (w) {
+            w->list_item_height = int32_t(arg(c, 3));
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0154: // CB_GETITEMHEIGHT
+        set_eax(c, w ? uint32_t(combo_row_height(w)) : 0xffffffffu);
+        return;
+    case 0x0157: // CB_GETDROPPEDSTATE
+        set_eax(c, (w && w->combo_open) ? 1u : 0u);
+        return;
+    case 0x015b: // CB_GETTOPINDEX
+        set_eax(c, w ? uint32_t(w->list_top) : 0);
+        return;
+    // -----------------------------------------------------------------------
+    // msctls_updown32 (UDM_*). The buddy edit is updated with the new value.
+    // -----------------------------------------------------------------------
+    case 0x0465: // UDM_SETRANGE (lParam = MAKELONG(max,min))
+        if (w) {
+            w->range_max = int16_t(arg(c, 3) & 0xffff);
+            w->range_min = int16_t((arg(c, 3) >> 16) & 0xffff);
+            if (w->range_max < w->range_min)
+                std::swap(w->range_min, w->range_max);
+            w->range_pos = range_clamp(w, w->range_pos);
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0466: // UDM_GETRANGE
+        set_eax(c, w ? ((uint32_t(uint16_t(w->range_min)) << 16) | uint16_t(w->range_max)) : 0);
+        return;
+    case 0x0467: // UDM_SETPOS (lParam = signed position)
+        if (w) {
+            w->range_pos = range_clamp(w, int32_t(int16_t(arg(c, 3) & 0xffff)));
+            w->update_pending = true;
+        }
+        set_eax(c, w ? uint32_t(int16_t(w->range_pos)) : 0);
+        return;
+    case 0x0468: // UDM_GETPOS (LOWORD the value, HIWORD non-zero on error)
+        set_eax(c, w ? uint32_t(uint16_t(w->range_pos)) : 0);
+        return;
+    case 0x0469: // UDM_SETBUDDY
+        if (w) {
+            w->spin_buddy = arg(c, 2);
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x046a: // UDM_GETBUDDY
+        set_eax(c, w ? w->spin_buddy : 0);
+        return;
+    case 0x046d: // UDM_SETBASE
+        if (w)
+            w->spin_base = int32_t(arg(c, 2));
+        set_eax(c, w ? uint32_t(w->spin_base) : 0);
+        return;
+    case 0x046e: // UDM_GETBASE
+        set_eax(c, w ? uint32_t(w->spin_base) : 0);
+        return;
+    case 0x046f: // UDM_SETRANGE32 (wParam low, lParam high)
+        if (w) {
+            w->range_min = int32_t(arg(c, 2));
+            w->range_max = int32_t(arg(c, 3));
+            if (w->range_max < w->range_min)
+                std::swap(w->range_min, w->range_max);
+            w->range_pos = range_clamp(w, w->range_pos);
+        }
+        set_eax(c, 0);
+        return;
+    case 0x0471: // UDM_SETPOS32
+        if (w) {
+            w->range_pos = range_clamp(w, int32_t(arg(c, 2)));
+            w->update_pending = true;
+        }
+        set_eax(c, w ? uint32_t(w->range_pos) : 0);
+        return;
+    case 0x0472: // UDM_GETPOS32
+        set_eax(c, w ? uint32_t(w->range_pos) : 0);
+        return;
+    // -----------------------------------------------------------------------
+    // SysTabControl32 (TCM_*). TCITEM is 28 bytes; only TCIF_TEXT (1) is read.
+    // -----------------------------------------------------------------------
+    case 0x1304: // TCM_GETITEMCOUNT
+        set_eax(c, w ? uint32_t(w->list_items.size()) : 0);
+        return;
+    case 0x1307: { // TCM_INSERTITEM (wParam index, lParam TCITEM*)
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        int32_t i = int32_t(arg(c, 2));
+        if (i < 0 || i > int32_t(w->list_items.size()))
+            i = int32_t(w->list_items.size());
+        uint32_t item = arg(c, 3);
+        std::string text;
+        if (item && gm_valid(item, 28) && (rd32(item) & 1u)) // TCIF_TEXT
+            text = gm_str(rd32(item + 12));
+        w->list_items.insert(w->list_items.begin() + i, text);
+        w->update_pending = true;
+        set_eax(c, uint32_t(i));
+        return;
+    }
+    case 0x1308: { // TCM_DELETEITEM
+        if (!w) {
+            set_eax(c, 0);
+            return;
+        }
+        const int32_t i = int32_t(arg(c, 2));
+        if (i >= 0 && i < int32_t(w->list_items.size())) {
+            w->list_items.erase(w->list_items.begin() + i);
+            if (w->list_sel == i)
+                w->list_sel = -1;
+            else if (w->list_sel > i)
+                --w->list_sel;
+            w->update_pending = true;
+        }
+        set_eax(c, 1);
+        return;
+    }
+    case 0x1309: // TCM_DELETEALLITEMS
+        if (w) {
+            w->list_items.clear();
+            w->list_sel = -1;
+            w->update_pending = true;
+        }
+        set_eax(c, 1);
+        return;
+    case 0x130b: // TCM_GETCURSEL
+        set_eax(c, w ? uint32_t(w->list_sel) : 0xffffffffu);
+        return;
+    case 0x130c: { // TCM_SETCURSEL
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        const int32_t i = int32_t(arg(c, 2));
+        w->list_sel = (i < 0 || i >= int32_t(w->list_items.size())) ? -1 : i;
+        w->update_pending = true;
+        set_eax(c, w->list_sel < 0 ? 0xffffffffu : uint32_t(w->list_sel));
+        return;
+    }
+    case 0x1305: { // TCM_GETITEM (wParam index, lParam TCITEM*)
+        if (!w) {
+            set_eax(c, 0);
+            return;
+        }
+        const int32_t i = int32_t(arg(c, 2));
+        uint32_t item = arg(c, 3);
+        if (i < 0 || i >= int32_t(w->list_items.size()) || !item || !gm_valid(item, 28)) {
+            set_eax(c, 0);
+            return;
+        }
+        if (rd32(item) & 1u) { // TCIF_TEXT
+            uint32_t buf = rd32(item + 12);
+            uint32_t cap = rd32(item + 16);
+            if (buf && cap)
+                gm_put_str(buf, w->list_items[i].c_str(), cap);
+        }
+        set_eax(c, 1);
+        return;
+    }
+    // -----------------------------------------------------------------------
+    // The SCROLLBAR control (SBM_*). The range is inclusive; SBS_VERT (1) makes
+    // it vertical.
+    // -----------------------------------------------------------------------
+    case 0x00e0: // SBM_SETPOS (wParam pos, lParam redraw)
+        if (w) {
+            w->range_pos = range_clamp(w, int32_t(arg(c, 2)));
+            w->update_pending = true;
+        }
+        set_eax(c, w ? uint32_t(w->range_pos) : 0);
+        return;
+    case 0x00e1: // SBM_GETPOS
+        set_eax(c, w ? uint32_t(w->range_pos) : 0);
+        return;
+    case 0x00e2: // SBM_SETRANGE (wParam min, lParam max)
+        if (w) {
+            w->range_min = int32_t(arg(c, 2));
+            w->range_max = int32_t(arg(c, 3));
+            if (w->range_max < w->range_min)
+                std::swap(w->range_min, w->range_max);
+            w->range_pos = range_clamp(w, w->range_pos);
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x00e3: { // SBM_GETRANGE (wParam LPINT min, lParam LPINT max)
+        if (w) {
+            uint32_t lo = arg(c, 2), hi = arg(c, 3);
+            if (lo && gm_valid(lo, 4))
+                wr32(lo, uint32_t(w->range_min));
+            if (hi && gm_valid(hi, 4))
+                wr32(hi, uint32_t(w->range_max));
+        }
+        set_eax(c, w ? uint32_t(w->range_pos) : 0);
+        return;
+    }
+    case 0x00e6: // SBM_SETRANGEREDRAW
+        if (w) {
+            w->range_min = int32_t(arg(c, 2));
+            w->range_max = int32_t(arg(c, 3));
+            if (w->range_max < w->range_min)
+                std::swap(w->range_min, w->range_max);
+            w->range_pos = range_clamp(w, w->range_pos);
+            w->update_pending = true;
+        }
+        set_eax(c, 0);
+        return;
+    case 0x00f1: // BM_SETCHECK
+        if (w) {
+            const uint32_t bs = w->style & 0x0fu;
+            w->check_state = arg(c, 2);
+            // Checking a radio button clears its group (TD-081).
+            if ((bs == 4 || bs == 9) && w->check_state)
+                radio_group_clear(hwnd);
+        }
+        set_eax(c, 0);
+        return;
+    case 0x00f5: { // BM_CLICK: press and release, then notify the parent
+        uint32_t parent = w ? w->parent : 0, id = w ? w->id : 0;
+        if (w && w->cls == "button") {
+            if (is_check_button(w->style)) {
+                const uint32_t bs = w->style & 0x0fu;
+                if (bs == 3)
+                    w->check_state = w->check_state ? 0u : 1u;
+                else if (bs == 6)
+                    w->check_state = (w->check_state + 1) % 3;
+                else if (bs == 9 || bs == 4) {
+                    w->check_state = 1u;
+                    radio_group_clear(hwnd);
+                }
+                w->update_pending = true;
+            } else if (!is_group_box(w->style)) {
+                w->pressed = true;
+                w->pressed = false;
+            }
+        }
+        if (w && is_group_box(w->style)) {
+            set_eax(c, 0);
+            return;
+        }
+        if (parent)
+            host_dispatch_to_wndproc(c, parent, 0x0111 /*WM_COMMAND*/, id & 0xffffu, hwnd);
+        set_eax(c, 0);
+        return;
+    }
     case 0x00f0: // BM_GETCHECK
         set_eax(c, w ? w->check_state : 0);
         return;
@@ -3512,6 +4929,46 @@ void control_proc(X86 *c) {
         if (focus_window() == hwnd)
             state |= 8u; // BST_FOCUS
         set_eax(c, state);
+        return;
+    }
+    case 0x0200: { // WM_MOUSEMOVE: a thumb drag, a scrollbar drag, a combo hot row
+        if (!w) {
+            set_eax(c, 0);
+            return;
+        }
+        const int32_t mx = int16_t(arg(c, 3) & 0xffff);
+        const int32_t my = int16_t((arg(c, 3) >> 16) & 0xffff);
+        if (w->cls == "msctls_trackbar32" && w->thumb_drag) {
+            const int32_t np = range_clamp(w, range_pos_from_point(w, mx, my));
+            if (np != w->range_pos) {
+                w->range_pos = np;
+                w->update_pending = true;
+                range_notify(c, hwnd, 5 /*TB_THUMBTRACK*/, np);
+            }
+        } else if (w->cls == "scrollbar" && w->thumb_drag) {
+            const bool vert = range_vertical(w);
+            const int32_t arrow = 16, thumb = 16;
+            const int32_t span = (vert ? w->h : w->w) - 2 * arrow;
+            const int32_t track = span - thumb;
+            const int32_t range = w->range_max - w->range_min;
+            if (track > 0 && range > 0) {
+                int32_t along = vert ? my - arrow - thumb / 2 : mx - arrow - thumb / 2;
+                if (along < 0)
+                    along = 0;
+                if (along > track)
+                    along = track;
+                const int32_t np =
+                    w->range_min + int32_t((int64_t(along) * range + track / 2) / track);
+                if (np != w->range_pos) {
+                    w->range_pos = np;
+                    w->update_pending = true;
+                    range_notify(c, hwnd, 5 /*SB_THUMBTRACK*/, np);
+                }
+            }
+        }
+        // An open combo box's drop-down is its own popup window and takes the
+        // pointer capture, so a move over the list never reaches the combo.
+        set_eax(c, 0);
         return;
     }
     case 0x0201: // WM_LBUTTONDOWN: remember the press so the click is a pair
@@ -3552,6 +5009,115 @@ void control_proc(X86 *c) {
             set_eax(c, 0);
             return;
         }
+        if (w && w->cls == "combobox") {
+            set_focus_window(hwnd);
+            // A press on the closed field opens a drop-down list; a press while
+            // it is open (only reachable without the popup's capture) closes it.
+            if (w->combo_open)
+                combo_show_dropdown(c, hwnd, false);
+            else if ((w->style & 3u) == 3u /*CBS_DROPDOWNLIST*/)
+                combo_show_dropdown(c, hwnd, true);
+            set_eax(c, 0);
+            return;
+        }
+        if (w && w->cls == "msctls_trackbar32") {
+            set_focus_window(hwnd);
+            w->thumb_drag = true;
+            const int32_t mx = int16_t(arg(c, 3) & 0xffff);
+            const int32_t my = int16_t((arg(c, 3) >> 16) & 0xffff);
+            const int32_t np = range_clamp(w, range_pos_from_point(w, mx, my));
+            w->range_pos = np;
+            w->update_pending = true;
+            range_notify(c, hwnd, 5 /*TB_THUMBTRACK*/, np);
+            set_eax(c, 0);
+            return;
+        }
+        if (w && w->cls == "scrollbar") {
+            set_focus_window(hwnd);
+            const bool vert = range_vertical(w);
+            const int32_t mx = int16_t(arg(c, 3) & 0xffff);
+            const int32_t my = int16_t((arg(c, 3) >> 16) & 0xffff);
+            const int32_t arrow = 16, thumb = 16;
+            const int32_t axis = vert ? my : mx;
+            const int32_t span = (vert ? w->h : w->w) - 2 * arrow;
+            const int32_t track = span - thumb;
+            const int32_t range = w->range_max - w->range_min;
+            int32_t tpos = 0;
+            if (track > 0 && range > 0) {
+                int32_t t =
+                    int32_t((int64_t(w->range_pos - w->range_min) * track + range / 2) / range);
+                if (t < 0)
+                    t = 0;
+                if (t > track)
+                    t = track;
+                tpos = t;
+            }
+            const int32_t thumb0 = arrow + tpos;
+            const int32_t far = vert ? w->h : w->w;
+            if (axis < arrow) {
+                w->range_pos = range_clamp(w, w->range_pos - w->range_line);
+                w->update_pending = true;
+                range_notify(c, hwnd, 0 /*SB_LINEUP*/, w->range_pos);
+            } else if (axis >= far - arrow) {
+                w->range_pos = range_clamp(w, w->range_pos + w->range_line);
+                w->update_pending = true;
+                range_notify(c, hwnd, 1 /*SB_LINEDOWN*/, w->range_pos);
+            } else if (axis >= thumb0 && axis < thumb0 + thumb) {
+                w->thumb_drag = true; // grab the thumb
+            } else if (axis < thumb0) {
+                w->range_pos = range_clamp(w, w->range_pos - trackbar_page(w));
+                w->update_pending = true;
+                range_notify(c, hwnd, 2 /*SB_PAGEUP*/, w->range_pos);
+            } else {
+                w->range_pos = range_clamp(w, w->range_pos + trackbar_page(w));
+                w->update_pending = true;
+                range_notify(c, hwnd, 3 /*SB_PAGEDOWN*/, w->range_pos);
+            }
+            set_eax(c, 0);
+            return;
+        }
+        if (w && w->cls == "msctls_updown32") {
+            const int32_t my = int16_t((arg(c, 3) >> 16) & 0xffff);
+            const int32_t delta = my < w->h / 2 ? 1 : -1;
+            w->range_pos = range_clamp(w, w->range_pos + delta);
+            w->update_pending = true;
+            // The up-down pushes the value into its buddy edit, if it has one.
+            if (w->spin_buddy && find_window(w->spin_buddy)) {
+                char buf[32];
+                snprintf(buf, sizeof buf, "%d", w->range_pos);
+                uint32_t tmp = heap_alloc(32, true);
+                if (tmp) {
+                    gm_put_str(tmp, buf, 32);
+                    deliver_message(c, w->spin_buddy, 0x000c /*WM_SETTEXT*/, 0, tmp, false);
+                    heap_free(tmp);
+                }
+            }
+            set_eax(c, 0);
+            return;
+        }
+        if (w && w->cls == "systabcontrol32") {
+            const int32_t mx = int16_t(arg(c, 3) & 0xffff);
+            const int32_t my = int16_t((arg(c, 3) >> 16) & 0xffff);
+            const int32_t tab = tab_index_from_point(w, mx, my);
+            if (tab >= 0 && tab != w->list_sel) {
+                const uint32_t parent = w->parent, id = w->id;
+                w->list_sel = tab;
+                w->update_pending = true;
+                // TCN_SELCHANGE (TCN_FIRST-1) through an NMHDR via WM_NOTIFY.
+                if (parent) {
+                    uint32_t nm = heap_alloc(24, true);
+                    if (nm) {
+                        wr32(nm + 0, hwnd);        // hwndFrom
+                        wr32(nm + 4, id);          // idFrom
+                        wr32(nm + 8, 0xfffffdd9u); // TCN_SELCHANGE
+                        host_dispatch_to_wndproc(c, parent, 0x004e /*WM_NOTIFY*/, id, nm);
+                        heap_free(nm);
+                    }
+                }
+            }
+            set_eax(c, 0);
+            return;
+        }
         if (w) {
             // A checkbox/radio keeps its check state in `check_state`; a press
             // does not disturb it (only the push buttons use the pressed bit).
@@ -3565,6 +5131,28 @@ void control_proc(X86 *c) {
     case 0x0202: { // WM_LBUTTONUP: a completed click reports WM_COMMAND
         uint32_t parent = w ? w->parent : 0, id = w ? w->id : 0;
         LOGW("control: WM_LBUTTONUP hwnd=%08x id=%u parent=%08x", hwnd, id, parent);
+        // The range controls and the combo box end their own interaction and
+        // never report BN_CLICKED.
+        if (w && (w->cls == "msctls_trackbar32" || w->cls == "scrollbar")) {
+            if (w->thumb_drag) {
+                w->thumb_drag = false;
+                if (w->cls == "msctls_trackbar32") {
+                    range_notify(c, hwnd, 4 /*TB_THUMBPOSITION*/, w->range_pos);
+                    range_notify(c, hwnd, 8 /*TB_ENDTRACK*/, w->range_pos);
+                } else {
+                    range_notify(c, hwnd, 4 /*SB_THUMBPOSITION*/, w->range_pos);
+                    range_notify(c, hwnd, 8 /*SB_ENDSCROLL*/, w->range_pos);
+                }
+            }
+            w->update_pending = true;
+            set_eax(c, 0);
+            return;
+        }
+        if (w && (w->cls == "combobox" || w->cls == "msctls_updown32" ||
+                  w->cls == "systabcontrol32" || w->cls == "msctls_progress32")) {
+            set_eax(c, 0);
+            return;
+        }
         if (w) {
             if (w->cls == "button" && is_check_button(w->style)) {
                 // An auto-checkbox/auto-3-state toggles itself before notifying
@@ -3574,8 +5162,10 @@ void control_proc(X86 *c) {
                     w->check_state = w->check_state ? 0u : 1u;
                 else if (bs == 6) // BS_AUTO3STATE
                     w->check_state = (w->check_state + 1) % 3;
-                else if (bs == 9) // BS_AUTORADIOBUTTON
+                else if (bs == 9) { // BS_AUTORADIOBUTTON
                     w->check_state = 1u;
+                    radio_group_clear(hwnd); // TD-081: the group is exclusive
+                }
             } else {
                 w->pressed = false;
             }
@@ -3607,7 +5197,9 @@ uint32_t control_proc_addr() {
 // ships STATIC; the rest are inert windows that still route messages.
 void ensure_dialog_classes() {
     ensure_system_classes();
-    for (const char *name : {"button", "edit", "combobox", "listbox", "scrollbar"}) {
+    for (const char *name :
+         {"button", "edit", "combobox", "listbox", "scrollbar", "msctls_trackbar32",
+          "msctls_progress32", "msctls_updown32", "systabcontrol32"}) {
         if (classes().count(name))
             continue;
         WndClass wc;
@@ -3832,6 +5424,14 @@ uint32_t dlg_create_child(uint32_t parent, const DlgItemTemplate &it, const DlgB
     w.y = dialog_map_unit(it.y, base.y, 8);
     w.w = dialog_map_unit(it.cx, base.x, 4);
     w.h = dialog_map_unit(it.cy, base.y, 8);
+    // A drop-down combo box's template height is the DROPPED height: Windows
+    // creates the control one row tall (the closed field) and the list extends
+    // to the template height. Without this the closed field is as tall as the
+    // whole drop-down and overlaps the controls below it.
+    if (w.cls == "combobox" && (it.style & 3u) != 1u /*not CBS_SIMPLE*/ && w.h > 20) {
+        w.combo_drop_h = w.h;
+        w.h = 20;
+    }
     w.title_utf8 = it.text;
     w.parent = parent;
     w.id = it.id;
