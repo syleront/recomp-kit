@@ -55,6 +55,7 @@ bool g_clipped = false;
 bool (*g_message_waiter)() = nullptr;
 void (*g_window_shown)(uint32_t) = nullptr;
 uint8_t g_key_state[256] = {0};
+uint8_t g_host_char_pending[256] = {0};
 
 // WS_VISIBLE: a window created with it is shown as part of creation.
 const uint32_t WS_VISIBLE = 0x10000000u;
@@ -1187,6 +1188,18 @@ void u_TranslateMessage(X86 *c) {
     }
     uint32_t msg = rd32(p + 4), vk = rd32(p + 8), lparam = rd32(p + 12);
     if (msg == 0x0100 || msg == 0x0104) { // WM_KEYDOWN / WM_SYSKEYDOWN
+        // The host is the OS here and posts this key's WM_CHAR itself (next to
+        // the WM_KEYDOWN), because the modal DialogBoxParamA pump never calls
+        // TranslateMessage. A guest message loop DOES call us, so synthesising
+        // a second character message typed every key twice - the Editor's
+        // "Playscene name" edit. The host marks the scan code it translated;
+        // consume the mark and let its own WM_CHAR be dispatched.
+        const uint32_t scan = (lparam >> 16) & 0xffu;
+        if (scan && g_host_char_pending[scan]) {
+            g_host_char_pending[scan] = 0;
+            set_eax(c, 0);
+            return;
+        }
         uint32_t ch = 0;
         if (vk >= 0x30 && vk <= 0x5a)
             ch = vk; // digits and letters

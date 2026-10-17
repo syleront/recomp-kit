@@ -3275,6 +3275,65 @@ static void test_edit_text_model(X86 *c) {
     call_import(c, "USER32.dll", "DestroyWindow", {parent});
 }
 
+// The host stands in for the OS and posts a key's WM_CHAR next to its
+// WM_KEYDOWN, because the modal DialogBoxParamA pump has no TranslateMessage.
+// A guest message loop DOES call TranslateMessage, which used to synthesise a
+// second WM_CHAR and type every character twice - what the Editor's "Playscene
+// name" page showed. The host marks the key it translated (by scan code) and
+// TranslateMessage must consume the mark instead of making another character.
+static void test_host_key_char_dedup(X86 *c) {
+    section("USER32 a host-translated key types once");
+    ensure_dialog_classes();
+    uint32_t cls = put_str("RTKeyParent");
+    uint32_t proc = imports_alloc_trampoline("test", "rt_key_parent", fake_guest_fn, 4);
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 0, 0);
+    wr32(wc + 4, proc);
+    wr32(wc + 36, cls);
+    check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0, "register the key parent");
+    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                  {0, cls, cls, 0x80000000u, 0, 0, 300, 100, 0, 0, 0, 0});
+    uint32_t edit = call_import(c, "USER32.dll", "CreateWindowExA",
+                                {0, put_str("edit"), 0, 0x40000000u | 0x10000000u | 0x00800000u, 0,
+                                 0, 100, 20, parent, 42, 0, 0});
+    if (user32::Window *ew = user32::find_window(edit))
+        ew->cls = "edit";
+    check(edit != 0, "create a child edit");
+    auto text = [&]() { return user32::find_window(edit)->title_utf8; };
+    user32::set_focus_window(edit);
+
+    // The guest's own message loop, exactly as the game's WinMain runs it:
+    // GetMessage -> TranslateMessage -> DispatchMessage. Drain keyboard
+    // messages only so a synthesised WM_PAINT cannot hide the character.
+    auto run_loop = [&]() {
+        uint32_t msg = scratch_block(28);
+        for (int guard = 0; guard < 16; ++guard) {
+            if (call_import(c, "USER32.dll", "PeekMessageA", {msg, 0, 0x0100, 0x0109, 1}) != 1)
+                break;
+            call_import(c, "USER32.dll", "TranslateMessage", {msg});
+            call_import(c, "USER32.dll", "DispatchMessageA", {msg});
+        }
+    };
+
+    // A host key: WM_KEYDOWN + WM_CHAR, scan code 0x22 is the 'G' key.
+    call_import(c, "USER32.dll", "SetWindowTextA", {edit, put_str("")});
+    host_post_key_message(0x0100, 'G', 0x00220001);
+    host_post_key_message(0x0102, 'G', 0x00220001);
+    run_loop();
+    check(text() == "G", "a host-translated key types once, not twice (got \"%s\")",
+          text().c_str());
+
+    // A WM_KEYDOWN with no host WM_CHAR (a guest-synthesised key) still
+    // translates, so TranslateMessage is not a no-op.
+    call_import(c, "USER32.dll", "SetWindowTextA", {edit, put_str("")});
+    host_post_key_message(0x0100, 'H', 0x00230001);
+    run_loop();
+    check(text() == "h", "an untranslated key is still translated once (got \"%s\")",
+          text().c_str());
+
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
+}
+
 // The modal pump's IsDialogMessage: Return presses the default push button,
 // Escape cancels, Tab moves the focus. The rename dialog's OK is a
 // BS_DEFPUSHBUTTON, so a player who presses Return renames.
@@ -8408,6 +8467,7 @@ int main(int argc, char **argv) {
     test_group_box(c);
     test_range_and_common_controls(c);
     test_edit_text_model(c);
+    test_host_key_char_dedup(c);
     test_dialog_key_routing(c);
     test_interp_extra_ops(c);
     test_acm_pcm_converter(c);

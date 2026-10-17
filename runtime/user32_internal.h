@@ -148,6 +148,17 @@ uint32_t deliver_message(X86 *c, uint32_t hwnd, uint32_t msg, uint32_t wp, uint3
 extern uint32_t g_main_hwnd, g_cursor;
 extern int32_t g_cursor_x, g_cursor_y;
 extern uint8_t g_key_state[256];
+// A scan code whose character the host has ALREADY delivered as a WM_CHAR. The
+// host stands in for the OS and pre-translates a key (it posts WM_CHAR next to
+// WM_KEYDOWN) because the modal DialogBoxParamA pump never calls
+// TranslateMessage. A guest message loop DOES call TranslateMessage, which
+// would synthesise a second WM_CHAR for the same physical key and type every
+// character twice (the Editor's "Playscene name" page). TranslateMessage skips
+// a scan code marked here and clears it; host_post_key_message sets it. Keyed
+// by scan code, which the key lParam carries, so it pairs with the key it came
+// from and a host character message without one (the headless `text=` seam
+// posts scan code 0) marks nothing.
+extern uint8_t g_host_char_pending[256];
 extern bool (*g_message_waiter)();
 extern Msg last_message;
 constexpr uint32_t desktop_handle = 0x00020000;

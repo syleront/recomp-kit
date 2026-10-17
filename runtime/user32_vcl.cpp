@@ -2420,6 +2420,16 @@ void host_post_key_message(uint32_t msg, uint32_t wparam, uint32_t lparam) {
         hwnd = user32::active;
     if (!hwnd || !user32::find_window(hwnd))
         hwnd = host_main_window();
+    // A character the host has already translated (it posts WM_CHAR next to the
+    // WM_KEYDOWN, because the modal dialog pump never calls TranslateMessage).
+    // Mark the key's scan code so a guest message loop's TranslateMessage does
+    // not synthesise a duplicate; see g_host_char_pending. The headless `text=`
+    // seam posts a character with scan code 0 and marks nothing.
+    if (msg == 0x0102 || msg == 0x0106) {
+        const uint32_t scan = (lparam >> 16) & 0xffu;
+        if (scan)
+            user32::g_host_char_pending[scan] = 1;
+    }
     if (hwnd)
         host_post_message(hwnd, msg, wparam, lparam);
 }
