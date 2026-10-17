@@ -141,7 +141,11 @@ void pump_mouse_input(X86 *c) {
             dialog_end_move();
         return;
     }
-    uint32_t hwnd = find_window(capture) ? capture : mouse_window(0, input.x, input.y);
+    // A capture window that has been hidden no longer owns the pointer: a combo
+    // drop-down left open on a hidden owner would otherwise route every click to
+    // itself and the main UI would stop responding.
+    Window *cap = find_window(capture);
+    uint32_t hwnd = (cap && cap->visible) ? capture : mouse_window(0, input.x, input.y);
     // A wheel event has no button to capture it: Windows sends it to the window
     // under the cursor, and to the focus window when the point is over none of
     // this thread's windows. Every other mouse message is routed by its point.

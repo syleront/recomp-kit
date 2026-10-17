@@ -345,6 +345,9 @@ uint32_t host_dispatch_to_wndproc(X86 *c, uint32_t hwnd, uint32_t msg, uint32_t 
 // Defined with the rest of the dialog engine below (global scope); the dialog
 // entry points inside namespace user32 need it before that.
 uint32_t dlg_item(uint32_t parent, uint32_t id);
+// Windows hides a window's children and its owned windows with it; defined with
+// the combo box below (global scope) and used by ShowWindow(SW_HIDE) here.
+void hide_window_subtree(X86 *c, uint32_t hwnd);
 
 namespace user32 {
 
@@ -581,8 +584,13 @@ void u_ShowWindow(X86 *c) {
     set_eax(c, was ? 1 : 0);
     if (!was && w->visible)
         became_visible(w, cmd != 4 && cmd != 7 && cmd != 8); // SW_*NOACTIVATE keeps stacking
-    else if (was && !w->visible)
+    else if (was && !w->visible) {
+        // Windows hides a window's children and its owned windows with it. Do
+        // that BEFORE the repaint so an owned combo drop-down (which holds the
+        // pointer capture) is closed and the exposed pixels are repainted.
+        hide_window_subtree(c, w->hwnd);
         repaint_exposed_windows(); // hiding exposes what the window covered
+    }
 }
 
 // UpdateWindow sends WM_PAINT directly to the window procedure, synchronously,
@@ -730,6 +738,14 @@ void dialog_end_move() {
     g_move_hwnd = 0;
 }
 bool dialog_move_active() {
+    // A move loop owns the pointer until the button is released. If the window
+    // it was moving is gone or hidden before that release (the Editor wizard
+    // closed from under the drag), nothing will ever end it, and the pump would
+    // swallow every later press - the main UI's suitcase stopped responding.
+    // Self-heal here, the one place that answers the question.
+    Window *w = find_window(g_move_hwnd);
+    if (g_move_hwnd && (!w || !w->visible))
+        g_move_hwnd = 0;
     return g_move_hwnd != 0;
 }
 // The bounds a window had before a display took it over, by handle.
@@ -3712,6 +3728,32 @@ void combo_close_popup(X86 *c, uint32_t combo_hwnd) {
             set_capture_window(0);
         destroy_window(c, pop);
     }
+}
+// Windows hides a window's children and its owned windows with it. The combo
+// box's drop-down is an owned top-level popup that holds the pointer capture,
+// so a hidden owner (the Playscene Editor wizard closed with its drop-down
+// still open) must not leave that popup on screen capturing every later click:
+// the main UI's suitcase stopped responding. Close an open drop-down and hide
+// the rest of the subtree, releasing the capture if one of them held it.
+void hide_window_subtree(X86 *c, uint32_t hwnd) {
+    // A child's own WS_VISIBLE is independent of its parent's; a hidden
+    // top-level already drops its whole subtree from hit testing. What survives
+    // is an OWNED top-level popup - the combo box's drop-down - which is its own
+    // entry in the z-order and holds the pointer capture. Close any open
+    // drop-down in the subtree and release the capture if one of these windows
+    // held it.
+    std::vector<uint32_t> kids;
+    for (const auto &kv : windows())
+        if (kv.first != hwnd && (kv.second.parent == hwnd || kv.second.owner == hwnd))
+            kids.push_back(kv.first);
+    for (uint32_t k : kids)
+        if (find_window(k))
+            hide_window_subtree(c, k);
+    if (Window *w = find_window(hwnd))
+        if (w->cls == "combobox" && w->combo_open)
+            combo_close_popup(c, hwnd);
+    if (capture_window() == hwnd)
+        set_capture_window(0);
 }
 // The drop-down popup's window procedure: it paints itself and, on a press,
 // selects the row under the pointer (or dismisses when the point is off the

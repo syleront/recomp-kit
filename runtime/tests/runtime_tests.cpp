@@ -2697,6 +2697,34 @@ static void test_dialog_frame_geometry(X86 *c) {
     call_import(c, "USER32.dll", "DestroyWindow", {plain});
 }
 
+// A caption drag owns the pointer until the button comes up. If the window it
+// was moving is destroyed (or hidden) first, nothing will ever end it and the
+// input pump would swallow every later press - the main UI's suitcase stopped
+// responding after the Playscene Editor wizard was closed from under a caption
+// drag. dialog_move_active() self-heals, which is the one place that answers it.
+static void test_dialog_move_heals(X86 *c) {
+    section("USER32 a stale caption drag does not own the pointer");
+    ensure_dialog_classes();
+    uint32_t cls = put_str("#32770");
+    uint32_t style =
+        0x80000000u | 0x10000000u | 0x00c00000u | 0x00080000u; // POPUP|VISIBLE|CAPTION|SYSMENU
+    uint32_t dlg = call_import(c, "USER32.dll", "CreateWindowExA",
+                               {0, cls, put_str("Drag"), style, 100, 120, 200, 150, 0, 0, 0, 0});
+    check(dlg != 0, "create a captioned dialog");
+    check(user32::dialog_begin_move(c, dlg, 150, 125), "a caption grab starts the move loop");
+    check(user32::dialog_move_active(), "the move loop is active");
+    call_import(c, "USER32.dll", "DestroyWindow", {dlg});
+    check(!user32::dialog_move_active(), "destroying the dragged window ends the move loop");
+
+    uint32_t dlg2 = call_import(c, "USER32.dll", "CreateWindowExA",
+                                {0, cls, put_str("Drag2"), style, 100, 120, 200, 150, 0, 0, 0, 0});
+    check(user32::dialog_begin_move(c, dlg2, 150, 125) && user32::dialog_move_active(),
+          "a second move loop starts");
+    call_import(c, "USER32.dll", "ShowWindow", {dlg2, 0 /*SW_HIDE*/});
+    check(!user32::dialog_move_active(), "hiding the dragged window ends the move loop");
+    call_import(c, "USER32.dll", "DestroyWindow", {dlg2});
+}
+
 // The interpreter is what runs code the translator never emitted; Petz 5's
 // warning dialog procedure (0x4014f0, only passed as a DialogProc) is one such
 // routine and needs SETcc, NOT and REPNE SCASB. Each is exercised on a tiny
@@ -3110,6 +3138,21 @@ static void test_range_and_common_controls(X86 *c) {
     check(user32::capture_window() == 0, "closing the drop-down releases the pointer capture");
     send(cb, 0x014b /*CB_RESETCONTENT*/, 0, 0);
     check(send(cb, 0x0146, 0, 0) == 0, "CB_RESETCONTENT empties the list");
+    // Hiding the owner closes an open drop-down and releases the pointer
+    // capture. A drop-down left open on a hidden owner is its own top-level
+    // window, so it would otherwise route every later click to itself and the
+    // main UI would stop responding (the Playscene Editor wizard closed with
+    // its drop-down still open).
+    send(cb, 0x0143 /*CB_ADDSTRING*/, 0, put_str("Again"));
+    send(cb, 0x0201 /*WM_LBUTTONDOWN*/, 1, (5u << 16) | 5u); // reopen
+    check(user32::find_window(cb)->combo_open && user32::capture_window() != 0,
+          "the drop-down reopens and takes the capture");
+    uint32_t owner = user32::find_window(cb)->parent;
+    call_import(c, "USER32.dll", "ShowWindow", {owner, 0 /*SW_HIDE*/});
+    check(!user32::find_window(cb) || !user32::find_window(cb)->combo_open,
+          "hiding the owner closes the drop-down");
+    check(user32::capture_window() == 0, "hiding the owner releases the pointer capture");
+    call_import(c, "USER32.dll", "ShowWindow", {owner, 1 /*SW_SHOWNORMAL*/});
 
     // --- progress bar ---
     uint32_t pb = make("msctls_progress32", 0, 0, 60, 120, 20, 1302);
@@ -8504,6 +8547,7 @@ int main(int argc, char **argv) {
     test_listbox_ownerdraw_hit(c);
     test_dialog_dlu_mapping(c);
     test_dialog_frame_geometry(c);
+    test_dialog_move_heals(c);
     test_dialog_close_box(c);
     test_button_state(c);
     test_edit_click_preserves_userdata(c);
