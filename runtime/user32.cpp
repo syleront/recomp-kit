@@ -2557,6 +2557,17 @@ constexpr int32_t listbox_sb_width = 16;
 bool listbox_has_scrollbar(const Window *w) {
     return (w->style & 0x00200000u) != 0;
 }
+// A listbox's selection is a SET (`list_selected`); `list_sel` is the CARET
+// (LB_GETCURSEL), which Windows paints as a focus rectangle, NOT as a selected
+// row. A single-select box keeps the two in step; a multi/extended one does not
+// (LBS_MULTIPLESEL 0x8, LBS_EXTENDEDSEL 0x800). The Editor's Contact Sound list
+// is LBS_EXTENDEDSEL and its own subclass toggles rows with LB_GETSEL +
+// LB_SETSEL: LB_SETSEL(FALSE, row) clears the row from the selection but leaves
+// the caret on it, so a paint that also treated the caret as selected made the
+// last-clicked row impossible to deselect (TD-107).
+bool listbox_multi_select(const Window *w) {
+    return (w->style & (0x0008u | 0x0800u)) != 0;
+}
 // The total height of every row, which the thumb's size is proportional to.
 int32_t listbox_content_height(X86 *c, Window *w) {
     int32_t total = 0;
@@ -2616,19 +2627,23 @@ bool owner_draw_listbox(X86 *c, Window *w, uint32_t hwnd, uint32_t hdc, int32_t 
             return false;
         for (int k = 0; k < 0x30; k += 4)
             wr32(ds + k, 0);
-        wr32(ds + 0x00, 2);                          // CtlType = ODT_LISTBOX
-        wr32(ds + 0x04, w->id);                      // CtlID
-        wr32(ds + 0x08, uint32_t(i));                // itemID = the row index
-        wr32(ds + 0x0c, 1);                          // itemAction = ODA_DRAWENTIRE
-        wr32(ds + 0x10,
-             (w->list_selected.count(i) || i == w->list_sel) ? 1u : 0u); // ODS_SELECTED
-        wr32(ds + 0x14, hwnd);                       // hwndItem
-        wr32(ds + 0x18, hdc);                        // hDC
-        wr32(ds + 0x1c, 0);                          // rcItem.left
-        wr32(ds + 0x20, uint32_t(y));                // rcItem.top
-        wr32(ds + 0x24, uint32_t(width));            // rcItem.right
-        wr32(ds + 0x28, uint32_t(y + ih));           // rcItem.bottom
-        wr32(ds + 0x2c, 0);                          // itemData
+        wr32(ds + 0x00, 2);           // CtlType = ODT_LISTBOX
+        wr32(ds + 0x04, w->id);       // CtlID
+        wr32(ds + 0x08, uint32_t(i)); // itemID = the row index
+        wr32(ds + 0x0c, 1);           // itemAction = ODA_DRAWENTIRE
+        // ODS_SELECTED is the selection SET; the caret is ODS_FOCUS (0x10) and
+        // is not a selection (see listbox_multi_select).
+        uint32_t item_state = w->list_selected.count(i) ? 1u : 0u; // ODS_SELECTED
+        if (i == w->list_sel)
+            item_state |= 0x10u; // ODS_FOCUS
+        wr32(ds + 0x10, item_state);
+        wr32(ds + 0x14, hwnd);             // hwndItem
+        wr32(ds + 0x18, hdc);              // hDC
+        wr32(ds + 0x1c, 0);                // rcItem.left
+        wr32(ds + 0x20, uint32_t(y));      // rcItem.top
+        wr32(ds + 0x24, uint32_t(width));  // rcItem.right
+        wr32(ds + 0x28, uint32_t(y + ih)); // rcItem.bottom
+        wr32(ds + 0x2c, 0);                // itemData
         uint32_t r = host_dispatch_to_wndproc(c, w->parent, 0x002b /* WM_DRAWITEM */, w->id, ds);
         heap_free(ds);
         if (!r)
@@ -3128,11 +3143,22 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
     int32_t y = 0;
     for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i) {
         int32_t ih = listbox_item_height(c, w, i);
-        const bool selected = w->list_selected.count(i) || i == w->list_sel;
+        const bool selected = w->list_selected.count(i) != 0;
+        const bool caret = i == w->list_sel && focus_window() == hwnd;
         if (auto *paint_dc = gdi::dc_of(hdc))
             paint_dc->text_color = selected ? 0x00ffffff : 0x00000000;
         if (selected)
             gdi::fill(hdc, {0, y, row_width, y + ih}, 0x00c00000);
+        if (caret) {
+            // The caret row carries a focus rectangle, not a selection
+            // highlight: a one-pixel black outline inset from the row (Windows
+            // dithers it; a solid edge reads the same at this size).
+            const uint32_t ink = 0x00000000;
+            gdi::fill(hdc, {1, y + 1, row_width - 1, y + 2}, ink);
+            gdi::fill(hdc, {1, y + ih - 2, row_width - 1, y + ih - 1}, ink);
+            gdi::fill(hdc, {1, y + 1, 2, y + ih - 1}, ink);
+            gdi::fill(hdc, {row_width - 2, y + 1, row_width - 1, y + ih - 1}, ink);
+        }
         uint32_t units = wide_units(w->list_items[i]);
         if (!units) {
             y += ih;
@@ -4282,6 +4308,12 @@ void control_proc(X86 *c) {
             }
             if (moved && n > 0) {
                 w->list_sel = sel < 0 ? 0 : (sel >= n ? n - 1 : sel);
+                // A plain arrow moves the caret AND the selection (Windows
+                // replaces the selection on an unmodified arrow); the caret is
+                // not itself a selection, so a multi/extended box would show
+                // nothing highlighted without this.
+                w->list_selected.clear();
+                w->list_selected.insert(w->list_sel);
                 listbox_scroll_into_view(c, w);
                 w->update_pending = true;
                 if (w->parent)
@@ -4391,9 +4423,14 @@ void control_proc(X86 *c) {
         int32_t i = int32_t(arg(c, 2));
         if (w) {
             w->list_sel = (i < 0 || i >= int32_t(w->list_items.size())) ? -1 : i;
-            w->list_selected.clear();
-            if (w->list_sel >= 0)
-                w->list_selected.insert(w->list_sel);
+            // Windows selects the caret item too, but only when the box is not
+            // multiple/extended select; there the caret is independent of the
+            // selection (and LB_SETSEL is what changes it).
+            if (!listbox_multi_select(w)) {
+                w->list_selected.clear();
+                if (w->list_sel >= 0)
+                    w->list_selected.insert(w->list_sel);
+            }
             w->update_pending = true;
         }
         set_eax(c, w ? uint32_t(w->list_sel) : 0xffffffffu);

@@ -2252,6 +2252,10 @@ static void test_synchronous_geometry(X86 *c) {
 // and claims WM_DRAWITEM so the owner-draw path stays selected.
 static int g_lb_measure_mode = 0; // 0 fixed, 1 variable
 static uint32_t g_lb_fixed_height = 0;
+// The ODS_SELECTED bit of each itemID in the last owner-draw WM_DRAWITEM, so a
+// test can see which rows the paint treats as selected (the caret is ODS_FOCUS,
+// which is not a selection).
+static uint32_t g_lb_ods[8];
 static void listbox_owner_wndproc(X86 *c) {
     uint32_t hwnd = arg(c, 0), msg = arg(c, 1), wp = arg(c, 2), lp = arg(c, 3);
     if (msg == 0x002c /* WM_MEASUREITEM */) {
@@ -2264,7 +2268,10 @@ static void listbox_owner_wndproc(X86 *c) {
         return;
     }
     if (msg == 0x002b /* WM_DRAWITEM */) {
-        set_eax(c, 1); // handled
+        uint32_t item = rd32(lp + 8); // itemID
+        if (item < 8)
+            g_lb_ods[item] = rd32(lp + 0x10) & 1u; // itemState & ODS_SELECTED
+        set_eax(c, 1);                             // handled
         return;
     }
     call_import(c, "USER32.dll", "DefWindowProcA", {hwnd, msg, wp, lp});
@@ -2525,6 +2532,42 @@ static void test_listbox_ownerdraw_hit(X86 *c) {
         check(call_import(c, "USER32.dll", "SendMessageA", {vlb, 0x0188, 0, 0}) == uint32_t(e.row),
               "variable box: a click at y=%d selects row %d", e.y, e.row);
     }
+
+    // The caret is not a selection. In an LBS_EXTENDEDSEL box LB_SETSEL(FALSE)
+    // clears a row but leaves the caret on it, and the paint must follow the
+    // SELECTION set, not the caret - otherwise the last-clicked row can never
+    // be deselected (the Editor's Contact Sound list; its own subclass toggles
+    // rows with LB_GETSEL + LB_SETSEL, TD-107).
+    g_lb_measure_mode = 0;
+    g_lb_fixed_height = 40;
+    uint32_t xlb = make_listbox(0x10u /* LBS_OWNERDRAWFIXED */ | 0x800u /* LBS_EXTENDEDSEL */, 103);
+    check(xlb != 0, "create an LBS_EXTENDEDSEL owner-draw listbox");
+    for (const char *n : names)
+        call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0180, 0, put_str(n)});
+    call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0185 /* LB_SETSEL */, 1, 2});
+    call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0185, 1, 5});
+    check(call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0190 /* LB_GETSELCOUNT */, 0, 0}) ==
+              2,
+          "the extended box has two rows selected");
+    memset(g_lb_ods, 0, sizeof g_lb_ods);
+    call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x000f /* WM_PAINT */, 0, 0});
+    check(g_lb_ods[2] == 1 && g_lb_ods[5] == 1, "both selected rows report ODS_SELECTED");
+    call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0185, 0, 5});
+    check(call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0190, 0, 0}) == 1 &&
+              call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0187 /* LB_GETSEL */, 5, 0}) ==
+                  0,
+          "LB_SETSEL(FALSE) clears one row");
+    memset(g_lb_ods, 0, sizeof g_lb_ods);
+    call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x000f, 0, 0});
+    check(g_lb_ods[2] == 1 && g_lb_ods[5] == 0,
+          "the cleared row stops reporting ODS_SELECTED even though it is the caret");
+    // LB_SETCURSEL moves the caret only in an extended box; it must not select.
+    call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0186 /* LB_SETCURSEL */, 3, 0});
+    check(call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0188 /* LB_GETCURSEL */, 0, 0}) ==
+                  3 &&
+              call_import(c, "USER32.dll", "SendMessageA", {xlb, 0x0190, 0, 0}) == 1,
+          "LB_SETCURSEL moves the caret but does not select in an extended box");
+    call_import(c, "USER32.dll", "DestroyWindow", {xlb});
 
     call_import(c, "USER32.dll", "DestroyWindow", {vlb});
     call_import(c, "USER32.dll", "DestroyWindow", {lb});
