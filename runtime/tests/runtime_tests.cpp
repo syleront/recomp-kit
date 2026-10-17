@@ -2730,8 +2730,9 @@ static void test_group_box(X86 *c) {
     wr32(wc + 4, proc);
     wr32(wc + 36, cls);
     check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0, "register the group parent");
-    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
-                                  {0, cls, cls, 0x80000000u, 0, 0, 220, 120, 0, 0, 0, 0});
+    uint32_t parent =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, cls, cls, 0x80000000u | 0x10000000u, 0, 0, 220, 120, 0, 0, 0, 0});
     uint32_t bcls = put_str("button");
     uint32_t title = put_str("Supply Case");
     // WS_CHILD|WS_VISIBLE|BS_GROUPBOX (the dialog template's group box).
@@ -2752,6 +2753,31 @@ static void test_group_box(X86 *c) {
     user32::find_window(gb)->update_pending = true;
     call_import(c, "USER32.dll", "SendMessageA", {gb, 0x000f /*WM_PAINT*/, 0, 0});
     check(!user32::find_window(gb)->update_pending, "a group box paints and validates");
+    // A checkbox's state is readable back through the dialog helpers the game's
+    // OK handler uses (IsDlgButtonChecked -> BM_GETCHECK): a click toggles it.
+    uint32_t cb = call_import(
+        c, "USER32.dll", "CreateWindowExA",
+        {0, bcls, title, 0x40000000u | 0x10000000u | 3u, 4, 50, 120, 20, parent, 1021, 0, 0});
+    if (user32::Window *cw = user32::find_window(cb))
+        cw->cls = "button";
+    call_import(c, "USER32.dll", "CheckDlgButton", {parent, 1021, 1});
+    check(call_import(c, "USER32.dll", "IsDlgButtonChecked", {parent, 1021}) == 1,
+          "CheckDlgButton is readable back through IsDlgButtonChecked");
+    call_import(c, "USER32.dll", "SendMessageA", {cb, 0x0201 /*WM_LBUTTONDOWN*/, 1, 0x00040008});
+    call_import(c, "USER32.dll", "SendMessageA", {cb, 0x0202 /*WM_LBUTTONUP*/, 0, 0x00040008});
+    check(call_import(c, "USER32.dll", "IsDlgButtonChecked", {parent, 1021}) == 0,
+          "an auto-checkbox click clears its checked state");
+    // A group box created after its contents (as a template that lists group
+    // boxes last does) is on top in z-order, but a click on it must reach the
+    // control underneath, not the frame.
+    uint32_t gb2 = call_import(
+        c, "USER32.dll", "CreateWindowExA",
+        {0, bcls, title, 0x40000000u | 0x10000000u | 7u, 0, 0, 200, 110, parent, 65535, 0, 0});
+    if (user32::Window *gw = user32::find_window(gb2))
+        gw->cls = "button";
+    uint32_t at = call_import(c, "USER32.dll", "WindowFromPoint", {64, 60});
+    check(at == cb, "WindowFromPoint over a group box returns the control underneath (got %08x)",
+          at);
     call_import(c, "USER32.dll", "DestroyWindow", {parent});
 }
 

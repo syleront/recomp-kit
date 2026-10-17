@@ -17,6 +17,11 @@
   structure was unreadable. A group box now draws its 1 px etched frame with the
   top edge broken for the caption at the top-left, in the control's own font,
   and a click on it is inert (no pressed bevel, no `BN_CLICKED` to the parent).
+  A group box is also transparent to the mouse now, as a STATIC without
+  `SS_NOTIFY` already was: a template that lists its group boxes last puts them
+  on top in z-order, and the frame used to swallow every click meant for a
+  checkbox or radio inside it (the General Options dialog's controls could not
+  be toggled, so its settings never changed).
 - Reach the host filesystem for a path chosen in a system file dialog. A chosen
   path is a real host path, but the guest hands it straight back to
   `CopyFileA`/`CreateFileA` and the overlay used to re-root it under the writable

@@ -102,8 +102,12 @@ uint32_t mouse_window(uint32_t parent, int32_t x, int32_t y, size_t depth = 0) {
             return *i; // the frame is the window's, not a child's
         // A STATIC control is transparent to the mouse unless it has SS_NOTIFY
         // (0x100), which is why a caption drawn over a button does not eat its
-        // click. Windows reports HTTRANSPARENT from WM_NCHITTEST here.
+        // click. Windows reports HTTRANSPARENT from WM_NCHITTEST here. A group
+        // box (BS_GROUPBOX) is the same: a frame whose children lie inside it,
+        // so a click on it must reach the control underneath, not the frame.
         if (w->cls == "static" && !(w->style & 0x100))
+            continue;
+        if (w->cls == "button" && (w->style & 0x0fu) == 7u) // BS_GROUPBOX
             continue;
         uint32_t child = mouse_window(*i, x, y, depth + 1);
         return child ? child : *i;
