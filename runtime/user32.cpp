@@ -3487,7 +3487,7 @@ void paint_trackbar(X86 *c, uint32_t hwnd, uint32_t into) {
     uint32_t face = gdi::argb(0x00c8d0d4);
     control_background(c, hwnd, hdc, &face);
     gdi::fill(hdc, {0, 0, width, height}, face);
-    if (!find_window(hwnd)) {
+    if (!(w = find_window(hwnd))) {
         if (!into)
             gdi_release_window_dc(hwnd, hdc);
         return;
