@@ -2642,6 +2642,11 @@ bool is_check_button(uint32_t style) {
     const uint32_t bs = style & 0x0fu;
     return bs == 2 || bs == 3 || bs == 4 || bs == 5 || bs == 6 || bs == 9;
 }
+// BS_GROUPBOX (7): a frame with a caption, not a button. Windows gives it no
+// pressed state and reports no BN_CLICKED, so a click on it is inert.
+bool is_group_box(uint32_t style) {
+    return (style & 0x0fu) == 7u;
+}
 // A checkbox or radio button: a 13 px glyph (a box, or a circle) at the left of
 // the caption (the right, with BS_LEFTTEXT), filled when checked, and the
 // caption drawn in the control's font. A checkbox gets the parent's
@@ -2731,17 +2736,106 @@ void paint_checkbox(X86 *c, uint32_t hwnd, uint32_t into) {
         caller->bk_mode = caller_bk_mode;
     }
 }
+// A group box (BS_GROUPBOX): a 1 px etched frame whose top edge is broken for
+// the caption, the caption drawn at the top-left in the control's own font.
+// Windows draws this in the BUTTON class, and a program relies on the frame to
+// read the dialog's structure; the caption is not a normal centred label, so
+// the STATIC caption path cannot draw it (its text_flags returns 0 for a button
+// style, leaving the box invisible).
+void paint_groupbox(X86 *c, uint32_t hwnd, uint32_t into) {
+    Window *w = find_window(hwnd);
+    if (!w)
+        return;
+    if (!into)
+        w->update_pending = false;
+    const int32_t width = w->w, height = w->h;
+    uint32_t hdc = into ? into : gdi_window_dc(hwnd);
+    auto *dc = gdi::dc_of(hdc);
+    if (!dc) {
+        if (!into)
+            gdi_release_window_dc(hwnd, hdc);
+        return;
+    }
+    const uint32_t caller_font = dc->font;
+    const int caller_bk_mode = dc->bk_mode;
+    if (w->font)
+        dc->font = w->font;
+    // The parent chooses the caption's colours through the static protocol; a
+    // null brush leaves the dialog face already painted underneath (the dialog
+    // engine fills its client), as for a STATIC caption.
+    uint32_t pixel = 0;
+    bool have = false;
+    if (w->parent) {
+        uint32_t brush =
+            host_dispatch_to_wndproc(c, w->parent, 0x0138 /* WM_CTLCOLORSTATIC */, hdc, hwnd);
+        have = brush && gdi::brush_color(brush, &pixel);
+        if (!have) {
+            if (Window *pw = find_window(w->parent); pw && pw->cls == "#32770") {
+                uint32_t b = host_dispatch_to_wndproc(c, w->parent, 0x0131 /* WM_CTLCOLORDLG */,
+                                                      hdc, w->parent);
+                have = b && gdi::brush_color(b, &pixel);
+            }
+        }
+    }
+    if (have)
+        gdi::fill(hdc, {0, 0, width, height}, pixel);
+    const std::string text = w->title_utf8;
+    const int32_t th = gdi::text_height(hdc);
+    const int32_t top = th > 0 ? th / 2 : 6; // the frame's top edge
+    const int32_t gap = 8;                   // the caption's left inset
+    const int32_t tw = text.empty() ? 0 : gdi::text_width(hdc, text);
+    const uint32_t shadow = gdi::argb(0x00808080), light = gdi::argb(0x00ffffff);
+    // Etched frame: the top/left edge in the shadow, the bottom/right in the
+    // highlight, with the top edge interrupted under the caption.
+    gdi::fill(hdc, {0, top, gap, top + 1}, shadow);
+    if (tw)
+        gdi::fill(hdc, {gap + tw + 2, top, width, top + 1}, shadow);
+    gdi::fill(hdc, {0, top, 1, height}, shadow);
+    gdi::fill(hdc, {width - 1, top, width, height}, shadow);
+    gdi::fill(hdc, {0, height - 1, width, height}, light);
+    // The caption sits on the frame's top-left, its text transparent over the
+    // dialog face.
+    if (!text.empty()) {
+        if (auto *paint_dc = gdi::dc_of(hdc)) {
+            paint_dc->bk_mode = 1; // TRANSPARENT
+            paint_dc->text_color = 0x00000000;
+        }
+        uint32_t units = wide_units(text);
+        if (units && units < (UINT32_MAX - 32) / 2) {
+            if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+                wr32(block + 0, uint32_t(gap));
+                wr32(block + 4, 0);
+                wr32(block + 8, uint32_t(width));
+                wr32(block + 12, uint32_t(height));
+                gm_put_wstr(block + 16, text, units + 1);
+                gdi::draw_text(hdc, block + 16, units, block,
+                               0x0 /*DT_LEFT*/ | 0x20 /*DT_SINGLELINE*/ | 0x800 /*DT_NOPREFIX*/);
+                heap_free(block);
+            }
+        }
+    }
+    if (!into)
+        gdi_release_window_dc(hwnd, hdc);
+    else if (auto *caller = gdi::dc_of(hdc)) {
+        caller->font = caller_font;
+        caller->bk_mode = caller_bk_mode;
+    }
+}
 // A push button in a dialog: a COLOR_BTNFACE face with a raised 3D bevel, a
 // sunken one while the press is held, and the caption centred. BS_DEFPUSHBUTTON
 // (style 1) also gets the dark default-button border. Checkboxes and radios get
-// the glyph path above; other button styles fall back to the STATIC caption
-// path.
+// the glyph path above; a group box gets its own frame and top-left caption;
+// other button styles fall back to the STATIC caption path.
 void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
     if (!w)
         return;
     if (is_check_button(w->style)) {
         paint_checkbox(c, hwnd, into);
+        return;
+    }
+    if ((w->style & 0x0fu) == 7u) { // BS_GROUPBOX
+        paint_groupbox(c, hwnd, into);
         return;
     }
     if ((w->style & 0x0fu) > 1u) {
@@ -3462,7 +3556,7 @@ void control_proc(X86 *c) {
             // A checkbox/radio keeps its check state in `check_state`; a press
             // does not disturb it (only the push buttons use the pressed bit).
             // Never GWL_USERDATA: a program's own storage must survive a click.
-            if (w->cls != "button" || !is_check_button(w->style))
+            if (w->cls != "button" || (!is_check_button(w->style) && !is_group_box(w->style)))
                 w->pressed = true;
             w->update_pending = true; // the pressed bevel has to be drawn
         }
@@ -3487,6 +3581,11 @@ void control_proc(X86 *c) {
             }
             if (w->cls == "button")
                 w->update_pending = true; // the bevel returns to raised
+        }
+        // A group box is not a button: no BN_CLICKED to the parent.
+        if (w && is_group_box(w->style)) {
+            set_eax(c, 0);
+            return;
         }
         if (parent)
             host_dispatch_to_wndproc(c, parent, 0x0111 /* WM_COMMAND */,

@@ -2707,6 +2707,54 @@ static void test_edit_click_preserves_userdata(X86 *c) {
     call_import(c, "USER32.dll", "DestroyWindow", {parent});
 }
 
+// BS_GROUPBOX (TD-081): the BUTTON class's frame-with-caption. Windows draws a
+// 1 px etched frame and the caption at the top-left, and a click is inert (no
+// pressed bevel, no BN_CLICKED). The STATIC caption path returns no text flags
+// for a button style, so before this the box (and its caption) drew nothing.
+static uint32_t g_group_cmd = 0;
+static void group_parent_proc(X86 *c) {
+    if (arg(c, 1) == 0x0111) { // WM_COMMAND
+        g_group_cmd = arg(c, 2) & 0xffffu;
+        set_eax(c, 1);
+        return;
+    }
+    set_eax(c, arg(c, 1) == 0x0081 ? 1 : 0); // WM_NCCREATE must not cancel
+}
+static void test_group_box(X86 *c) {
+    section("USER32 group box");
+    ensure_dialog_classes();
+    uint32_t cls = put_str("RTGroupParent");
+    uint32_t proc = imports_alloc_trampoline("test", "rt_group_parent", group_parent_proc, 4);
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 0, 0);
+    wr32(wc + 4, proc);
+    wr32(wc + 36, cls);
+    check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0, "register the group parent");
+    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                  {0, cls, cls, 0x80000000u, 0, 0, 220, 120, 0, 0, 0, 0});
+    uint32_t bcls = put_str("button");
+    uint32_t title = put_str("Supply Case");
+    // WS_CHILD|WS_VISIBLE|BS_GROUPBOX (the dialog template's group box).
+    uint32_t gb = call_import(
+        c, "USER32.dll", "CreateWindowExA",
+        {0, bcls, title, 0x40000000u | 0x10000000u | 7u, 4, 4, 160, 40, parent, 65535, 0, 0});
+    if (user32::Window *gw = user32::find_window(gb))
+        gw->cls = "button";
+    check(gb != 0 && user32::find_window(gb) && (user32::find_window(gb)->style & 0x0fu) == 7u,
+          "create a BS_GROUPBOX child");
+    // A click is inert: no press, no BN_CLICKED to the parent.
+    g_group_cmd = 0xdeadbeefu;
+    call_import(c, "USER32.dll", "SendMessageA", {gb, 0x0201 /*WM_LBUTTONDOWN*/, 1, 0x00040008});
+    check(!user32::find_window(gb)->pressed, "a group-box click records no press");
+    call_import(c, "USER32.dll", "SendMessageA", {gb, 0x0202 /*WM_LBUTTONUP*/, 0, 0x00040008});
+    check(g_group_cmd == 0xdeadbeefu, "a group box sends no BN_CLICKED");
+    // It paints through its own path and validates its update region.
+    user32::find_window(gb)->update_pending = true;
+    call_import(c, "USER32.dll", "SendMessageA", {gb, 0x000f /*WM_PAINT*/, 0, 0});
+    check(!user32::find_window(gb)->update_pending, "a group box paints and validates");
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
+}
+
 // An edit control's text model: caret, selection and the editing keys.
 static void test_edit_text_model(X86 *c) {
     section("USER32 edit caret and selection");
@@ -7849,6 +7897,7 @@ int main(int argc, char **argv) {
     test_dialog_close_box(c);
     test_button_state(c);
     test_edit_click_preserves_userdata(c);
+    test_group_box(c);
     test_edit_text_model(c);
     test_dialog_key_routing(c);
     test_interp_extra_ops(c);

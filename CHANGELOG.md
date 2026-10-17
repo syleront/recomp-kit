@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Draw a dialog's group boxes (`BS_GROUPBOX`). The BUTTON class fell through to
+  the STATIC caption path, whose `text_flags` returns 0 for a button style, so a
+  group box drew neither its etched frame nor its caption and a dialog's
+  structure was unreadable. A group box now draws its 1 px etched frame with the
+  top edge broken for the caption at the top-left, in the control's own font,
+  and a click on it is inert (no pressed bevel, no `BN_CLICKED` to the parent).
 - Reach the host filesystem for a path chosen in a system file dialog. A chosen
   path is a real host path, but the guest hands it straight back to
   `CopyFileA`/`CreateFileA` and the overlay used to re-root it under the writable
