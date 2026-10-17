@@ -6,6 +6,7 @@
 #include "win32.h"
 #include <deque>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 namespace user32 {
@@ -75,6 +76,12 @@ struct Window {
     std::vector<std::string> list_items;
     int32_t list_sel = -1;
     int32_t list_top = 0;
+    // A multi-select (LBS_MULTIPLESEL / LBS_EXTENDEDSEL) listbox's selected
+    // rows. A single-select box keeps this in step with `list_sel` (the click
+    // and LB_SETCURSEL replace it), so LB_GETSELCOUNT/LB_GETSEL/LB_GETSELITEMS
+    // answer for either style. The Contact Sound page (Petz 5's Editor) is
+    // LBS_EXTENDEDSEL and drives its selection entirely through LB_SETSEL.
+    std::set<int32_t> list_selected;
     // A range control's model, shared by the trackbar, the scrollbar and the
     // up-down: `range_min`/`range_max` are the inclusive bounds, `range_pos` the
     // current value, `range_page` a page step and `range_line` a line step. The

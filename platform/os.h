@@ -184,7 +184,20 @@ void os_sleep_us(uint64_t us);
 typedef struct OsFileFilter {
     const char *description; // may be empty
     const char *patterns;    // "*.pet;*.PET", may be empty
+    // The bare, lowercase, ';'-separated extensions this filter allows, derived
+    // from `patterns` *and* from the extension list the description advertises
+    // ("Picture Files (*.BMP; *.JPG)"). A Win32 filter only narrows the list of
+    // files the picker shows - the user can still type any name - so a filter
+    // whose description names a type the pattern omits (Petz 5's Editor filter
+    // is exactly this: "(*.BMP; *.JPG)" but "*.bmp;") must keep that type
+    // selectable. An empty string means the filter allows every file.
+    const char *extensions;
 } OsFileFilter;
+// Derive the allowed extensions a Win32 filter advertises: every `*.ext` /
+// `.ext` named by `patterns` or by a parenthesised wildcard list in
+// `description`, lowercased and de-duplicated. Writes a NUL-terminated,
+// ';'-separated list into `out` (`cap` bytes); an empty list means every file.
+void os_file_filter_extensions(const char *patterns, const char *description, char *out, size_t cap);
 
 typedef struct OsFileDialog {
     int save;                // 1: save panel, 0: open panel

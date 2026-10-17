@@ -2270,6 +2270,171 @@ static void listbox_owner_wndproc(X86 *c) {
     call_import(c, "USER32.dll", "DefWindowProcA", {hwnd, msg, wp, lp});
 }
 
+// A STATIC's caption must be erased before the new text is drawn. The Editor's
+// trackbar value static is set with SetWindowTextA as the slider moves; the
+// parent answers WM_CTLCOLORSTATIC with 0 (no brush), so the old glyphs stayed
+// and the value smeared. A caption static now erases with the dialog's face
+// colour; a picture static (no text style) keeps the null-brush transparency the
+// Petz Profile portrait needs.
+static void test_static_settext_erase(X86 *c) {
+    section("USER32 static caption erase");
+    ensure_dialog_classes();
+    uint32_t dlg = call_import(c, "USER32.dll", "CreateWindowExA",
+                               {0, put_str("#32770"), put_str("d"), 0x10000000u, 0, 0, 160, 60, 0, 0,
+                                0, 0});
+    check(dlg != 0, "create a #32770 dialog whose procedure answers no colour brush");
+    // CreateWindowExA records the class atom as the window's class; the dialog
+    // engine names a real dialog "#32770", so name this one the same way.
+    if (user32::Window *dw = user32::find_window(dlg))
+        dw->cls = "#32770";
+    auto make_static = [&](uint32_t style, uint32_t id) -> uint32_t {
+        return call_import(c, "USER32.dll", "CreateWindowExA",
+                           {0, put_str("static"), 0, 0x40000000u | 0x10000000u | style, 4, 4, 96,
+                            16, dlg, id, 0, 0});
+    };
+    auto set_text = [&](uint32_t h, const char *s) {
+        call_import(c, "USER32.dll", "SendMessageA", {h, 0x000c /*WM_SETTEXT*/, 0, put_str(s)});
+        call_import(c, "USER32.dll", "SendMessageA", {h, 0x000f /*WM_PAINT*/, 0, 0});
+    };
+    const uint32_t face = gdi::argb(0x00c8d0d4) & 0x00ffffffu;
+    auto ink_pixels = [&](uint32_t h) -> int {
+        uint32_t dc = ::gdi_window_dc(h);
+        int n = 0;
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 96; ++x) {
+                uint32_t px = 0;
+                if (gdi::read_pixel(dc, x, y, &px) && (px & 0x00ffffffu) != face)
+                    ++n;
+            }
+        ::gdi_release_window_dc(h, dc);
+        return n;
+    };
+
+    uint32_t cap = make_static(0x0 /*SS_LEFT*/, 1);
+    check(cap != 0, "create a caption STATIC");
+    set_text(cap, "0");
+    const int ink0 = ink_pixels(cap);
+    check(ink0 > 0, "a caption draws ink over the dialog face (%d px)", ink0);
+    set_text(cap, "");
+    check(ink_pixels(cap) == 0, "clearing the caption erases the old glyphs");
+    set_text(cap, "88");
+    check(ink_pixels(cap) > ink0, "a wider caption draws more ink than the old one");
+
+    // A picture-style static (no text style) must NOT erase: the Petz Profile
+    // paints its portrait into the dialog's DC at the control's rectangle.
+    uint32_t pic = make_static(0x0e /*SS_BITMAP*/, 2);
+    check(pic != 0, "create a picture STATIC");
+    const uint32_t marker = gdi::argb(0x000000ff);
+    {
+        uint32_t dc = ::gdi_window_dc(pic);
+        gdi::write_pixel(dc, 3, 3, marker);
+        ::gdi_release_window_dc(pic, dc);
+    }
+    set_text(pic, "label");
+    {
+        uint32_t dc = ::gdi_window_dc(pic), px = 0;
+        bool kept = gdi::read_pixel(dc, 3, 3, &px) && (px & 0x00ffffffu) == (marker & 0x00ffffffu);
+        ::gdi_release_window_dc(pic, dc);
+        check(kept, "a picture static keeps its null-brush pixels");
+    }
+    call_import(c, "USER32.dll", "DestroyWindow", {dlg});
+}
+
+// A WS_VSCROLL listbox's row hit test and its selection model. The game's
+// Contact Sound page (Petz 5's Editor, LBS_EXTENDEDSEL) computes the clicked
+// row itself as `top_index + y/item_height` and drives the selection with
+// LB_SETSEL/LB_GETSEL/LB_GETSELCOUNT/LB_GETSELITEMS; `0x0190` was mislabelled
+// LB_SELECTSTRING here, so the game's GETSELCOUNT query ran a string search with
+// a NULL prefix and moved the caret to row 1 on every click.
+static void test_listbox_selection(X86 *c) {
+    section("USER32 listbox selection and hit test");
+    ensure_dialog_classes();
+    uint32_t cls = put_str("RTListSelParent");
+    uint32_t proc = imports_alloc_trampoline("test", "rt_list_sel_parent", fake_guest_fn, 4);
+    uint32_t wc = scratch_block(40);
+    wr32(wc + 4, proc);
+    wr32(wc + 36, cls);
+    check(call_import(c, "USER32.dll", "RegisterClassA", {wc}) != 0,
+          "register the listbox-selection parent");
+    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                  {0, cls, cls, 0x80000000u, 0, 0, 320, 300, 0, 0, 0, 0});
+    check(parent != 0, "create the listbox-selection parent");
+    uint32_t lbcls = put_str("listbox");
+    auto send = [&](uint32_t h, uint32_t m, uint32_t wp, uint32_t lp) -> uint32_t {
+        return call_import(c, "USER32.dll", "SendMessageA", {h, m, wp, lp});
+    };
+    uint32_t lb = call_import(c, "USER32.dll", "CreateWindowExA",
+                              {0, lbcls, 0, 0x40000000u | 0x00200000u /*WS_VSCROLL*/, 0, 0, 100,
+                               64, parent, 1307, 0, 0});
+    if (user32::Window *lw = user32::find_window(lb))
+        lw->cls = "listbox";
+    check(lb != 0, "create a WS_VSCROLL listbox");
+    for (int i = 0; i < 20; ++i) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "Row %d", i);
+        send(lb, 0x0180 /*LB_ADDSTRING*/, 0, put_str(nm));
+    }
+    check(send(lb, 0x018b /*LB_GETCOUNT*/, 0, 0) == 20, "the listbox holds twenty rows");
+    // A plain click selects the row under the pointer, at any scroll offset.
+    for (int top = 0; top <= 8; top += 4) {
+        send(lb, 0x0197 /*LB_SETTOPINDEX*/, uint32_t(top), 0);
+        check(send(lb, 0x018e /*LB_GETTOPINDEX*/, 0, 0) == uint32_t(top),
+              "LB_SETTOPINDEX is readable through LB_GETTOPINDEX (%d)", top);
+        for (int row = 0; row < 3; ++row) {
+            const int32_t y = row * 16 + 8; // inside row `row` of the view
+            send(lb, 0x0201 /*WM_LBUTTONDOWN*/, 1, (uint32_t(y) << 16) | 5u);
+            check(send(lb, 0x0188 /*LB_GETCURSEL*/, 0, 0) == uint32_t(top + row),
+                  "a click at view row %d selects row %d (top %d, got %d)", row, top + row, top,
+                  int32_t(send(lb, 0x0188, 0, 0)));
+            send(lb, 0x0202 /*WM_LBUTTONUP*/, 0, 0);
+        }
+    }
+    // The scrollbar's own right 16 px still scrolls and never selects a row.
+    send(lb, 0x0197 /*LB_SETTOPINDEX*/, 0, 0);
+    send(lb, 0x0186 /*LB_SETCURSEL*/, 1, 0);
+    send(lb, 0x0201, 1, (56u << 16) | 92u); // the down arrow
+    check(send(lb, 0x018e, 0, 0) == 1, "the scrollbar's down arrow scrolls one row");
+    check(send(lb, 0x0188, 0, 0) == 1, "a scrollbar click does not move the selection");
+    send(lb, 0x0202, 0, 0);
+
+    // LB_GETSELCOUNT (0x0190) is not LB_SELECTSTRING: with nothing selected it
+    // answers 0 and leaves the caret alone. This is the Contact Sound bug.
+    send(lb, 0x0186 /*LB_SETCURSEL*/, uint32_t(-1), 0);
+    check(send(lb, 0x0190 /*LB_GETSELCOUNT*/, 0, 0) == 0,
+          "LB_GETSELCOUNT answers 0 with nothing selected");
+    check(send(lb, 0x0188 /*LB_GETCURSEL*/, 0, 0) == 0xffffffffu,
+          "LB_GETSELCOUNT leaves the caret at -1 (it is not LB_SELECTSTRING)");
+
+    // The extended selection: LB_SETSEL toggles rows, LB_GETSEL reads one,
+    // LB_GETSELCOUNT counts them and LB_GETSELITEMS lists them.
+    send(lb, 0x0185 /*LB_SETSEL*/, 1, 2);
+    check(send(lb, 0x0187 /*LB_GETSEL*/, 2, 0) == 1 && send(lb, 0x0187, 3, 0) == 0,
+          "LB_SETSEL selects exactly the named row");
+    send(lb, 0x0185, 1, 5);
+    check(send(lb, 0x0190 /*LB_GETSELCOUNT*/, 0, 0) == 2,
+          "a second LB_SETSEL grows the selection count");
+    uint32_t selbuf = scratch_block(8 * 4);
+    check(send(lb, 0x0191 /*LB_GETSELITEMS*/, 8, selbuf) == 2 && rd32(selbuf) == 2 &&
+              rd32(selbuf + 4) == 5,
+          "LB_GETSELITEMS lists the selected rows in order");
+    send(lb, 0x0185, 0, 2);
+    check(send(lb, 0x0187, 2, 0) == 0 && send(lb, 0x0190, 0, 0) == 1,
+          "LB_SETSEL with FALSE clears one row");
+    send(lb, 0x0185, 1, uint32_t(-1));
+    check(send(lb, 0x0190, 0, 0) == 20, "LB_SETSEL with index -1 selects every row");
+    send(lb, 0x0185, 0, uint32_t(-1));
+    check(send(lb, 0x0190, 0, 0) == 0, "LB_SETSEL with index -1 and FALSE clears every row");
+
+    // LB_SELECTSTRING (0x018C) finds a prefix and makes it the caret; an empty
+    // prefix matches nothing.
+    check(send(lb, 0x018c /*LB_SELECTSTRING*/, 0, put_str("Row 7")) == 7 &&
+              send(lb, 0x0188, 0, 0) == 7,
+          "LB_SELECTSTRING selects the matching row");
+    check(send(lb, 0x018c, 0, put_str("")) == 0xffffffffu && send(lb, 0x0188, 0, 0) == 7,
+          "LB_SELECTSTRING with an empty prefix matches nothing and leaves the caret");
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
+}
+
 static void test_listbox_ownerdraw_hit(X86 *c) {
     section("USER32 owner-draw listbox hit test");
     ensure_dialog_classes();
@@ -3394,7 +3559,7 @@ static void test_windows(X86 *c) {
 struct CapturedDialog {
     int called = 0, save = 0, filter_count = 0, filter_index = 0;
     uint32_t flags = 0;
-    std::string title, dir, ext, initial, f0desc, f0pats;
+    std::string title, dir, ext, initial, f0desc, f0pats, f0exts, f1desc, f1pats, f1exts;
 };
 static CapturedDialog g_cap_dialog;
 
@@ -3412,6 +3577,12 @@ extern "C" int capture_file_dialog(OsFileDialog *d) {
     if (d->filter_count > 0) {
         g_cap_dialog.f0desc = d->filters[0].description ? d->filters[0].description : "";
         g_cap_dialog.f0pats = d->filters[0].patterns ? d->filters[0].patterns : "";
+        g_cap_dialog.f0exts = d->filters[0].extensions ? d->filters[0].extensions : "";
+    }
+    if (d->filter_count > 1) {
+        g_cap_dialog.f1desc = d->filters[1].description ? d->filters[1].description : "";
+        g_cap_dialog.f1pats = d->filters[1].patterns ? d->filters[1].patterns : "";
+        g_cap_dialog.f1exts = d->filters[1].extensions ? d->filters[1].extensions : "";
     }
     return os_file_dialog_set_result(d, "/captured/Chosen.pet");
 }
@@ -3440,6 +3611,35 @@ static uint32_t put_bytes(const void *data, uint32_t n) {
     uint32_t a = scratch_block(n + 16);
     memcpy(g_mem + a, data, n);
     return a;
+}
+
+// ---------------------------------------------------------------------------
+// The extension list a Win32 filter advertises. Windows' picker only narrows
+// the *view* by the filter, but the macOS panel's allowedFileTypes hard-
+// restricts, so the runtime derives every type the filter names - including a
+// description's advertised list that the pattern omits (Petz 5's Editor
+// "Picture Files (*.BMP; *.JPG)" with pattern "*.bmp;").
+// ---------------------------------------------------------------------------
+static void test_file_filter_extensions() {
+    section("comdlg32 filter extensions");
+    char out[128];
+    os_file_filter_extensions("*.bmp;", "Picture Files (*.BMP; *.JPG)", out, sizeof out);
+    check(std::string(out) == "bmp;jpg",
+          "a .bmp pattern plus a description advertising JPG keeps both");
+    os_file_filter_extensions("*.jpg;*.jpeg", "JPEG (*.jpg;*.jpeg)", out, sizeof out);
+    check(std::string(out) == "jpg;jpeg", "a semicolon multi-pattern yields both extensions");
+    os_file_filter_extensions("*.JPG", "JPEG", out, sizeof out);
+    check(std::string(out) == "jpg", "an uppercase pattern is lowercased");
+    os_file_filter_extensions("*.jpg; *.jpeg", "JPEG", out, sizeof out);
+    check(std::string(out) == "jpg;jpeg", "spaces around a pattern's semicolon are ignored");
+    os_file_filter_extensions("*.pet;*.PET", "Petz File", out, sizeof out);
+    check(std::string(out) == "pet", "case-folded duplicates collapse to one");
+    os_file_filter_extensions("*.*", "All Files (*.*)", out, sizeof out);
+    check(out[0] == '\0', "*.* allows every file (no restriction)");
+    os_file_filter_extensions("*", "", out, sizeof out);
+    check(out[0] == '\0', "a bare * allows every file");
+    os_file_filter_extensions("", "", out, sizeof out);
+    check(out[0] == '\0', "an empty filter allows every file");
 }
 
 static void test_common_dialogs(X86 *c) {
@@ -3474,8 +3674,8 @@ static void test_common_dialogs(X86 *c) {
     check(g_cap_dialog.ext == "pet", "lpstrDefExt reached the presenter");
     check(g_cap_dialog.initial == "Pouncer.pet", "lpstrFile preloaded the name");
     check(g_cap_dialog.filter_count == 1 && g_cap_dialog.f0desc == "Petz File" &&
-              g_cap_dialog.f0pats == "*.pet;",
-          "lpstrFilter split into a description and its patterns");
+              g_cap_dialog.f0pats == "*.pet;" && g_cap_dialog.f0exts == "pet",
+          "lpstrFilter split into a description, its patterns and its extensions");
     check(g_cap_dialog.flags == 0x80eu && g_cap_dialog.filter_index == 1,
           "Flags and nFilterIndex reached the presenter");
     check(gm_str(file_buf, 260) == "Z:\\captured\\Chosen.pet",
@@ -3486,6 +3686,23 @@ static void test_common_dialogs(X86 *c) {
           "and the granted path maps straight back to the host path");
     check(call_import(c, "comdlg32.dll", "CommDlgExtendedError", {}) == 0,
           "a success leaves CommDlgExtendedError at 0");
+
+    // A two-entry filter whose second entry names two extensions: the seam
+    // carries each entry's description, patterns and derived extensions.
+    const char kTwo[] = "Bitmap (*.bmp)\0*.bmp\0JPEG (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0";
+    wr32(ofn + 12, put_bytes(kTwo, sizeof kTwo));
+    wr32(ofn + 24, 0);
+    memcpy(g_mem + file_buf, "x.jpg", 6);
+    check(call_import(c, "comdlg32.dll", "GetSaveFileNameA", {ofn}) == 1,
+          "a two-filter OPENFILENAMEA opens");
+    check(g_cap_dialog.filter_count == 2 && g_cap_dialog.f0desc == "Bitmap (*.bmp)" &&
+              g_cap_dialog.f0pats == "*.bmp" && g_cap_dialog.f0exts == "bmp",
+          "the first filter keeps its description, pattern and extension");
+    check(g_cap_dialog.f1desc == "JPEG (*.jpg;*.jpeg)" && g_cap_dialog.f1pats == "*.jpg;*.jpeg" &&
+              g_cap_dialog.f1exts == "jpg;jpeg",
+          "the second filter's multi-pattern yields jpg and jpeg");
+    wr32(ofn + 12, filter);
+    wr32(ofn + 24, 1);
     os_set_file_dialog_presenter(nullptr);
 
     // The deterministic fallback: RECOMP_FILE_DIALOG_RESULT chooses the path.
@@ -8176,9 +8393,12 @@ int main(int argc, char **argv) {
     test_native_draw_waits(c);
     test_midi(c);
     test_windows(c);
+    test_file_filter_extensions();
     test_common_dialogs(c);
     test_host_path_grants(c);
     test_synchronous_geometry(c);
+    test_static_settext_erase(c);
+    test_listbox_selection(c);
     test_listbox_ownerdraw_hit(c);
     test_dialog_dlu_mapping(c);
     test_dialog_frame_geometry(c);

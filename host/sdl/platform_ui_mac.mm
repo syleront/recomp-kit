@@ -35,8 +35,12 @@ const char *basename_of(const char *path) {
     return base;
 }
 
-// Extensions named by a Win32 filter pattern ("*.pet;*.PET"), as an NSArray of
-// bare extensions. "*.*"/"*" adds nothing (all files are allowed).
+// The extensions a Win32 filter allows, as an NSArray of bare extensions. The
+// runtime derives them from the pattern *and* from the description's advertised
+// list (see os_file_filter_extensions), so a filter that names a type its
+// pattern omits - Petz 5's Editor "Picture Files (*.BMP; *.JPG)" with pattern
+// "*.bmp;" - keeps that type selectable. An empty list means every file, so
+// nothing is restricted.
 NSArray<NSString *> *allowed_types(const OsFileDialog *d) {
     if (!d->filters || d->filter_count <= 0)
         return nil;
@@ -44,20 +48,17 @@ NSArray<NSString *> *allowed_types(const OsFileDialog *d) {
     for (int i = 0; i < d->filter_count; ++i) {
         if (d->filter_index > 0 && d->filter_index != i + 1)
             continue;
-        const char *patterns = d->filters[i].patterns;
-        if (!patterns)
-            continue;
-        std::string list(patterns);
+        const char *exts = d->filters[i].extensions;
+        if (!exts || !*exts)
+            return nil; // this filter allows every file
+        std::string list(exts);
         size_t at = 0;
         while (at <= list.size()) {
             size_t sep = list.find(';', at);
             std::string token = list.substr(at, sep == std::string::npos ? sep : sep - at);
             at = sep == std::string::npos ? list.size() + 1 : sep + 1;
-            if (token.rfind("*.", 0) == 0 && token.size() > 2)
-                token = token.substr(2);
-            else if (token == "*" || token == "*.*" || token.empty())
-                continue;
-            [set addObject:[NSString stringWithUTF8String:token.c_str()]];
+            if (!token.empty())
+                [set addObject:[NSString stringWithUTF8String:token.c_str()]];
         }
     }
     return set.count ? set.array : nil;

@@ -87,6 +87,19 @@ void paint_control(X86 *c, uint32_t hwnd, uint32_t into) {
             host_dispatch_to_wndproc(c, parent, 0x0131 /* WM_CTLCOLORDLG */, hdc, parent);
         have_pixel = dlg_brush && gdi::brush_color(dlg_brush, &pixel);
     }
+    // A caption STATIC that gets no brush must still erase its old glyphs before
+    // the new ones are drawn: repainting only the control would land the new
+    // text on the old (Petz 5's Editor trackbar value smeared this way). Windows
+    // erases a STATIC with the dialog's face colour in this case. A control that
+    // shows no text (`flags` is 0 for SS_ICON/SS_BITMAP/SS_*RECT) keeps the
+    // null-brush "do not erase" rule - that is what lets the Petz Profile's
+    // portrait static, which the dialog's own WM_PAINT paints into, show through.
+    if (!have_pixel && flags) {
+        if (Window *pw = find_window(parent); pw && pw->cls == "#32770") {
+            pixel = gdi::argb(0x00c8d0d4); // COLOR_BTNFACE
+            have_pixel = true;
+        }
+    }
     if (have_pixel)
         gdi::fill(hdc, {0, 0, width, height}, pixel);
     // The caption is drawn transparent over the background just filled (or over

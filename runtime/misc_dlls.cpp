@@ -4,8 +4,10 @@
 #include "win32.h"
 #include "../platform/os.h"
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace {
@@ -220,13 +222,86 @@ void folder_path(X86 *c) {
 // FNERR_BUFFERTOOSMALL.
 // ---------------------------------------------------------------------------
 uint32_t g_commdlg_error = 0;
+} // namespace
 
+// Add one token ("*.jpg", ".JPG", "*.bmp") to the ';'-separated extension list
+// in `exts`, lowercasing it and dropping duplicates. A "*"/"*.*" token sets
+// `all`, which means the filter allows every file.
+static void add_filter_extension(std::string &exts, std::string tok, bool &all) {
+    while (!tok.empty() && std::isspace((unsigned char)tok.front()))
+        tok.erase(tok.begin());
+    while (!tok.empty() && std::isspace((unsigned char)tok.back()))
+        tok.pop_back();
+    if (tok == "*" || tok == "*.*") {
+        all = true;
+        return;
+    }
+    if (tok.size() >= 2 && tok[0] == '*' && tok[1] == '.')
+        tok = tok.substr(2);
+    else if (!tok.empty() && tok[0] == '.')
+        tok = tok.substr(1);
+    else
+        return; // not a wildcard extension
+    for (char &ch : tok)
+        ch = (char)std::tolower((unsigned char)ch);
+    if (tok.empty() || tok.find_first_of("*?") != std::string::npos)
+        return; // not a bare extension
+    if (exts.empty())
+        exts = tok;
+    else if ((";" + exts + ";").find(";" + tok + ";") == std::string::npos)
+        exts += ";" + tok;
+}
+
+// Every extension a Win32 filter advertises: the wildcards in its pattern list
+// and any wildcard list its description carries ("Picture Files (*.BMP;
+// *.JPG)"). Windows only narrows the *view* by the filter and still lets the
+// user open any name, so a picker that hard-restricts (the macOS panel's
+// allowedFileTypes) must honour the description's list too - otherwise Petz 5's
+// Editor Browse dialog ("Picture Files (*.BMP; *.JPG)", pattern "*.bmp;")
+// refuses to select the .jpg the dialog just advertised. An empty result means
+// the filter allows every file.
+void os_file_filter_extensions(const char *patterns, const char *description, char *out, size_t cap) {
+    std::string exts;
+    bool all = false;
+    if (patterns) {
+        std::string list(patterns);
+        size_t at = 0;
+        while (at <= list.size()) {
+            size_t sep = list.find(';', at);
+            std::string tok = list.substr(at, sep == std::string::npos ? sep : sep - at);
+            at = sep == std::string::npos ? list.size() + 1 : sep + 1;
+            if (!tok.empty())
+                add_filter_extension(exts, tok, all);
+        }
+    }
+    if (description) {
+        const char *lp = std::strchr(description, '(');
+        const char *rp = lp ? std::strchr(lp, ')') : nullptr;
+        if (lp && rp) {
+            std::string inner(lp + 1, rp);
+            for (size_t i = 0; i <= inner.size();) {
+                size_t j = i;
+                while (j < inner.size() && inner[j] != ';' && inner[j] != ',' &&
+                       !std::isspace((unsigned char)inner[j]))
+                    ++j;
+                if (j > i)
+                    add_filter_extension(exts, inner.substr(i, j - i), all);
+                i = j + 1;
+            }
+        }
+    }
+    if (all)
+        exts.clear();
+    snprintf(out, cap, "%s", exts.c_str());
+}
+
+namespace {
 // The Win32 filter string is pairs of NUL-terminated strings ending with a
 // double NUL: description\0pattern\0...\0\0. The pattern is a
 // semicolon-separated list of wildcards. Split it into the plain form the
 // platform seam takes; malformed input stops at the first empty description.
 int parse_ofn_filter(uint32_t lpstrFilter, OsFileFilter *out, char descs[][128], char pats[][256],
-                     int max) {
+                     char exts[][128], int max) {
     if (!lpstrFilter || !gm_valid(lpstrFilter, 1))
         return 0;
     int count = 0;
@@ -241,8 +316,10 @@ int parse_ofn_filter(uint32_t lpstrFilter, OsFileFilter *out, char descs[][128],
         p += (uint32_t)pattern.size() + 1;
         snprintf(descs[count], 128, "%s", desc.c_str());
         snprintf(pats[count], 256, "%s", pattern.c_str());
+        os_file_filter_extensions(pattern.c_str(), desc.c_str(), exts[count], 128);
         out[count].description = descs[count];
         out[count].patterns = pats[count];
+        out[count].extensions = exts[count];
         ++count;
     }
     return count;
@@ -284,8 +361,8 @@ void common_dialog(X86 *c, bool save) {
     std::string ext = lpstrDefExt ? gm_str(lpstrDefExt, 32) : std::string();
 
     OsFileFilter filters[8];
-    char descs[8][128], pats[8][256];
-    int filter_count = parse_ofn_filter(lpstrFilter, filters, descs, pats, 8);
+    char descs[8][128], pats[8][256], exts[8][128];
+    int filter_count = parse_ofn_filter(lpstrFilter, filters, descs, pats, exts, 8);
 
     std::vector<char> buf((size_t)nMaxFile, 0);
     if (!initial.empty())
@@ -306,8 +383,9 @@ void common_dialog(X86 *c, bool save) {
     d.file_offset = &file_offset;
     d.file_extension = &file_extension;
 
-    LOGW("%s: title \"%s\", initial \"%s\", %d filter(s), flags 0x%x", kind, title.c_str(),
-         initial.c_str(), filter_count, flags);
+    LOGW("%s: title \"%s\", initial \"%s\", %d filter(s) [%s | %s], flags 0x%x", kind, title.c_str(),
+         initial.c_str(), filter_count, filter_count > 0 ? descs[0] : "", filter_count > 0 ? pats[0] : "",
+         flags);
     int r = os_file_dialog(&d);
     if (r == 1 || r == -2) {
         size_t n = 0;

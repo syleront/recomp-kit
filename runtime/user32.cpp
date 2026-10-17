@@ -2607,7 +2607,8 @@ bool owner_draw_listbox(X86 *c, Window *w, uint32_t hwnd, uint32_t hdc, int32_t 
         wr32(ds + 0x04, w->id);                      // CtlID
         wr32(ds + 0x08, uint32_t(i));                // itemID = the row index
         wr32(ds + 0x0c, 1);                          // itemAction = ODA_DRAWENTIRE
-        wr32(ds + 0x10, i == w->list_sel ? 1u : 0u); // itemState = ODS_SELECTED
+        wr32(ds + 0x10,
+             (w->list_selected.count(i) || i == w->list_sel) ? 1u : 0u); // ODS_SELECTED
         wr32(ds + 0x14, hwnd);                       // hwndItem
         wr32(ds + 0x18, hdc);                        // hDC
         wr32(ds + 0x1c, 0);                          // rcItem.left
@@ -3114,9 +3115,10 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
     int32_t y = 0;
     for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y < height; ++i) {
         int32_t ih = listbox_item_height(c, w, i);
+        const bool selected = w->list_selected.count(i) || i == w->list_sel;
         if (auto *paint_dc = gdi::dc_of(hdc))
-            paint_dc->text_color = i == w->list_sel ? 0x00ffffff : 0x00000000;
-        if (i == w->list_sel)
+            paint_dc->text_color = selected ? 0x00ffffff : 0x00000000;
+        if (selected)
             gdi::fill(hdc, {0, y, row_width, y + ih}, 0x00c00000);
         uint32_t units = wide_units(w->list_items[i]);
         if (!units) {
@@ -4320,8 +4322,15 @@ void control_proc(X86 *c) {
                 i = int32_t(w->list_items.size());
             w->list_items.insert(w->list_items.begin() + i, gm_str(arg(c, 3)));
             // Inserting shifts every later row's index; the per-row height cache
-            // is keyed by index, so drop it and measure the moved rows again.
+            // is keyed by index, so drop it and measure the moved rows again,
+            // and shift the selection set the same way.
             w->list_item_heights.clear();
+            std::set<int32_t> shifted;
+            for (int32_t s : w->list_selected)
+                shifted.insert(s >= i ? s + 1 : s);
+            w->list_selected.swap(shifted);
+            if (w->list_sel >= i)
+                ++w->list_sel;
             w->update_pending = true;
             set_eax(c, uint32_t(i));
         } else {
@@ -4334,18 +4343,60 @@ void control_proc(X86 *c) {
             w->list_items.clear();
             w->list_sel = -1;
             w->list_top = 0;
+            w->list_selected.clear();
             w->list_item_heights.clear();
             w->update_pending = true;
         }
         set_eax(c, 0);
         return;
+    case 0x0185: { // LB_SETSEL: select or clear one row (or all with index -1)
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        const bool select = arg(c, 2) != 0;
+        const int32_t idx = int32_t(arg(c, 3));
+        const int32_t n = int32_t(w->list_items.size());
+        if (idx == -1) {
+            w->list_selected.clear();
+            if (select)
+                for (int32_t i = 0; i < n; ++i)
+                    w->list_selected.insert(i);
+        } else if (idx >= 0 && idx < n) {
+            if (select) {
+                w->list_selected.insert(idx);
+                w->list_sel = idx;
+            } else {
+                w->list_selected.erase(idx);
+            }
+        }
+        w->update_pending = true;
+        set_eax(c, 0);
+        return;
+    }
     case 0x0186: { // LB_SETCURSEL
         int32_t i = int32_t(arg(c, 2));
-        if (w)
+        if (w) {
             w->list_sel = (i < 0 || i >= int32_t(w->list_items.size())) ? -1 : i;
-        if (w)
+            w->list_selected.clear();
+            if (w->list_sel >= 0)
+                w->list_selected.insert(w->list_sel);
             w->update_pending = true;
+        }
         set_eax(c, w ? uint32_t(w->list_sel) : 0xffffffffu);
+        return;
+    }
+    case 0x0187: { // LB_GETSEL: is this row selected?
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        const int32_t idx = int32_t(arg(c, 2));
+        if (idx < 0 || idx >= int32_t(w->list_items.size())) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        set_eax(c, w->list_selected.count(idx) ? 1u : 0u);
         return;
     }
     case 0x0188: // LB_GETCURSEL
@@ -4384,8 +4435,16 @@ void control_proc(X86 *c) {
         set_eax(c, found < 0 ? 0xffffffffu : uint32_t(found));
         return;
     }
-    case 0x0190: { // LB_SELECTSTRING
+    case 0x018c: { // LB_SELECTSTRING: find the prefix, then make it the caret
+        // An empty prefix matches nothing, as on Windows; the search starts at
+        // the item after `wParam`. (This is 0x018C, not 0x0190: 0x0190 is
+        // LB_GETSELCOUNT. The two were swapped here, which made the Editor's
+        // Contact Sound list select row 1 on every click - see the note.)
         std::string want = gm_str(arg(c, 3));
+        if (want.empty()) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
         std::string lower_want = user32::lower(want);
         int32_t start = int32_t(arg(c, 2)) + 1;
         int32_t found = -1;
@@ -4397,9 +4456,31 @@ void control_proc(X86 *c) {
                 }
         if (w && found >= 0) {
             w->list_sel = found;
+            w->list_selected.clear();
+            w->list_selected.insert(found);
             w->update_pending = true;
         }
         set_eax(c, found < 0 ? 0xffffffffu : uint32_t(found));
+        return;
+    }
+    case 0x0190: // LB_GETSELCOUNT: how many rows are selected
+        set_eax(c, w ? uint32_t(w->list_selected.size()) : 0xffffffffu);
+        return;
+    case 0x0191: { // LB_GETSELITEMS: fill `wParam` ints with the selected rows
+        int32_t max_items = int32_t(arg(c, 2));
+        uint32_t buf = arg(c, 3);
+        if (!w) {
+            set_eax(c, 0xffffffffu);
+            return;
+        }
+        int32_t written = 0;
+        for (int32_t i = 0; i < int32_t(w->list_items.size()) && written < max_items; ++i)
+            if (w->list_selected.count(i)) {
+                if (gm_valid(buf + 4u * uint32_t(written), 4))
+                    wr32(buf + 4u * uint32_t(written), uint32_t(i));
+                ++written;
+            }
+        set_eax(c, uint32_t(written));
         return;
     }
     case 0x0197: // LB_SETTOPINDEX
@@ -4450,7 +4531,10 @@ void control_proc(X86 *c) {
         return;
     }
     case 0x01a1: { // LB_GETITEMHEIGHT
-        set_eax(c, w ? uint32_t(listbox_item_height(c, w, int32_t(arg(c, 2)))) : 0xffffffffu);
+        int32_t ih = w ? listbox_item_height(c, w, int32_t(arg(c, 2))) : -1;
+        LOGW("LB_GETITEMHEIGHT hwnd=%08x item=%d -> %d style=%08x", arg(c, 1), int32_t(arg(c, 2)), ih,
+             w ? w->style : 0);
+        set_eax(c, w ? uint32_t(ih) : 0xffffffffu);
         return;
     }
     case 0x01a9: { // LB_ITEMFROMPOINT: LOWORD row, HIWORD non-zero when outside
@@ -5116,6 +5200,11 @@ void control_proc(X86 *c) {
             int32_t row = listbox_item_from_y(c, w, my);
             if (row >= 0 && row != w->list_sel) {
                 w->list_sel = row;
+                // A plain click replaces the selection, even in an extended-
+                // select box (the modifiers are what extend it, and the game's
+                // own subclass drives its multi-selection with LB_SETSEL).
+                w->list_selected.clear();
+                w->list_selected.insert(row);
                 w->update_pending = true;
                 if (w->parent)
                     host_dispatch_to_wndproc(c, w->parent, 0x0111 /* WM_COMMAND */, w->id & 0xffffu,
