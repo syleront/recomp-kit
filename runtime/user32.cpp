@@ -2536,6 +2536,55 @@ void listbox_scroll_to(X86 *c, Window *w, int32_t top) {
     w->update_pending = true;
 }
 
+// A listbox with WS_VSCROLL (0x00200000) draws its own 16 px scrollbar on the
+// right: two arrows, a track and a proportional thumb. A click on an arrow
+// lines, on the track pages, and a drag moves the thumb. The wheel and the
+// arrow keys already scroll (TD-062).
+constexpr int32_t listbox_sb_width = 16;
+bool listbox_has_scrollbar(const Window *w) {
+    return (w->style & 0x00200000u) != 0;
+}
+// The total height of every row, which the thumb's size is proportional to.
+int32_t listbox_content_height(X86 *c, Window *w) {
+    int32_t total = 0;
+    for (int32_t i = 0; i < int32_t(w->list_items.size()); ++i)
+        total += std::max(1, listbox_item_height(c, w, i));
+    return total;
+}
+// The thumb's top (client y, measured from the top arrow) and height for the
+// current view. The track is the client less the two 16 px arrow boxes.
+int32_t listbox_thumb(X86 *c, Window *w, int32_t *thumb_h) {
+    const int32_t total = listbox_content_height(c, w);
+    const int32_t track = w->h - 2 * listbox_sb_width;
+    const int32_t view = w->h;
+    int32_t th = track;
+    if (total > view && total > 0)
+        th = int32_t(std::max<int64_t>(16, int64_t(track) * view / total));
+    if (th > track)
+        th = track;
+    int32_t above = 0;
+    for (int32_t i = 0; i < w->list_top && i < int32_t(w->list_items.size()); ++i)
+        above += std::max(1, listbox_item_height(c, w, i));
+    int32_t top = listbox_sb_width;
+    if (total > view && track > th)
+        top += int32_t(int64_t(above) * (track - th) / (total - view));
+    if (thumb_h)
+        *thumb_h = th;
+    return top;
+}
+// The zone a pointer at client y is over on the listbox's scrollbar: 1 = up
+// arrow, 2 = track above the thumb, 3 = the thumb, 4 = track below, 5 = down.
+int32_t listbox_sb_zone(X86 *c, Window *w, int32_t y) {
+    if (y < listbox_sb_width)
+        return 1; // the up arrow
+    if (y >= w->h - listbox_sb_width)
+        return 5; // the down arrow
+    int32_t th = 0;
+    const int32_t top = listbox_thumb(c, w, &th);
+    if (y >= top && y < top + th)
+        return 3;           // the thumb
+    return y < top ? 2 : 4; // the track above / below the thumb
+}
 // An owner-draw listbox (LBS_OWNERDRAWFIXED / LBS_OWNERDRAWVARIABLE) does not
 // draw its own rows: Windows asks the parent for the row height with
 // WM_MEASUREITEM, then asks it to draw each visible row with WM_DRAWITEM. The
@@ -2715,6 +2764,16 @@ void fill_disc(uint32_t hdc, int32_t cx, int32_t cy, int32_t r, uint32_t color) 
         while (x > 0 && int64_t(x) * x + int64_t(dy) * dy > int64_t(r) * r)
             --x;
         gdi::fill(hdc, {cx - x, cy + dy, cx + x + 1, cy + dy + 1}, color);
+    }
+}
+// A filled triangle pointing up or down, by horizontal spans (the runtime has
+// no polygon fill a control paint can reach). Shared by the scrollbar arrows,
+// the combo box's drop-down arrow and the up-down.
+void fill_triangle(uint32_t hdc, int32_t cx, int32_t cy, int32_t half, uint32_t color, bool down) {
+    for (int32_t i = 0; i <= half; ++i) {
+        const int32_t w = half - i;
+        const int32_t y = down ? cy - half + i : cy + half - i;
+        gdi::fill(hdc, {cx - w, y, cx + w + 1, y + 1}, color);
     }
 }
 // Button styles whose check state is the window's own `check_state` rather than
@@ -2995,6 +3054,28 @@ void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
     }
 }
 
+// The listbox's own WS_VSCROLL bar, drawn in the right 16 px: two arrow boxes,
+// a track and a proportional thumb. The rows are drawn narrower to make room.
+void paint_listbox_scrollbar(X86 *c, Window *w, uint32_t hdc) {
+    const int32_t x0 = w->w - listbox_sb_width, height = w->h;
+    const uint32_t face = gdi::argb(0x00c8d0d4), light = gdi::argb(0x00ffffff),
+                   dark = gdi::argb(0x00000000), shadow = gdi::argb(0x00808080);
+    gdi::fill(hdc, {x0, 0, w->w, height}, face);
+    auto bevel = [&](int32_t t, int32_t b) {
+        gdi::fill(hdc, {x0, t, w->w, t + 1}, light);
+        gdi::fill(hdc, {x0, t, x0 + 1, b}, light);
+        gdi::fill(hdc, {x0, b - 1, w->w, b}, dark);
+        gdi::fill(hdc, {w->w - 1, t, w->w, b}, dark);
+    };
+    bevel(0, listbox_sb_width);
+    bevel(height - listbox_sb_width, height);
+    fill_triangle(hdc, x0 + listbox_sb_width / 2, listbox_sb_width / 2, 4, dark, false);
+    fill_triangle(hdc, x0 + listbox_sb_width / 2, height - listbox_sb_width / 2, 4, dark, true);
+    int32_t th = 0;
+    const int32_t top = listbox_thumb(c, w, &th);
+    bevel(top, top + th);
+    gdi::fill(hdc, {x0 + 4, top + 3, w->w - 4, top + 4}, shadow);
+}
 // A listbox control with strings (LBS_HASSTRINGS): paint the rows top to
 // bottom and highlight the selected one, each at the row height above. An
 // owner-draw listbox instead hands each row to the parent's WM_DRAWITEM.
@@ -3014,8 +3095,12 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
     if (w->font)
         dc->font = w->font;
     gdi::fill(hdc, {0, 0, width, height}, 0x00ffffff);
-    bool drawn = owner_draw_listbox(c, w, hwnd, hdc, width, height);
+    const bool sb = listbox_has_scrollbar(w);
+    const int32_t row_width = width - (sb ? listbox_sb_width : 0);
+    bool drawn = owner_draw_listbox(c, w, hwnd, hdc, row_width, height);
     if (drawn) {
+        if (sb)
+            paint_listbox_scrollbar(c, w, hdc);
         if (!into)
             gdi_release_window_dc(hwnd, hdc);
         else if (auto *caller = gdi::dc_of(hdc)) {
@@ -3032,7 +3117,7 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
         if (auto *paint_dc = gdi::dc_of(hdc))
             paint_dc->text_color = i == w->list_sel ? 0x00ffffff : 0x00000000;
         if (i == w->list_sel)
-            gdi::fill(hdc, {0, y, width, y + ih}, 0x00c00000);
+            gdi::fill(hdc, {0, y, row_width, y + ih}, 0x00c00000);
         uint32_t units = wide_units(w->list_items[i]);
         if (!units) {
             y += ih;
@@ -3041,7 +3126,7 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
         if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
             wr32(block + 0, 2);
             wr32(block + 4, y);
-            wr32(block + 8, width - 2);
+            wr32(block + 8, uint32_t(row_width - 2));
             wr32(block + 12, y + ih);
             gm_put_wstr(block + 16, w->list_items[i], units + 1);
             gdi::draw_text(hdc, block + 16, units, block, 0x24 /* DT_SINGLELINE|DT_VCENTER */);
@@ -3049,6 +3134,8 @@ void paint_listbox(X86 *c, uint32_t hwnd, uint32_t into) {
         }
         y += ih;
     }
+    if (sb)
+        paint_listbox_scrollbar(c, w, hdc);
     if (!into)
         gdi_release_window_dc(hwnd, hdc);
     else if (auto *caller = gdi::dc_of(hdc)) {
@@ -3375,15 +3462,6 @@ void range_notify(X86 *c, uint32_t hwnd, uint32_t code, int32_t pos) {
     const uint32_t msg = range_vertical(w) ? 0x0115u /*WM_VSCROLL*/ : 0x0114u /*WM_HSCROLL*/;
     const uint32_t hi = (code == 4 || code == 5) ? uint32_t(uint16_t(pos)) : 0u;
     host_dispatch_to_wndproc(c, w->parent, msg, (hi << 16) | (code & 0xffffu), hwnd);
-}
-// A filled triangle pointing up or down, by horizontal spans (the runtime has
-// no polygon fill a control paint can reach).
-void fill_triangle(uint32_t hdc, int32_t cx, int32_t cy, int32_t half, uint32_t color, bool down) {
-    for (int32_t i = 0; i <= half; ++i) {
-        const int32_t w = half - i;
-        const int32_t y = down ? cy - half + i : cy + half - i;
-        gdi::fill(hdc, {cx - w, y, cx + w + 1, y + 1}, color);
-    }
 }
 void paint_trackbar(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
@@ -4965,6 +5043,17 @@ void control_proc(X86 *c) {
                     range_notify(c, hwnd, 5 /*SB_THUMBTRACK*/, np);
                 }
             }
+        } else if (w->cls == "listbox" && w->thumb_drag && listbox_has_scrollbar(w)) {
+            // Drag the scrollbar thumb: map the pointer's position on the track
+            // to the first-visible row.
+            const int32_t max_top = listbox_max_top(c, w);
+            const int32_t band = w->h - 2 * listbox_sb_width;
+            int32_t frac = band > 0 ? (my - listbox_sb_width) * 1000 / band : 0;
+            if (frac < 0)
+                frac = 0;
+            if (frac > 1000)
+                frac = 1000;
+            listbox_scroll_to(c, w, int32_t(int64_t(frac) * max_top / 1000));
         }
         // An open combo box's drop-down is its own popup window and takes the
         // pointer capture, so a move over the list never reaches the combo.
@@ -4995,10 +5084,36 @@ void control_proc(X86 *c) {
             // arrow keys that follow reach it. The dialog manager otherwise
             // leaves focus on the first tab stop (its OK button).
             set_focus_window(hwnd);
+            const int32_t mx = int16_t(arg(c, 3) & 0xffff);
+            const int32_t my = int16_t((arg(c, 3) >> 16) & 0xffff);
+            // A WS_VSCROLL box owns its right 16 px: the arrows line, the track
+            // pages and the thumb starts a drag, none of which selects a row.
+            if (listbox_has_scrollbar(w) && mx >= w->w - listbox_sb_width) {
+                switch (listbox_sb_zone(c, w, my)) {
+                case 1:
+                    listbox_scroll_to(c, w, w->list_top - 1);
+                    break;
+                case 5:
+                    listbox_scroll_to(c, w, w->list_top + 1);
+                    break;
+                case 3:
+                    w->thumb_drag = true;
+                    set_capture_window(hwnd); // keep the drag even off the bar
+                    break;
+                case 2:
+                    listbox_scroll_to(c, w, w->list_top - 3);
+                    break;
+                default:
+                    listbox_scroll_to(c, w, w->list_top + 3);
+                    break;
+                }
+                set_eax(c, 0);
+                return;
+            }
             // The click row comes from the same heights the paint and
             // LB_GETITEMRECT use; a hard 16 px divisor here selected the wrong
             // row once WM_MEASUREITEM gave the box a different height.
-            int32_t row = listbox_item_from_y(c, w, int16_t((arg(c, 3) >> 16) & 0xffff));
+            int32_t row = listbox_item_from_y(c, w, my);
             if (row >= 0 && row != w->list_sel) {
                 w->list_sel = row;
                 w->update_pending = true;
@@ -5131,6 +5246,11 @@ void control_proc(X86 *c) {
     case 0x0202: { // WM_LBUTTONUP: a completed click reports WM_COMMAND
         uint32_t parent = w ? w->parent : 0, id = w ? w->id : 0;
         LOGW("control: WM_LBUTTONUP hwnd=%08x id=%u parent=%08x", hwnd, id, parent);
+        if (w && w->cls == "listbox") {
+            w->thumb_drag = false; // end a scrollbar-thumb drag
+            if (capture_window() == hwnd)
+                set_capture_window(0);
+        }
         // The range controls and the combo box end their own interaction and
         // never report BN_CLICKED.
         if (w && (w->cls == "msctls_trackbar32" || w->cls == "scrollbar")) {

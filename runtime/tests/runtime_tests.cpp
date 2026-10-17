@@ -2963,6 +2963,28 @@ static void test_range_and_common_controls(X86 *c) {
     check(g_range_scroll_code == 0 /*SB_LINEUP*/, "the scrollbar reports SB_LINEUP (code %u)",
           g_range_scroll_code);
 
+    // --- a listbox's own WS_VSCROLL bar (TD-062) ---
+    uint32_t lb = make("listbox", 0x00200000u /*WS_VSCROLL*/, 0, 240, 100, 64, 1306);
+    check(lb != 0, "create a listbox with WS_VSCROLL");
+    for (int i = 0; i < 20; ++i) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "Row %d", i);
+        send(lb, 0x0180 /*LB_ADDSTRING*/, 0, put_str(nm));
+    }
+    check(send(lb, 0x018e /*LB_GETTOPINDEX*/, 0, 0) == 0, "the list starts at the top");
+    // The right 16 px is the scrollbar: the down arrow is its bottom 16 px.
+    send(lb, 0x0201, 1, (56u << 16) | 92u);
+    check(send(lb, 0x018e, 0, 0) == 1, "the scrollbar's down arrow scrolls one row");
+    // The track below the thumb pages by three rows (thumb is [16,32) here).
+    send(lb, 0x0201, 1, (40u << 16) | 92u);
+    check(send(lb, 0x018e, 0, 0) == 4, "the scrollbar's track pages three rows");
+    send(lb, 0x0202 /*WM_LBUTTONUP*/, 0, 0);
+    // A click left of the bar still selects a row.
+    send(lb, 0x0201, 1, (40u << 16) | 5u);
+    check(send(lb, 0x0188 /*LB_GETCURSEL*/, 0, 0) == 6, "a row click still selects (row %u)",
+          send(lb, 0x0188, 0, 0));
+    send(lb, 0x0202, 0, 0);
+
     // --- radio groups (TD-081): a click clears the group's other buttons ---
     uint32_t r1 =
         make("button", 9u | 0x20000u /*BS_AUTORADIOBUTTON|WS_GROUP*/, 0, 180, 80, 12, 1400);
