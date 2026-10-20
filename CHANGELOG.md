@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Paint a modeless dialog's frame and client background. Only the modal
+  `DialogBoxParamA` pump ran the chrome/erase synthesis, so a `CreateDialogParamA`
+  dialog (the splash, the Playscene Editor wizard) never had its frame painted
+  and its client stayed unpainted: a caption STATIC erased itself with
+  `COLOR_BTNFACE`, leaving a light box on the surface (TD-072/TD-108). The guest
+  message loop's `WM_PAINT` now paints the chrome and face fill once, before the
+  first client paint, and never refills afterwards (the splash paints its own
+  bitmap into that client).
+- Honour the remaining BUTTON placement styles: `BS_MULTILINE` wraps a caption
+  and centres the block, `BS_PUSHLIKE` draws a checkbox/radio as a push button
+  whose bevel stays down while checked, `BS_LEFTTEXT` puts the glyph on the
+  right, and `BS_TOP`/`BS_BOTTOM`/`BS_VCENTER` place the glyph vertically.
+- Support `CBS_SIMPLE` combo boxes (an always-open list under the field, the
+  template height being field plus list) and per-item `CB_SETITEMDATA`/
+  `CB_GETITEMDATA` storage that follows insert/delete/reset.
+- Give a `WS_SYSMENU` dialog a working system menu: `Alt+F4` closes it through
+  the close-box rule (`WM_COMMAND IDCANCEL`, then `WM_CLOSE`), `Alt+Space` and a
+  click on the caption's system-menu box open a labelled Move/Close popup, and a
+  caption double-click opens the same menu. A system-menu popup no longer treats
+  the release of the click that opened it as a choice.
 - Implement the MSVCIRT entry points a content module imports but the
   executable does not. A content module (a `.toy`/`.env`/`.cat`/`.dog`) is a
   separate PE that imports a few more names from the same VC6 old-iostreams

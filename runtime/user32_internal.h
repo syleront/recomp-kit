@@ -125,6 +125,17 @@ struct Window {
     // True when the caption bar above the client is drawn (WS_CAPTION); the
     // chrome painter needs it to place the title and the close box.
     bool nc_caption = false;
+    // True on a dialog built by CreateDialogParamA. The guest's own message loop
+    // paints such a dialog (there is no modal pump to do it), so the paint
+    // synthesis paints its frame and client background once before the first
+    // client paint (TD-072/TD-108). `dlg_client_painted` records that the
+    // one-time chrome/erase has run; later paints must not refill the client,
+    // which would erase what the dialog's own WM_PAINT drew (the splash).
+    bool dlg_modeless = false;
+    bool dlg_client_painted = false;
+    // A combo box's per-item data (CB_SETITEMDATA/CB_GETITEMDATA), kept in step
+    // with list_items. A listbox has its own item data path and never uses this.
+    std::vector<uint32_t> combo_item_data;
 };
 
 struct Msg {
@@ -240,6 +251,16 @@ void ensure_system_classes();
 // parent's WM_CTLCOLORSTATIC brush, then the text). Shared with the dialog
 // engine's control_proc.
 void paint_control(X86 *c, uint32_t hwnd, uint32_t into);
+// Alt+F4 and Alt+Space on a dialog (Windows' DefDlgProc/DefWindowProc system
+// commands). `msg` is WM_KEYDOWN/WM_SYSKEYDOWN and `vk` the virtual key; the
+// Alt state is read from the guest's key state. Returns true when the message
+// was a system command and must not be dispatched: Alt+F4 asks the dialog to
+// close (WM_COMMAND IDCANCEL then WM_CLOSE, the close-box rule), Alt+Space
+// opens its system menu at the caption. Only a #32770 with WS_SYSMENU answers.
+bool dialog_system_key(X86 *c, uint32_t hwnd, uint32_t msg, uint32_t vk);
+// Pop up a dialog's system menu (Move/Close) at a screen point and apply the
+// chosen command. Only a framed #32770 with WS_SYSMENU has one.
+void dialog_open_system_menu(X86 *c, uint32_t hwnd, int32_t screen_x, int32_t screen_y);
 // Builds a dialog and its controls from a DLGTEMPLATE that is already in guest
 // memory (address `tmpl`, `size` bytes), applying the template's DS_SETFONT
 // face to the dialog and each control. The resource entry points share this

@@ -593,6 +593,28 @@ void u_ShowWindow(X86 *c) {
     }
 }
 
+// A modeless dialog is painted by the guest's own loop, so no pump runs its
+// frame/background synthesis. Before the first WM_PAINT of the dialog or one of
+// its children, paint the chrome and the COLOR_BTNFACE client fill once, in the
+// order the modal pump uses (chrome/erase first). Every later paint is left to
+// the guest. A caption STATIC then erases against a face-coloured client
+// (TD-108) and the dialog has its frame (TD-072) without a refill erasing the
+// dialog's own painting (the splash bitmap).
+static void prepare_modeless_dialog_paint(X86 *c, uint32_t hwnd) {
+    uint32_t dlg = hwnd;
+    for (size_t n = 0; dlg && n < windows().size(); ++n) {
+        Window *w = find_window(dlg);
+        if (!w)
+            return;
+        if (w->dlg_modeless) {
+            if (!w->dlg_client_painted)
+                paint_dialog_chrome(c, dlg);
+            return;
+        }
+        dlg = w->parent;
+    }
+}
+
 // UpdateWindow sends WM_PAINT directly to the window procedure, synchronously,
 // and only if the update region is not empty. It does not post: a posted
 // WM_PAINT would arrive whenever the guest next pumped, and a guest that never
@@ -608,6 +630,7 @@ void u_UpdateWindow(X86 *c) {
         // (or ValidateRect), so a WNDPROC that ignores WM_PAINT leaves the
         // window dirty and gets asked again. Clearing it up front would lose
         // the paint entirely for such a window.
+        prepare_modeless_dialog_paint(c, w->hwnd);
         host_dispatch_to_wndproc(c, w->hwnd, 0x000f /* WM_PAINT */, 0, 0);
     }
     set_eax(c, 1);
@@ -673,8 +696,9 @@ void u_SetWindowPos(X86 *c) {
 // A framed dialog's non-client hit test, DefWindowProc's answer to
 // WM_NCHITTEST. `x`/`y` are CLIENT coordinates: a point in the caption is
 // negative y, a point in the left border negative x, and one past the client
-// size is the right/bottom border. The close box is the same square the chrome
-// painter draws (TD-061), so what a click cancels is what the user sees.
+// size is the right/bottom border. The close box and the system-menu box at the
+// left of the caption are the same squares the chrome painter draws (TD-061),
+// so what a click closes or opens is what the user sees. HTSYSMENU is 3.
 int32_t dialog_hit_test(const Window *w, int32_t x, int32_t y) {
     if (!w)
         return 0; // HTNOWHERE
@@ -685,6 +709,10 @@ int32_t dialog_hit_test(const Window *w, int32_t x, int32_t y) {
         return 0; // HTNOWHERE: outside the window entirely
     if (w->nc_caption && (w->style & 0x00080000u /*WS_SYSMENU*/)) {
         const int32_t box = w->nc_top - 4;
+        // The system-menu box (the icon's place at the left of the caption).
+        const int32_t sx0 = -w->nc_left + 1, sy0 = -w->nc_top + 2;
+        if (x >= sx0 && x < sx0 + box && y >= sy0 && y < sy0 + box)
+            return 3; // HTSYSMENU
         const int32_t x1 = w->w + w->nc_right - 3;
         const int32_t y0 = -w->nc_top + 2;
         if (x >= x1 - box && x < x1 && y >= y0 && y < y0 + box)
@@ -1247,6 +1275,12 @@ void dispatch_message(X86 *c) {
     }
     uint32_t hwnd = rd32(p + 0), msg = rd32(p + 4);
     uint32_t wp = rd32(p + 8), lp = rd32(p + 12);
+    if (msg == 0x000f /* WM_PAINT */ && !wp)
+        prepare_modeless_dialog_paint(c, hwnd);
+    if (dialog_system_key(c, hwnd, msg, wp)) {
+        set_eax(c, 0);
+        return;
+    }
     if (msg == 0x113 && lp)
         set_eax(c, guest_call(c, lp, hwnd, msg, wp, rd32(p + 16)));
     else
@@ -2675,12 +2709,24 @@ bool owner_draw_listbox(X86 *c, Window *w, uint32_t hwnd, uint32_t hdc, int32_t 
 // client WM_PAINT; this runs in that place, for the dialog the pump is about
 // to paint. The frame only ever goes to the window's own surface (the client DC
 // maps client (0,0) onto the surface at the non-client inset).
+//
+// A MODELESS dialog has no pump: its guest message loop dispatches the WM_PAINT
+// the update region synthesises, so the paint entry point calls this first
+// (TD-072/TD-108). A modeless dialog may have no frame at all (a WS_POPUP
+// wizard); its client still gets the face fill, which is what a caption STATIC
+// erases against, so the text no longer sits on an unpainted surface.
 void paint_dialog_chrome(X86 *c, uint32_t hwnd) {
     Window *w = find_window(hwnd);
     if (!w || !w->visible)
         return;
     const int32_t l = w->nc_left, t = w->nc_top, r = w->nc_right, b = w->nc_bottom;
-    if (!l && !t && !r && !b)
+    const bool framed = l || t || r || b;
+    if (!framed && !w->dlg_modeless)
+        return;
+    // A modeless dialog's chrome/erase is painted once, before the first client
+    // paint. Painting it again over a later WM_PAINT would erase what the
+    // dialog's own procedure drew (the splash paints a pre-rendered bitmap).
+    if (w->dlg_modeless && w->dlg_client_painted)
         return;
     const bool caption = w->nc_caption;
     const int32_t cw = w->w, ch = w->h;
@@ -2722,14 +2768,16 @@ void paint_dialog_chrome(X86 *c, uint32_t hwnd) {
     gdi::fill(hdc, {0, 0, cw, ch}, bg);
     // Raised outer edge: highlight on the top/left, dark shadow on the bottom
     // and right, with a shadow just inside the dark edge.
-    gdi::fill(hdc, {-l, -t, right, -t + 1}, hi);
-    gdi::fill(hdc, {-l, -t, -l + 1, bottom}, hi);
-    gdi::fill(hdc, {-l, bottom - 1, right, bottom}, dk);
-    gdi::fill(hdc, {right - 1, -t, right, bottom}, dk);
-    if (caption) {
-        gdi::fill(hdc, {-l + 1, bottom - 2, right - 1, bottom - 1}, lo);
-        gdi::fill(hdc, {right - 2, -t + 1, right - 1, bottom - 1}, lo);
-        gdi::fill(hdc, {-l, -1, right, 0}, dk); // rule under the caption
+    if (framed) {
+        gdi::fill(hdc, {-l, -t, right, -t + 1}, hi);
+        gdi::fill(hdc, {-l, -t, -l + 1, bottom}, hi);
+        gdi::fill(hdc, {-l, bottom - 1, right, bottom}, dk);
+        gdi::fill(hdc, {right - 1, -t, right, bottom}, dk);
+        if (caption) {
+            gdi::fill(hdc, {-l + 1, bottom - 2, right - 1, bottom - 1}, lo);
+            gdi::fill(hdc, {right - 2, -t + 1, right - 1, bottom - 1}, lo);
+            gdi::fill(hdc, {-l, -1, right, 0}, dk); // rule under the caption
+        }
     }
     if (!caption)
         goto skip_caption;
@@ -2769,8 +2817,11 @@ void paint_dialog_chrome(X86 *c, uint32_t hwnd) {
         }
     }
 skip_caption:
-    if (Window *after = find_window(hwnd))
+    if (Window *after = find_window(hwnd)) {
         after->update_pending = false;
+        if (after->dlg_modeless)
+            after->dlg_client_painted = true;
+    }
     gdi_release_window_dc(hwnd, hdc);
 }
 
@@ -2836,7 +2887,9 @@ bool is_group_box(uint32_t style) {
 // A checkbox or radio button: a 13 px glyph (a box, or a circle) at the left of
 // the caption (the right, with BS_LEFTTEXT), filled when checked, and the
 // caption drawn in the control's font. A checkbox gets the parent's
-// WM_CTLCOLORSTATIC colour protocol, as on Windows.
+// WM_CTLCOLORSTATIC colour protocol, as on Windows. BS_TOP/BS_BOTTOM/BS_VCENTER
+// place the glyph (and the caption block) vertically; BS_MULTILINE wraps the
+// caption and centres the wrapped block (TD-081).
 void paint_checkbox(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
     if (!w)
@@ -2846,7 +2899,11 @@ void paint_checkbox(X86 *c, uint32_t hwnd, uint32_t into) {
     const int32_t width = w->w, height = w->h;
     const bool radio = ((w->style & 0x0fu) == 0x4u || (w->style & 0x0fu) == 0x9u);
     const uint32_t checked = (w->check_state & 3u) != 0;
-    const bool left_text = (w->style & 0x20u) != 0; // BS_LEFTTEXT
+    const bool left_text = (w->style & 0x20u) != 0;   // BS_LEFTTEXT
+    const bool multiline = (w->style & 0x2000u) != 0; // BS_MULTILINE
+    // BS_VCENTER is both bits; a single bit is TOP or BOTTOM.
+    const bool top_align = (w->style & 0x400u) && !(w->style & 0x800u);
+    const bool bottom_align = (w->style & 0x800u) && !(w->style & 0x400u);
     const std::string text = w->title_utf8;
     uint32_t hdc = into ? into : gdi_window_dc(hwnd);
     auto *dc = gdi::dc_of(hdc);
@@ -2882,7 +2939,9 @@ void paint_checkbox(X86 *c, uint32_t hwnd, uint32_t into) {
         paint_dc->bk_mode = 1; // TRANSPARENT over the background
         paint_dc->text_color = 0x00000000;
     }
-    const int32_t g = 13, gy = (height - 13) / 2, gx = left_text ? width - 13 : 0;
+    const int32_t g = 13;
+    const int32_t gy = top_align ? 0 : (bottom_align ? height - g : (height - g) / 2);
+    const int32_t gx = left_text ? width - 13 : 0;
     const uint32_t white = 0x00ffffff, dk = gdi::argb(0x00000000), lo = gdi::argb(0x00808080);
     if (radio) {
         fill_disc(hdc, gx + g / 2, gy + g / 2, g / 2, lo);
@@ -2904,14 +2963,41 @@ void paint_checkbox(X86 *c, uint32_t hwnd, uint32_t into) {
     uint32_t units = text.empty() ? 0 : wide_units(text);
     if (units && units < (UINT32_MAX - 32) / 2) {
         if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+            uint32_t flags = 0x0 /*DT_LEFT*/ | 0x800 /*DT_NOPREFIX*/;
+            int32_t top = 0, bottom = height;
+            if (multiline) {
+                // Wrap first, then place the block: measure with DT_CALCRECT
+                // (the bottom comes back as top + the wrapped height).
+                flags |= 0x10 /*DT_WORDBREAK*/;
+                wr32(block + 0, uint32_t(tx));
+                wr32(block + 4, 0);
+                wr32(block + 8, uint32_t(width));
+                wr32(block + 12, 0);
+                gm_put_wstr(block + 16, text, units + 1);
+                gdi::draw_text(hdc, block + 16, units, block, flags | 0x400 /*DT_CALCRECT*/);
+                const int32_t th = int32_t(rd32(block + 12));
+                if (top_align)
+                    top = 0;
+                else if (bottom_align)
+                    top = height - th;
+                else
+                    top = (height - th) / 2;
+                if (top < 0)
+                    top = 0;
+                bottom = top + th;
+            } else if (top_align) {
+                flags |= 0x20 /*DT_SINGLELINE*/ | 0x0 /*DT_TOP*/;
+            } else if (bottom_align) {
+                flags |= 0x20 /*DT_SINGLELINE*/ | 0x8 /*DT_BOTTOM*/;
+            } else {
+                flags |= 0x20 /*DT_SINGLELINE*/ | 0x4 /*DT_VCENTER*/;
+            }
             wr32(block + 0, uint32_t(tx));
-            wr32(block + 4, 0);
+            wr32(block + 4, uint32_t(top));
             wr32(block + 8, uint32_t(width));
-            wr32(block + 12, uint32_t(height));
+            wr32(block + 12, uint32_t(bottom));
             gm_put_wstr(block + 16, text, units + 1);
-            gdi::draw_text(hdc, block + 16, units, block,
-                           0x0 /*DT_LEFT*/ | 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/ |
-                               0x800 /*DT_NOPREFIX*/);
+            gdi::draw_text(hdc, block + 16, units, block, flags);
             heap_free(block);
         }
     }
@@ -3009,14 +3095,19 @@ void paint_groupbox(X86 *c, uint32_t hwnd, uint32_t into) {
 }
 // A push button in a dialog: a COLOR_BTNFACE face with a raised 3D bevel, a
 // sunken one while the press is held, and the caption centred. BS_DEFPUSHBUTTON
-// (style 1) also gets the dark default-button border. Checkboxes and radios get
-// the glyph path above; a group box gets its own frame and top-left caption;
-// other button styles fall back to the STATIC caption path.
+// (style 1) also gets the dark default-button border. BS_MULTILINE wraps the
+// caption and centres the block. A checkbox/radio with BS_PUSHLIKE is drawn as
+// a push button whose bevel stays sunken while it is checked (TD-081).
+// Checkboxes and radios without BS_PUSHLIKE get the glyph path above; a group
+// box gets its own frame and top-left caption; other button styles fall back to
+// the STATIC caption path.
 void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
     Window *w = find_window(hwnd);
     if (!w)
         return;
-    if (is_check_button(w->style)) {
+    const bool check = is_check_button(w->style);
+    const bool pushlike = check && (w->style & 0x1000u) != 0; // BS_PUSHLIKE
+    if (check && !pushlike) {
         paint_checkbox(c, hwnd, into);
         return;
     }
@@ -3024,15 +3115,17 @@ void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
         paint_groupbox(c, hwnd, into);
         return;
     }
-    if ((w->style & 0x0fu) > 1u) {
+    if (!pushlike && (w->style & 0x0fu) > 1u) {
         paint_control(c, hwnd, into);
         return;
     }
     if (!into)
         w->update_pending = false;
     const int32_t width = w->w, height = w->h;
-    const bool pressed = w->pressed;
-    const bool is_default = (w->style & 0x0fu) == 1u;
+    // A push-like check button reads as held down while it is checked.
+    const bool pressed = w->pressed || (pushlike && (w->check_state & 3u) != 0);
+    const bool is_default = !pushlike && (w->style & 0x0fu) == 1u;
+    const bool multiline = (w->style & 0x2000u) != 0;    // BS_MULTILINE
     const bool disabled = (w->style & 0x08000000u) != 0; // WS_DISABLED
     const std::string text = w->title_utf8;
     uint32_t hdc = into ? into : gdi_window_dc(hwnd);
@@ -3080,14 +3173,29 @@ void paint_button(X86 *c, uint32_t hwnd, uint32_t into) {
                 paint_dc->bk_mode = 1; // TRANSPARENT over the bevel
             }
             int32_t off = pressed ? 1 : 0;
-            wr32(block + 0, off);
-            wr32(block + 4, off);
+            uint32_t flags = 0x1 /*DT_CENTER*/ | 0x800 /*DT_NOPREFIX*/;
+            if (multiline) {
+                // BS_MULTILINE: wrap, measure, and centre the block vertically.
+                flags |= 0x10 /*DT_WORDBREAK*/;
+                wr32(block + 0, uint32_t(off));
+                wr32(block + 4, off);
+                wr32(block + 8, uint32_t(width - off));
+                wr32(block + 12, 0);
+                gm_put_wstr(block + 16, text, units + 1);
+                gdi::draw_text(hdc, block + 16, units, block, flags | 0x400 /*DT_CALCRECT*/);
+                const int32_t th = int32_t(rd32(block + 12));
+                off += (height - 2 * off - th) / 2;
+                if (off < 0)
+                    off = 0;
+            } else {
+                flags |= 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/;
+            }
+            wr32(block + 0, uint32_t(off));
+            wr32(block + 4, uint32_t(off));
             wr32(block + 8, uint32_t(width));
             wr32(block + 12, uint32_t(height));
             gm_put_wstr(block + 16, text, units + 1);
-            gdi::draw_text(hdc, block + 16, units, block,
-                           0x1 /*DT_CENTER*/ | 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/ |
-                               0x800 /*DT_NOPREFIX*/);
+            gdi::draw_text(hdc, block + 16, units, block, flags);
             heap_free(block);
         }
     }
@@ -3789,8 +3897,7 @@ void combo_drop_proc(X86 *c) {
                 cid = combo->id;
                 if (row >= 0) {
                     combo->list_sel = row;
-                    if ((combo->style & 3u) == 3u /*CBS_DROPDOWNLIST*/)
-                        combo->title_utf8 = combo->list_items[row];
+                    combo->title_utf8 = combo->list_items[size_t(row)];
                     combo->update_pending = true;
                 }
             }
@@ -3864,6 +3971,15 @@ void combo_show_dropdown(X86 *c, uint32_t hwnd, bool open) {
         host_dispatch_to_wndproc(c, parent, 0x0111 /*WM_COMMAND*/,
                                  (uint32_t(open ? 7u : 8u) << 16) | (id & 0xffffu), hwnd);
 }
+// The height of a combo box's edit/static field. A drop-down owns the whole
+// control (the list is a popup); a CBS_SIMPLE control reserves one row at the
+// top and shows its list in the rest of the template height (TD-101).
+int32_t combo_field_height(const Window *w) {
+    if ((w->style & 3u) != 1u) // not CBS_SIMPLE
+        return w->h;
+    const int32_t field = combo_row_height(w) + 4;
+    return field < w->h ? field : w->h;
+}
 void paint_combobox(X86 *c, uint32_t hwnd, uint32_t into) {
     (void)c;
     Window *w = find_window(hwnd);
@@ -3873,6 +3989,7 @@ void paint_combobox(X86 *c, uint32_t hwnd, uint32_t into) {
         w->update_pending = false;
     const int32_t width = w->w, height = w->h;
     const std::string text = w->title_utf8;
+    const bool simple = (w->style & 3u) == 1u; // CBS_SIMPLE
     uint32_t hdc = into ? into : gdi_window_dc(hwnd);
     auto *dc = gdi::dc_of(hdc);
     if (!dc) {
@@ -3886,22 +4003,25 @@ void paint_combobox(X86 *c, uint32_t hwnd, uint32_t into) {
         dc->font = w->font;
     const uint32_t white = gdi::argb(0x00ffffff), shadow = gdi::argb(0x00808080),
                    dark = gdi::argb(0x00404040), face = gdi::argb(0x00c8d0d4);
-    // The closed field: white inside a 2 px sunken border, the selected item's
-    // text left-aligned, and the arrow button on the right.
+    const int32_t field_h = combo_field_height(w);
+    // The field: white inside a 2 px sunken border, the selected item's text
+    // left-aligned, and (unless CBS_SIMPLE) the arrow button on the right.
     const int32_t arrow = 17;
     gdi::fill(hdc, {0, 0, width, height}, white);
     gdi::fill(hdc, {0, 0, width, 1}, shadow);
     gdi::fill(hdc, {0, 0, 1, height}, shadow);
     gdi::fill(hdc, {0, height - 1, width, height}, dark);
     gdi::fill(hdc, {width - 1, 0, width, height}, dark);
-    // The arrow button (a raised bevel with a down triangle).
-    const int32_t ax0 = width - arrow - 1;
-    gdi::fill(hdc, {ax0, 1, width - 1, height - 1}, face);
-    gdi::fill(hdc, {ax0, 1, width - 1, 2}, gdi::argb(0x00ffffff));
-    gdi::fill(hdc, {ax0, 1, ax0 + 1, height - 1}, gdi::argb(0x00ffffff));
-    gdi::fill(hdc, {ax0, height - 2, width - 1, height - 1}, dark);
-    gdi::fill(hdc, {width - 2, 1, width - 1, height - 1}, dark);
-    fill_triangle(hdc, ax0 + arrow / 2, height / 2, 4, gdi::argb(0x00000000), true);
+    const int32_t ax0 = simple ? width : width - arrow - 1;
+    if (!simple) {
+        // The arrow button (a raised bevel with a down triangle).
+        gdi::fill(hdc, {ax0, 1, width - 1, height - 1}, face);
+        gdi::fill(hdc, {ax0, 1, width - 1, 2}, gdi::argb(0x00ffffff));
+        gdi::fill(hdc, {ax0, 1, ax0 + 1, height - 1}, gdi::argb(0x00ffffff));
+        gdi::fill(hdc, {ax0, height - 2, width - 1, height - 1}, dark);
+        gdi::fill(hdc, {width - 2, 1, width - 1, height - 1}, dark);
+        fill_triangle(hdc, ax0 + arrow / 2, height / 2, 4, gdi::argb(0x00000000), true);
+    }
     if (auto *paint_dc = gdi::dc_of(hdc)) {
         paint_dc->bk_mode = 1; // TRANSPARENT
         paint_dc->text_color = 0x00000000;
@@ -3913,13 +4033,45 @@ void paint_combobox(X86 *c, uint32_t hwnd, uint32_t into) {
                 wr32(block + 0, 3);
                 wr32(block + 4, 0);
                 wr32(block + 8, uint32_t(ax0 - 1));
-                wr32(block + 12, uint32_t(height));
+                wr32(block + 12, uint32_t(field_h));
                 gm_put_wstr(block + 16, text, units + 1);
                 gdi::draw_text(hdc, block + 16, units, block,
                                0x0 /*DT_LEFT*/ | 0x4 /*DT_VCENTER*/ | 0x20 /*DT_SINGLELINE*/ |
                                    0x800 /*DT_NOPREFIX*/);
                 heap_free(block);
             }
+        }
+    }
+    // A CBS_SIMPLE list is always open: the rows live under the field, inside
+    // the control, with the template's height being the field plus the list.
+    if (simple && field_h < height - 1) {
+        const int32_t rh = combo_row_height(w);
+        gdi::fill(hdc, {1, field_h, width - 1, field_h + 1}, shadow); // sunken top edge
+        int32_t y = field_h + 1;
+        for (int32_t i = w->list_top; i < int32_t(w->list_items.size()) && y + rh <= height - 1;
+             ++i) {
+            const bool selected = i == w->list_sel;
+            const bool hotrow = i == w->combo_hot;
+            if (selected || hotrow) {
+                gdi::fill(hdc, {1, y, width - 1, y + rh}, gdi::argb(0x00a80000));
+                dc->text_color = 0x00ffffff;
+            } else {
+                dc->text_color = 0x00000000;
+            }
+            uint32_t units = wide_units(w->list_items[size_t(i)]);
+            if (units && units < (UINT32_MAX - 32) / 2) {
+                if (uint32_t block = heap_alloc(16 + 2 * (units + 1), true)) {
+                    wr32(block + 0, 2);
+                    wr32(block + 4, uint32_t(y));
+                    wr32(block + 8, uint32_t(width - 2));
+                    wr32(block + 12, uint32_t(y + rh));
+                    gm_put_wstr(block + 16, w->list_items[size_t(i)], units + 1);
+                    gdi::draw_text(hdc, block + 16, units, block,
+                                   0x24 /*DT_SINGLELINE|DT_VCENTER*/ | 0x800 /*DT_NOPREFIX*/);
+                    heap_free(block);
+                }
+            }
+            y += rh;
         }
     }
     if (!into)
@@ -4624,8 +4776,8 @@ void control_proc(X86 *c) {
     }
     case 0x01a1: { // LB_GETITEMHEIGHT
         int32_t ih = w ? listbox_item_height(c, w, int32_t(arg(c, 2))) : -1;
-        LOGW("LB_GETITEMHEIGHT hwnd=%08x item=%d -> %d style=%08x", arg(c, 1), int32_t(arg(c, 2)), ih,
-             w ? w->style : 0);
+        LOGW("LB_GETITEMHEIGHT hwnd=%08x item=%d -> %d style=%08x", arg(c, 1), int32_t(arg(c, 2)),
+             ih, w ? w->style : 0);
         set_eax(c, w ? uint32_t(ih) : 0xffffffffu);
         return;
     }
@@ -4800,6 +4952,7 @@ void control_proc(X86 *c) {
             return;
         }
         w->list_items.push_back(gm_str(arg(c, 3)));
+        w->combo_item_data.push_back(0);
         w->update_pending = true;
         set_eax(c, uint32_t(w->list_items.size() - 1));
         return;
@@ -4812,6 +4965,9 @@ void control_proc(X86 *c) {
         if (i < 0 || i > int32_t(w->list_items.size()))
             i = int32_t(w->list_items.size());
         w->list_items.insert(w->list_items.begin() + i, gm_str(arg(c, 3)));
+        w->combo_item_data.insert(w->combo_item_data.begin() + i, 0);
+        if (w->list_sel >= i)
+            ++w->list_sel;
         w->update_pending = true;
         set_eax(c, uint32_t(i));
         return;
@@ -4827,6 +4983,8 @@ void control_proc(X86 *c) {
             return;
         }
         w->list_items.erase(w->list_items.begin() + i);
+        if (i < int32_t(w->combo_item_data.size()))
+            w->combo_item_data.erase(w->combo_item_data.begin() + i);
         if (w->list_sel == i)
             w->list_sel = -1;
         else if (w->list_sel > i)
@@ -4835,9 +4993,29 @@ void control_proc(X86 *c) {
         set_eax(c, uint32_t(w->list_items.size()));
         return;
     }
+    case 0x0150: { // CB_GETITEMDATA
+        const int32_t i = int32_t(arg(c, 2));
+        if (!w || i < 0 || i >= int32_t(w->combo_item_data.size())) {
+            set_eax(c, 0xffffffffu); // CB_ERR
+            return;
+        }
+        set_eax(c, w->combo_item_data[size_t(i)]);
+        return;
+    }
+    case 0x0151: { // CB_SETITEMDATA
+        const int32_t i = int32_t(arg(c, 2));
+        if (!w || i < 0 || i >= int32_t(w->combo_item_data.size())) {
+            set_eax(c, 0xffffffffu); // CB_ERR
+            return;
+        }
+        w->combo_item_data[size_t(i)] = arg(c, 3);
+        set_eax(c, 0);
+        return;
+    }
     case 0x014b: // CB_RESETCONTENT
         if (w) {
             w->list_items.clear();
+            w->combo_item_data.clear();
             w->list_sel = -1;
             w->combo_hot = -1;
             w->title_utf8.clear();
@@ -4861,9 +5039,9 @@ void control_proc(X86 *c) {
             w->list_sel = -1; // Windows: -1 removes the selection
         } else {
             w->list_sel = i;
-            // A drop-down list shows the selected item in its closed field.
-            if ((w->style & 3u) == 3u /*CBS_DROPDOWNLIST*/)
-                w->title_utf8 = w->list_items[i];
+            // A combo box shows the selected item in its field (a drop-down
+            // list's closed field, or a simple/drop-down's edit text).
+            w->title_utf8 = w->list_items[size_t(i)];
         }
         w->update_pending = true;
         set_eax(c, w->list_sel < 0 ? 0xffffffffu : uint32_t(w->list_sel));
@@ -4910,15 +5088,16 @@ void control_proc(X86 *c) {
                 }
         if (w && found >= 0) {
             w->list_sel = found;
-            if ((w->style & 3u) == 3u)
-                w->title_utf8 = w->list_items[found];
+            w->title_utf8 = w->list_items[size_t(found)];
             w->update_pending = true;
         }
         set_eax(c, found < 0 ? 0xffffffffu : uint32_t(found));
         return;
     }
     case 0x014f: // CB_SHOWDROPDOWN
-        if (w)
+        // A CBS_SIMPLE combo's list is always open (the template height already
+        // covers it); there is no drop-down to show or hide.
+        if (w && (w->style & 3u) != 1u)
             combo_show_dropdown(c, hwnd, arg(c, 2) != 0);
         set_eax(c, 0);
         return;
@@ -5307,6 +5486,25 @@ void control_proc(X86 *c) {
         }
         if (w && w->cls == "combobox") {
             set_focus_window(hwnd);
+            if ((w->style & 3u) == 1u) { // CBS_SIMPLE: the list is always open
+                const int32_t my = int16_t((arg(c, 3) >> 16) & 0xffff);
+                const int32_t field_h = combo_field_height(w);
+                const int32_t rh = combo_row_height(w);
+                if (my >= field_h + 1 && rh > 0) {
+                    const int32_t row = w->list_top + (my - field_h - 1) / rh;
+                    if (row >= 0 && row < int32_t(w->list_items.size()) && row != w->list_sel) {
+                        w->list_sel = row;
+                        w->title_utf8 = w->list_items[size_t(row)];
+                        w->update_pending = true;
+                        if (w->parent)
+                            host_dispatch_to_wndproc(c, w->parent, 0x0111 /*WM_COMMAND*/,
+                                                     (1u << 16) | (w->id & 0xffffu),
+                                                     hwnd); // CBN_SELCHANGE
+                    }
+                }
+                set_eax(c, 0);
+                return;
+            }
             // A press on the closed field opens a drop-down list; a press while
             // it is open (only reachable without the popup's capture) closes it.
             if (w->combo_open)
@@ -5417,8 +5615,12 @@ void control_proc(X86 *c) {
         if (w) {
             // A checkbox/radio keeps its check state in `check_state`; a press
             // does not disturb it (only the push buttons use the pressed bit).
-            // Never GWL_USERDATA: a program's own storage must survive a click.
-            if (w->cls != "button" || (!is_check_button(w->style) && !is_group_box(w->style)))
+            // A BS_PUSHLIKE check button is visually a push button, so its press
+            // is the pressed bit too. Never GWL_USERDATA: a program's own
+            // storage must survive a click.
+            const bool pushlike = is_check_button(w->style) && (w->style & 0x1000u) != 0;
+            if (w->cls != "button" || (!is_check_button(w->style) && !is_group_box(w->style)) ||
+                pushlike)
                 w->pressed = true;
             w->update_pending = true; // the pressed bevel has to be drawn
         }
@@ -5467,6 +5669,8 @@ void control_proc(X86 *c) {
                     w->check_state = 1u;
                     radio_group_clear(hwnd); // TD-081: the group is exclusive
                 }
+                if (w->style & 0x1000u) // BS_PUSHLIKE: the press ends with the bevel up
+                    w->pressed = false;
             } else {
                 w->pressed = false;
             }
@@ -5842,6 +6046,38 @@ uint32_t create_dialog_window(X86 *c, uint32_t hinst, uint32_t parent, uint32_t 
     return hwnd;
 }
 namespace user32 {
+// Alt+F4 closes a #32770 with WS_SYSMENU (the close-box rule); Alt+Space opens
+// its system menu at the caption. Windows answers both in DefWindowProc/DefDlgProc
+// for the TOP-LEVEL window, while the key message itself goes to the focused
+// control, so walk up to the first dialog. Returns true when the key was a
+// system command (the caller must not dispatch it). (TD-070)
+bool dialog_system_key(X86 *c, uint32_t hwnd, uint32_t msg, uint32_t vk) {
+    if (msg != 0x0100 /*WM_KEYDOWN*/ && msg != 0x0104 /*WM_SYSKEYDOWN*/)
+        return false;
+    if (!(g_key_state[0x12] & 0x80)) // VK_MENU (Alt) is not held
+        return false;
+    if (vk != 0x73 /*VK_F4*/ && vk != 0x20 /*VK_SPACE*/)
+        return false;
+    uint32_t dlg = hwnd;
+    for (size_t n = 0; dlg && n < windows().size(); ++n) {
+        Window *w = find_window(dlg);
+        if (!w)
+            return false;
+        if (w->cls == "#32770") {
+            if (!(w->style & 0x00080000u /*WS_SYSMENU*/) || !w->nc_caption)
+                return false;
+            if (vk == 0x73) {
+                ::close_box_request(c, dlg);
+            } else {
+                // Windows drops the menu at the caption's top-left corner.
+                dialog_open_system_menu(c, dlg, w->x + 2, w->y + (w->nc_top > 4 ? 2 : 0));
+            }
+            return true;
+        }
+        dlg = w->parent;
+    }
+    return false;
+}
 // Give an edit the focus the way the dialog manager does: its whole text is
 // selected, so the next keystroke replaces it. A click uses edit_move_caret
 // instead, which is why this is separate.
@@ -5905,6 +6141,9 @@ uint32_t next_tab_stop(uint32_t dlg, uint32_t from, bool backward) {
 // ignores, so it cannot double-act.
 bool dialog_key_message(X86 *c, uint32_t dlg, uint32_t msg, uint32_t wparam, uint32_t lparam) {
     (void)lparam;
+    // Alt+F4 / Alt+Space are system commands, not character keys (TD-070).
+    if (dialog_system_key(c, dlg, msg, wparam))
+        return true;
     if (msg != 0x0100 /*WM_KEYDOWN*/)
         return false;
     Window *d = find_window(dlg);
@@ -6097,6 +6336,12 @@ void u_CreateDialogParamA(X86 *c) {
         set_eax(c, 0);
         return;
     }
+    if (Window *w = find_window(hwnd))
+        w->dlg_modeless = true;
+    if (const Window *cw = find_window(hwnd))
+        LOGV("CreateDialogParamA: name=%u rect=(%d,%d) %dx%d style=%08x nc=%d,%d,%d,%d", name,
+             cw->x, cw->y, cw->w, cw->h, cw->style, cw->nc_left, cw->nc_top, cw->nc_right,
+             cw->nc_bottom);
     host_dispatch_to_wndproc(c, hwnd, 0x0110 /* WM_INITDIALOG */, 0, init);
     user32::initial_dialog_focus(hwnd);
     set_eax(c, hwnd);

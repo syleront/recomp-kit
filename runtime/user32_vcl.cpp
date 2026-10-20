@@ -206,10 +206,27 @@ void pump_mouse_input(X86 *c) {
                         ::close_box_request(c, hwnd); // IDCANCEL, then WM_CLOSE if unanswered
                         return;
                     }
+                    if (hit == 3 /*HTSYSMENU*/) {
+                        // The system-menu box at the left of the caption. The
+                        // menu runs its own loop, which pumps mouse input, so
+                        // the outer routing guard must be down first.
+                        routing_mouse = false;
+                        dialog_open_system_menu(c, hwnd, input.x - 2, input.y + 2);
+                        return;
+                    }
                     if (hit == 2 /*HTCAPTION*/) {
                         if (dialog_begin_move(c, hwnd, input.x, input.y))
                             return; // the move loop owns the pointer from here
                     }
+                }
+                // A caption double-click opens the dialog's system menu (a
+                // dialog has no maximise box, so Windows' caption double-click
+                // would otherwise be inert). TD-070.
+                if (input.message == 0x0203 /* WM_LBUTTONDBLCLK */ && hit == 2 &&
+                    (fw->style & 0x00080000u /*WS_SYSMENU*/)) {
+                    routing_mouse = false; // the popup's loop pumps mouse input
+                    dialog_open_system_menu(c, hwnd, input.x - 2, input.y);
+                    return;
                 }
                 if (input.message >= 0x0200 && input.message <= 0x0209)
                     return; // the frame consumes button and move messages
@@ -995,6 +1012,46 @@ void set_menu(X86 *c) {
         w->menu = menu;
     set_eax(c, ok);
 }
+// The system menu every window owns. A dialog's has the two commands this
+// runtime can carry out - Move and Close, no minimise/maximise/size - while
+// other windows keep the classic six entries with the unsupported ones grayed
+// (TD-070). Labels matter: before this the menu existed with empty captions, so
+// GetSystemMenu + TrackPopupMenu showed a blank list.
+uint32_t ensure_system_menu(uint32_t hwnd) {
+    uint32_t &menu = system_menus[hwnd];
+    if (menus.count(menu))
+        return menu;
+    menu = new_menu();
+    Window *w = find_window(hwnd);
+    const bool dialog = w && w->cls == "#32770";
+    auto add = [&](uint32_t id, const char *text, bool enabled) {
+        MenuItem item;
+        item.id = id;
+        item.text = text;
+        if (!enabled)
+            item.state = 3; // MFS_GRAYED | MFS_DISABLED
+        menus[menu].items.push_back(item);
+    };
+    auto separator = [&]() {
+        MenuItem item;
+        item.type = 0x800; // MFT_SEPARATOR
+        menus[menu].items.push_back(item);
+    };
+    if (dialog) {
+        add(0xf010u, "&Move", true); // SC_MOVE
+        separator();
+        add(0xf060u, "&Close", true); // SC_CLOSE
+    } else {
+        add(0xf120u, "&Restore", false); // SC_RESTORE
+        add(0xf010u, "&Move", true);
+        add(0xf000u, "&Size", false); // SC_SIZE
+        add(0xf020u, "Mi&nimize", false);
+        add(0xf030u, "Ma&ximize", false);
+        separator();
+        add(0xf060u, "&Close", true);
+    }
+    return menu;
+}
 void system_menu(X86 *c) {
     uint32_t hwnd = arg(c, 0);
     if (!find_window(hwnd)) {
@@ -1008,15 +1065,7 @@ void system_menu(X86 *c) {
         set_eax(c, 0);
         return;
     }
-    if (!menus.count(menu)) {
-        menu = new_menu();
-        for (uint32_t id : {0xf120u, 0xf010u, 0xf000u, 0xf020u, 0xf030u, 0xf060u}) {
-            MenuItem item;
-            item.id = id;
-            menus[menu].items.push_back(item);
-        }
-    }
-    set_eax(c, menu);
+    set_eax(c, ensure_system_menu(hwnd));
 }
 void submenu(X86 *c) {
     auto *m = menu_item(arg(c, 0), arg(c, 1), true);
@@ -1790,6 +1839,11 @@ struct PopupMenu {
     int32_t width = 0, height = 0, item_height = 0, check_width = 0;
     int hot = -1, result = 0;
     bool done = false, return_command = false, any_check = false, any_submenu = false;
+    // A press that arrives after the menu opened. The release that belongs to
+    // the click which OPENED a system menu (a caption/icon click, or a
+    // double-click) must not dismiss it: Windows ignores it. A TrackPopupMenu
+    // opened by the program keeps its old release-selects rule.
+    bool saw_press = false, ignore_opening_release = false;
 };
 PopupMenu g_popup;
 // The menu font: Windows' menu face is the same proportional interface face as
@@ -2067,6 +2121,7 @@ void menu_proc(X86 *c) {
         return;
     }
     case 0x0201: // WM_LBUTTONDOWN outside the items dismisses the menu
+        m.saw_press = true;
         if (menu_hit(m, x, y) < 0) {
             m.result = 0;
             m.done = true;
@@ -2074,6 +2129,11 @@ void menu_proc(X86 *c) {
         set_eax(c, 0);
         return;
     case 0x0202: { // WM_LBUTTONUP: the release chooses the item under it
+        // The release of the click that opened a system menu is not a choice.
+        if (m.ignore_opening_release && !m.saw_press) {
+            set_eax(c, 0);
+            return;
+        }
         const int item = menu_hit(m, x, y);
         auto it = menus.find(m.menu);
         m.result = 0;
@@ -2125,8 +2185,8 @@ uint32_t menu_proc_addr() {
 // Show a menu and run it to a choice. Returns the selected command id (0 when
 // the menu was dismissed). The caller decides whether to report it or to post
 // WM_COMMAND, which is what TPM_RETURNCMD separates on Windows.
-int32_t run_popup_menu(X86 *c, uint32_t hmenu, uint32_t flags, int32_t x, int32_t y,
-                       uint32_t owner) {
+int32_t run_popup_menu(X86 *c, uint32_t hmenu, uint32_t flags, int32_t x, int32_t y, uint32_t owner,
+                       bool ignore_opening_release = false) {
     if (!menus.count(hmenu))
         return 0;
     PopupMenu &m = g_popup;
@@ -2134,6 +2194,7 @@ int32_t run_popup_menu(X86 *c, uint32_t hmenu, uint32_t flags, int32_t x, int32_
     m.menu = hmenu;
     m.owner = owner;
     m.return_command = (flags & 0x0100u) != 0; // TPM_RETURNCMD
+    m.ignore_opening_release = ignore_opening_release;
     // Windows sends WM_INITMENUPOPUP before it measures, so a menu whose items
     // are filled in there is sized from what the owner put in them.
     if (owner)
@@ -2410,6 +2471,32 @@ void user32::forget_window_services(uint32_t hwnd) {
         destroy_menu_tree(i->second);
         system_menus.erase(i);
     }
+}
+
+// A dialog's system menu, at a screen point. Run to a choice: Close follows the
+// close-box rule (WM_COMMAND IDCANCEL, then WM_CLOSE when the procedure leaves
+// it running); Move enters the caption move loop from the point the menu was
+// opened at, so the next drag moves the window and the next release drops it.
+// Any other command the program added to its own system menu is reported as
+// WM_SYSCOMMAND, which is what Windows does.
+void user32::dialog_open_system_menu(X86 *c, uint32_t hwnd, int32_t screen_x, int32_t screen_y) {
+    Window *w = find_window(hwnd);
+    if (!w || w->cls != "#32770" || !(w->style & 0x00080000u /*WS_SYSMENU*/) || !w->nc_caption)
+        return;
+    const uint32_t menu = ensure_system_menu(hwnd);
+    // The click that opened the system menu is still down (or its release is
+    // queued), so its release must not be read as a choice.
+    const int32_t id =
+        run_popup_menu(c, menu, 0x0100 /* TPM_RETURNCMD */, screen_x, screen_y, hwnd, true);
+    if (!find_window(hwnd))
+        return;
+    if (id == 0xf060) // SC_CLOSE
+        ::close_box_request(c, hwnd);
+    else if (id == 0xf010) // SC_MOVE
+        dialog_begin_move(c, hwnd, screen_x, screen_y);
+    else if (id)
+        host_dispatch_to_wndproc(c, hwnd, 0x0112 /* WM_SYSCOMMAND */, uint32_t(id),
+                                 (uint32_t(uint16_t(screen_y)) << 16) | uint16_t(screen_x));
 }
 
 // Keyboard input goes to the window with the focus, as Windows sends it. The

@@ -2286,9 +2286,9 @@ static void listbox_owner_wndproc(X86 *c) {
 static void test_static_settext_erase(X86 *c) {
     section("USER32 static caption erase");
     ensure_dialog_classes();
-    uint32_t dlg = call_import(c, "USER32.dll", "CreateWindowExA",
-                               {0, put_str("#32770"), put_str("d"), 0x10000000u, 0, 0, 160, 60, 0, 0,
-                                0, 0});
+    uint32_t dlg =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, put_str("#32770"), put_str("d"), 0x10000000u, 0, 0, 160, 60, 0, 0, 0, 0});
     check(dlg != 0, "create a #32770 dialog whose procedure answers no colour brush");
     // CreateWindowExA records the class atom as the window's class; the dialog
     // engine names a real dialog "#32770", so name this one the same way.
@@ -2370,9 +2370,9 @@ static void test_listbox_selection(X86 *c) {
     auto send = [&](uint32_t h, uint32_t m, uint32_t wp, uint32_t lp) -> uint32_t {
         return call_import(c, "USER32.dll", "SendMessageA", {h, m, wp, lp});
     };
-    uint32_t lb = call_import(c, "USER32.dll", "CreateWindowExA",
-                              {0, lbcls, 0, 0x40000000u | 0x00200000u /*WS_VSCROLL*/, 0, 0, 100,
-                               64, parent, 1307, 0, 0});
+    uint32_t lb = call_import(
+        c, "USER32.dll", "CreateWindowExA",
+        {0, lbcls, 0, 0x40000000u | 0x00200000u /*WS_VSCROLL*/, 0, 0, 100, 64, parent, 1307, 0, 0});
     if (user32::Window *lw = user32::find_window(lb))
         lw->cls = "listbox";
     check(lb != 0, "create a WS_VSCROLL listbox");
@@ -8427,6 +8427,412 @@ static void test_import_return_trace() {
     remove_tree(dir);
 }
 
+// ---------------------------------------------------------------------------
+// TD-072/TD-108: a modeless dialog gets the modal path's frame and client face
+// fill. The guest's own message loop dispatches the synthesized WM_PAINT, so
+// DispatchMessageA paints the whole subtree (chrome/erase, the dialog's own
+// paint, then the children) instead of just the dialog's window procedure.
+// ---------------------------------------------------------------------------
+static int ink_rows_in(uint32_t hwnd, int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t bg,
+                       int32_t *first, int32_t *last) {
+    uint32_t dc = ::gdi_window_dc(hwnd);
+    int rows = 0;
+    if (first)
+        *first = -1;
+    if (last)
+        *last = -1;
+    for (int32_t y = y0; y < y1; ++y) {
+        bool ink = false;
+        for (int32_t x = x0; x < x1 && !ink; ++x) {
+            uint32_t px = 0;
+            if (gdi::read_pixel(dc, x, y, &px) && (px & 0x00ffffffu) != bg)
+                ink = true;
+        }
+        if (ink) {
+            ++rows;
+            if (first && *first < 0)
+                *first = y;
+            if (last)
+                *last = y;
+        }
+    }
+    ::gdi_release_window_dc(hwnd, dc);
+    return rows;
+}
+static uint32_t pixel_at(uint32_t hwnd, int32_t x, int32_t y) {
+    uint32_t dc = ::gdi_window_dc(hwnd), px = 0;
+    gdi::read_pixel(dc, x, y, &px);
+    ::gdi_release_window_dc(hwnd, dc);
+    return px & 0x00ffffffu;
+}
+static void post_paint(uint32_t hwnd) {
+    uint32_t p = scratch_block(28);
+    for (int i = 0; i < 28; i += 4)
+        wr32(p + uint32_t(i), 0);
+    wr32(p + 0, hwnd);
+    wr32(p + 4, 0x000f /*WM_PAINT*/);
+    wr32(p + 16, host_millis());
+    // dispatch_message() reads the MSG from guest memory exactly as
+    // DispatchMessageA's argument does.
+    call_import(loader_context(), "USER32.dll", "DispatchMessageA", {p});
+}
+static void test_modeless_dialog_paint(X86 *c) {
+    section("USER32 modeless dialog frame and face fill");
+    ensure_dialog_classes();
+    const uint32_t face = gdi::argb(0x00c8d0d4) & 0x00ffffffu;
+    const uint32_t navy = gdi::argb(0x006a240a) & 0x00ffffffu;
+    const uint32_t hi = 0x00ffffffu;
+    uint32_t dlg = call_import(c, "USER32.dll", "CreateWindowExA",
+                               {0, put_str("#32770"), put_str("Modeless Dialog"),
+                                0x80000000u | 0x10000000u | 0x00c00000u | 0x00080000u, 40, 40, 160,
+                                70, 0, 0, 0, 0});
+    check(dlg != 0, "create a framed modeless dialog");
+    user32::Window *dw = user32::find_window(dlg);
+    if (dw)
+        dw->cls =
+            "#32770"; // CreateWindowExA records the class atom; the engine names a dialog this
+    check(dw && dw->nc_top == 19 && dw->nc_caption, "the dialog has a caption and frame");
+    if (!dw) {
+        if (dlg)
+            call_import(c, "USER32.dll", "DestroyWindow", {dlg});
+        return;
+    }
+    dw->dlg_modeless = true; // what CreateDialogParamA marks
+    dw->title_utf8 = "Modeless Dialog";
+    dw->update_pending = true;
+    // A caption STATIC paints first, before the dialog has ever been painted:
+    // that is the TD-108 light-box-on-grey state.
+    uint32_t st =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, put_str("static"), put_str(""),
+                     0x40000000u | 0x10000000u | 0x0u /*SS_LEFT*/, 4, 4, 100, 16, dlg, 7, 0, 0});
+    check(st != 0, "create a caption STATIC on the modeless dialog");
+    call_import(c, "USER32.dll", "SendMessageA", {st, 0x000f /*WM_PAINT*/, 0, 0});
+    check(pixel_at(dlg, 10, 10) == face, "the caption static erases with the dialog face");
+    check(pixel_at(dlg, 150, 60) == 0u, "the rest of the client is still unpainted at this point");
+    // The modeless dialog's own WM_PAINT is dispatched by the guest loop.
+    post_paint(dlg);
+    check(user32::find_window(dlg) && !user32::find_window(dlg)->update_pending,
+          "the modeless dialog validates its update region");
+    check(pixel_at(dlg, 150, 60) == face,
+          "the modeless dialog's client is filled with COLOR_BTNFACE (TD-108)");
+    check(pixel_at(dlg, 80, -10) == navy, "a modeless dialog paints its caption bar (TD-072)");
+    check(pixel_at(dlg, -3, 40) == hi, "a modeless dialog paints its raised frame");
+    // Caption text is drawn: white glyph pixels somewhere on the caption bar.
+    int32_t cap_first = 0, cap_last = 0;
+    check(ink_rows_in(dlg, 6, -17, 140, -2, navy, &cap_first, &cap_last) > 0,
+          "the caption draws its title");
+    call_import(c, "USER32.dll", "DestroyWindow", {dlg});
+}
+
+// ---------------------------------------------------------------------------
+// TD-081: the remaining BUTTON placement flags. BS_MULTILINE wraps and centres
+// the caption; BS_PUSHLIKE draws a checkbox/radio as a toggled push button;
+// BS_LEFTTEXT puts the glyph on the right; BS_TOP/BOTTOM/VCENTER place the glyph.
+// ---------------------------------------------------------------------------
+static void test_button_placement_flags(X86 *c) {
+    section("USER32 button placement flags");
+    ensure_dialog_classes();
+    const uint32_t face = gdi::argb(0x00c8d0d4) & 0x00ffffffu;
+    uint32_t parent = call_import(c, "USER32.dll", "CreateWindowExA",
+                                  {0, put_str("#32770"), put_str("Buttons"),
+                                   0x80000000u | 0x10000000u, 0, 0, 320, 200, 0, 0, 0, 0});
+    if (user32::Window *pw = user32::find_window(parent))
+        pw->cls = "#32770";
+    check(parent != 0, "create a dialog parent for the buttons");
+    auto make = [&](uint32_t style, const char *text, int32_t x, int32_t y, int32_t w,
+                    int32_t h) -> uint32_t {
+        uint32_t b = call_import(c, "USER32.dll", "CreateWindowExA",
+                                 {0, put_str("button"), put_str(text),
+                                  0x40000000u | 0x10000000u | style, uint32_t(x), uint32_t(y),
+                                  uint32_t(w), uint32_t(h), parent, uint32_t(100 + y), 0, 0});
+        if (user32::Window *bw = user32::find_window(b))
+            bw->cls = "button";
+        return b;
+    };
+    auto paint = [&](uint32_t b) {
+        call_import(c, "USER32.dll", "SendMessageA", {b, 0x000f /*WM_PAINT*/, 0, 0});
+    };
+    const char *long_text = "wrap this caption onto several lines";
+    uint32_t single = make(0x0 /*BS_PUSHBUTTON*/, long_text, 4, 4, 120, 48);
+    uint32_t multi = make(0x2000 /*BS_MULTILINE*/, long_text, 130, 4, 120, 48);
+    paint(single);
+    paint(multi);
+    int32_t s_first = 0, s_last = 0, m_first = 0, m_last = 0;
+    const int s_rows = ink_rows_in(single, 2, 2, 118, 46, face, &s_first, &s_last);
+    const int m_rows = ink_rows_in(multi, 2, 2, 118, 46, face, &m_first, &m_last);
+    check(s_rows > 0 && m_rows > 0, "both buttons draw their caption (%d/%d rows)", s_rows, m_rows);
+    check(m_rows > s_rows + 2, "BS_MULTILINE wraps the caption onto more rows (%d vs %d)", m_rows,
+          s_rows);
+    check((m_first + m_last) / 2 >= 20 && (m_first + m_last) / 2 <= 28,
+          "the wrapped caption block is vertically centred (%d..%d in 48 px)", m_first, m_last);
+
+    // BS_PUSHLIKE: a checked check button reads as a held-down push button.
+    uint32_t pushlike = make(3u | 0x1000u /*BS_AUTOCHECKBOX|BS_PUSHLIKE*/, "Toggle", 4, 60, 90, 24);
+    paint(pushlike);
+    const uint32_t raised = pixel_at(pushlike, 0, 0);
+    call_import(c, "USER32.dll", "SendMessageA", {pushlike, 0x00f1 /*BM_SETCHECK*/, 1, 0});
+    paint(pushlike);
+    const uint32_t checked_px = pixel_at(pushlike, 0, 0);
+    check(raised == 0x00ffffffu && checked_px == 0x00808080u,
+          "a BS_PUSHLIKE checkbox looks pressed while checked (%06x -> %06x)", raised, checked_px);
+    // A click toggles the push-like button and its bevel follows the check state.
+    call_import(c, "USER32.dll", "SendMessageA", {pushlike, 0x00f1 /*BM_SETCHECK*/, 0, 0});
+    call_import(c, "USER32.dll", "SendMessageA", {pushlike, 0x0201, 1, 0x00040008});
+    paint(pushlike);
+    check(pixel_at(pushlike, 0, 0) == 0x00808080u,
+          "the press of a push-like checkbox draws the sunken bevel");
+    call_import(c, "USER32.dll", "SendMessageA", {pushlike, 0x0202, 0, 0x00040008});
+    paint(pushlike);
+    check(call_import(c, "USER32.dll", "SendMessageA", {pushlike, 0x00f0 /*BM_GETCHECK*/, 0, 0}) ==
+              1u,
+          "the click toggles the push-like check state");
+    check(pixel_at(pushlike, 0, 0) == 0x00808080u, "the checked button stays pressed");
+
+    // BS_LEFTTEXT puts the glyph on the right; the default puts it on the left.
+    uint32_t lefttext = make(3u | 0x20u /*BS_AUTOCHECKBOX|BS_LEFTTEXT*/, "L", 4, 90, 100, 20);
+    uint32_t glyphleft = make(3u /*BS_AUTOCHECKBOX*/, "L", 110, 90, 100, 20);
+    paint(lefttext);
+    paint(glyphleft);
+    check(pixel_at(lefttext, 94, 10) == 0x00ffffffu,
+          "BS_LEFTTEXT draws the glyph at the right edge");
+    check(pixel_at(glyphleft, 6, 10) == 0x00ffffffu,
+          "the default checkbox draws the glyph at the left edge");
+
+    // BS_TOP / BS_BOTTOM / BS_VCENTER place the 13 px glyph in a 40 px control.
+    uint32_t gt = make(3u | 0x400u /*BS_TOP*/, "T", 4, 120, 100, 40);
+    uint32_t gb = make(3u | 0x800u /*BS_BOTTOM*/, "B", 110, 120, 100, 40);
+    uint32_t gv = make(3u /*BS_VCENTER is the default*/, "V", 216, 120, 100, 40);
+    auto glyph_top = [&](uint32_t b) -> int32_t {
+        paint(b);
+        for (int32_t y = 0; y < 40; ++y)
+            if (pixel_at(b, 6, y) != face)
+                return y;
+        return -1;
+    };
+    check(glyph_top(gt) == 0, "BS_TOP puts the glyph at the top (%d)", glyph_top(gt));
+    check(glyph_top(gv) == 13, "BS_VCENTER centres the glyph (%d)", glyph_top(gv));
+    check(glyph_top(gb) == 27, "BS_BOTTOM puts the glyph at the bottom (%d)", glyph_top(gb));
+    call_import(c, "USER32.dll", "DestroyWindow", {parent});
+}
+
+// ---------------------------------------------------------------------------
+// TD-101: CBS_SIMPLE (an always-open list under the field, the template's height
+// being field + list) and CB_SETITEMDATA/CB_GETITEMDATA.
+// ---------------------------------------------------------------------------
+static uint32_t make_combo_template(uint32_t style, int16_t cy) {
+    uint32_t t = scratch_block(56);
+    for (int i = 0; i < 56; i += 4)
+        wr32(t + uint32_t(i), 0);
+    wr32(t + 0, 0x10000000u); // WS_VISIBLE dialog
+    wr32(t + 4, 0);
+    wr16(t + 8, 1); // one control
+    wr16(t + 10, 0);
+    wr16(t + 12, 0);
+    wr16(t + 14, 200);
+    wr16(t + 16, 100);
+    wr16(t + 18, 0); // no menu
+    wr16(t + 20, 0); // dialog class
+    wr16(t + 22, 0); // no title
+    const uint32_t it = t + 24;
+    wr32(it + 0, 0x40000000u | 0x10000000u | style); // WS_CHILD|WS_VISIBLE|CBS_*
+    wr32(it + 4, 0);
+    wr16(it + 8, 5);
+    wr16(it + 10, 5);
+    wr16(it + 12, 100);
+    wr16(it + 14, uint16_t(cy));
+    wr16(it + 16, 1001);
+    wr16(it + 18, 0xffff); // class ordinal
+    wr16(it + 20, 0x85);   // combobox
+    wr16(it + 22, 0);      // no text
+    wr16(it + 24, 0);      // no creation data
+    return t;
+}
+static void test_combobox_simple_and_item_data(X86 *c) {
+    section("USER32 simple combo box and item data");
+    ensure_dialog_classes();
+    uint32_t proc = imports_alloc_trampoline("test", "rt_combo_tmpl", fake_guest_fn, 4);
+    // A CBS_SIMPLE template's cy is the whole control: field plus list. A
+    // drop-down's cy is the dropped height and the closed field is one row.
+    uint32_t simple_dlg =
+        user32::create_dialog_from_template(c, 0, 0, proc, make_combo_template(1u, 60), 50);
+    uint32_t drop_dlg =
+        user32::create_dialog_from_template(c, 0, 0, proc, make_combo_template(3u, 60), 50);
+    check(simple_dlg && drop_dlg, "create dialogs from a combo template");
+    uint32_t simple = 0, drop = 0;
+    for (const auto &kv : user32::windows()) {
+        if (kv.second.parent == simple_dlg && kv.second.cls == "combobox")
+            simple = kv.first;
+        if (kv.second.parent == drop_dlg && kv.second.cls == "combobox")
+            drop = kv.first;
+    }
+    check(simple != 0 && user32::find_window(simple)->h == 120 &&
+              user32::find_window(simple)->combo_drop_h == 0,
+          "CBS_SIMPLE keeps the template height as field+list (%d px)",
+          simple ? user32::find_window(simple)->h : -1);
+    check(drop != 0 && user32::find_window(drop)->h == 20 &&
+              user32::find_window(drop)->combo_drop_h == 120,
+          "CBS_DROPDOWNLIST keeps the dropped height and creates a one-row field (%d/%d)",
+          drop ? user32::find_window(drop)->h : -1,
+          drop ? user32::find_window(drop)->combo_drop_h : -1);
+
+    auto send = [&](uint32_t h, uint32_t m, uint32_t wp, uint32_t lp) -> uint32_t {
+        return call_import(c, "USER32.dll", "SendMessageA", {h, m, wp, lp});
+    };
+    uint32_t combo =
+        call_import(c, "USER32.dll", "CreateWindowExA",
+                    {0, put_str("combobox"), 0, 0x40000000u | 0x10000000u | 1u /*CBS_SIMPLE*/, 0, 0,
+                     120, 64, simple_dlg, 2001, 0, 0});
+    if (user32::Window *cw = user32::find_window(combo))
+        cw->cls = "combobox";
+    check(combo != 0, "create a CBS_SIMPLE combo");
+    send(combo, 0x0143 /*CB_ADDSTRING*/, 0, put_str("Alpha"));
+    send(combo, 0x0143, 0, put_str("Beta"));
+    send(combo, 0x0143, 0, put_str("Gamma"));
+    check(send(combo, 0x0146 /*CB_GETCOUNT*/, 0, 0) == 3, "three items");
+    // Item data follows its item through insert/delete, and reset clears it.
+    check(send(combo, 0x0151 /*CB_SETITEMDATA*/, 0, 0x11111111u) == 0,
+          "CB_SETITEMDATA stores a value");
+    check(send(combo, 0x0151, 1, 0x22222222u) == 0, "CB_SETITEMDATA stores a second value");
+    check(send(combo, 0x0150 /*CB_GETITEMDATA*/, 0, 0) == 0x11111111u &&
+              send(combo, 0x0150, 1, 0) == 0x22222222u,
+          "CB_GETITEMDATA reads the values back");
+    check(send(combo, 0x0150, 3, 0) == 0xffffffffu && send(combo, 0x0151, 3, 7) == 0xffffffffu,
+          "an out-of-range item data call answers CB_ERR");
+    send(combo, 0x014a /*CB_INSERTSTRING*/, 1, put_str("Inserted"));
+    check(send(combo, 0x0150, 2, 0) == 0x22222222u,
+          "inserting an item shifts the data with its item");
+    check(send(combo, 0x0150, 1, 0) == 0 && send(combo, 0x0150, 0, 0) == 0x11111111u,
+          "the inserted item starts with data 0 and the first item is unchanged");
+    send(combo, 0x0144 /*CB_DELETESTRING*/, 0, 0);
+    check(send(combo, 0x0150, 0, 0) == 0 && send(combo, 0x0150, 1, 0) == 0x22222222u,
+          "deleting an item drops its data");
+    send(combo, 0x014b /*CB_RESETCONTENT*/, 0, 0);
+    check(send(combo, 0x0146, 0, 0) == 0 && send(combo, 0x0150, 0, 0) == 0xffffffffu,
+          "CB_RESETCONTENT clears the data too");
+
+    // The list is always open: a press on a row selects it (and updates the
+    // field), a press in the field does not. The field is 20 px (a 16 px row
+    // plus the border), so rows start at y = 21.
+    send(combo, 0x0143, 0, put_str("Alpha"));
+    send(combo, 0x0143, 0, put_str("Beta"));
+    check(send(combo, 0x014f /*CB_SHOWDROPDOWN*/, 1, 0) == 0 &&
+              send(combo, 0x0157 /*CB_GETDROPPEDSTATE*/, 0, 0) == 0,
+          "CB_SHOWDROPDOWN cannot drop a CBS_SIMPLE list");
+    send(combo, 0x0201 /*WM_LBUTTONDOWN*/, 1, (10u << 16) | 5u); // the field
+    check(send(combo, 0x0147 /*CB_GETCURSEL*/, 0, 0) == 0xffffffffu,
+          "a press in the field selects nothing");
+    send(combo, 0x0202 /*WM_LBUTTONUP*/, 0, 0);
+    send(combo, 0x0201, 1, (45u << 16) | 5u); // row 1 of the list (21..37, 37..53)
+    check(send(combo, 0x0147, 0, 0) == 1, "a press on a simple-combo row selects it");
+    uint32_t buf = scratch_block(64);
+    check(call_import(c, "USER32.dll", "SendMessageA", {combo, 0x000d /*WM_GETTEXT*/, 32, buf}) ==
+                  4 &&
+              std::string(gm_str(buf)) == "Beta",
+          "the selected row becomes the field text");
+    send(combo, 0x0202, 0, 0);
+    // The paint draws the field white and the selected row highlighted.
+    send(combo, 0x000f /*WM_PAINT*/, 0, 0);
+    check(pixel_at(combo, 50, 8) == 0x00ffffffu, "the simple field is white");
+    check(pixel_at(combo, 60, 45) == (gdi::argb(0x00a80000) & 0x00ffffffu),
+          "the selected row is highlighted (%06x)", pixel_at(combo, 60, 45));
+    call_import(c, "USER32.dll", "DestroyWindow", {simple_dlg});
+    call_import(c, "USER32.dll", "DestroyWindow", {drop_dlg});
+}
+
+// ---------------------------------------------------------------------------
+// TD-070: a dialog's system menu. Alt+F4 closes (WM_COMMAND IDCANCEL then
+// WM_CLOSE), Alt+Space opens a Move/Close popup at the caption, and the popup's
+// Close command runs the same close-box rule.
+// ---------------------------------------------------------------------------
+static void test_dialog_system_menu(X86 *c) {
+    section("USER32 dialog system menu");
+    ensure_dialog_classes();
+    uint32_t proc =
+        imports_alloc_trampoline("test", "closebox_dialog_proc", closebox_dialog_proc, 4);
+    uint32_t hwnd = call_import(c, "USER32.dll", "CreateWindowExA",
+                                {0, put_str("#32770"), put_str("System Menu Dialog"),
+                                 0x80000000u | 0x10000000u | 0x00c00000u | 0x00080000u, 60, 60, 200,
+                                 120, 0, 0, 0, 0});
+    check(hwnd != 0, "create a captioned dialog with a system menu");
+    if (user32::Window *w = user32::find_window(hwnd))
+        w->cls = "#32770"; // CreateWindowExA records the class atom
+    call_import(c, "USER32.dll", "SetWindowLongA", {hwnd, uint32_t(-4), proc}); // GWL_WNDPROC
+
+    // The menu itself: Move, a separator, Close - no minimise/maximise/size.
+    uint32_t menu = call_import(c, "USER32.dll", "GetSystemMenu", {hwnd, 0});
+    check(menu != 0, "GetSystemMenu gives the dialog a menu");
+    const uint32_t count = call_import(c, "USER32.dll", "GetMenuItemCount", {menu});
+    check(count == 3, "a dialog system menu is Move/Close (%u entries)", count);
+    check(call_import(c, "USER32.dll", "GetMenuItemID", {menu, 0}) == 0xf010u,
+          "the first entry is Move (SC_MOVE)");
+    check((call_import(c, "USER32.dll", "GetMenuState", {menu, 1, 0}) & 0x800u) != 0,
+          "the middle entry is a separator");
+    check(call_import(c, "USER32.dll", "GetMenuItemID", {menu, 2}) == 0xf060u,
+          "the last entry is Close (SC_CLOSE)");
+    bool has_minmax = false;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t id = call_import(c, "USER32.dll", "GetMenuItemID", {menu, i});
+        if (id == 0xf020u || id == 0xf030u || id == 0xf000u)
+            has_minmax = true;
+    }
+    check(!has_minmax, "a dialog system menu has no minimise/maximise/size");
+
+    // Alt+F4: WM_COMMAND IDCANCEL then WM_CLOSE.
+    g_cb_cmd = g_cb_cmd_id = g_cb_close = 0;
+    host_set_key_state(0x12 /*VK_MENU*/, true);
+    check(user32::dialog_system_key(c, hwnd, 0x0104 /*WM_SYSKEYDOWN*/, 0x73 /*VK_F4*/),
+          "Alt+F4 is a system command");
+    check(g_cb_cmd == 1 && g_cb_cmd_id == 2 && g_cb_close == 1,
+          "Alt+F4 sends IDCANCEL and then WM_CLOSE");
+    // Without Alt it is an ordinary F4.
+    g_cb_cmd = g_cb_cmd_id = g_cb_close = 0;
+    host_set_key_state(0x12, false);
+    check(!user32::dialog_system_key(c, hwnd, 0x0104, 0x73) && g_cb_close == 0,
+          "F4 without Alt is not a system command");
+    // Alt+Space: open the menu and choose Close with a mouse release over the
+    // last entry (the popup runs its own loop and consumes the queued release).
+    g_cb_cmd = g_cb_cmd_id = g_cb_close = 0;
+    host_set_key_state(0x12, true);
+    user32::Window *sw = user32::find_window(hwnd);
+    check(sw != nullptr, "the dialog is still there");
+    if (sw) {
+        // A fresh press+release over the last entry (the release that opened a
+        // menu is not a choice; this press is the user's).
+        host_post_mouse_message(0x0201 /*WM_LBUTTONDOWN*/, 1, sw->x + 12, sw->y + 2 + 40);
+        host_post_mouse_message(0x0202 /*WM_LBUTTONUP*/, 0, sw->x + 12, sw->y + 2 + 40);
+        check(user32::dialog_system_key(c, hwnd, 0x0104, 0x20 /*VK_SPACE*/),
+              "Alt+Space opens the system menu");
+        check(g_cb_cmd == 1 && g_cb_cmd_id == 2 && g_cb_close == 1,
+              "choosing Close in the system menu cancels the dialog");
+    }
+    // The system-menu box at the left of the caption opens the same menu.
+    g_cb_cmd = g_cb_cmd_id = g_cb_close = 0;
+    if (user32::Window *dw = user32::find_window(hwnd)) {
+        host_post_mouse_message(0x0201, 1, dw->x + 2, dw->y + 8);        // the icon box
+        host_post_mouse_message(0x0201, 1, dw->x + 10, dw->y + 10 + 40); // Close entry
+        host_post_mouse_message(0x0202, 0, dw->x + 10, dw->y + 10 + 40);
+        user32::pump_mouse_input(c);
+        check(g_cb_cmd == 1 && g_cb_cmd_id == 2 && g_cb_close == 1,
+              "the caption system-menu box opens the dialog menu (cmd=%u id=%u close=%u)", g_cb_cmd,
+              g_cb_cmd_id, g_cb_close);
+    }
+    // A caption double-click opens the same menu (the pump's non-client path).
+    g_cb_cmd = g_cb_cmd_id = g_cb_close = 0;
+    if (user32::Window *dw = user32::find_window(hwnd)) {
+        const int32_t sx = dw->x + 100, sy = dw->y + 8; // inside the caption
+        host_post_mouse_message(0x0203 /*WM_LBUTTONDBLCLK*/, 1, sx, sy);
+        host_post_mouse_message(0x0201, 1, sx - 2 + 10, sy + 40); // Close entry
+        host_post_mouse_message(0x0202, 0, sx - 2 + 10, sy + 40);
+        user32::pump_mouse_input(c);
+        check(g_cb_cmd == 1 && g_cb_cmd_id == 2 && g_cb_close == 1,
+              "a caption double-click opens the dialog system menu (cmd=%u id=%u close=%u)",
+              g_cb_cmd, g_cb_cmd_id, g_cb_close);
+    }
+    host_set_key_state(0x12, false);
+    call_import(c, "USER32.dll", "DestroyWindow", {hwnd});
+}
+
 int main(int argc, char **argv) {
     const bool child = argc > 1 && strcmp(argv[1], "--child-setjmp-abort") == 0;
     if (child) {
@@ -8556,6 +8962,10 @@ int main(int argc, char **argv) {
     test_edit_text_model(c);
     test_host_key_char_dedup(c);
     test_dialog_key_routing(c);
+    test_modeless_dialog_paint(c);
+    test_button_placement_flags(c);
+    test_combobox_simple_and_item_data(c);
+    test_dialog_system_menu(c);
     test_interp_extra_ops(c);
     test_acm_pcm_converter(c);
     test_guest_thunks(c);
