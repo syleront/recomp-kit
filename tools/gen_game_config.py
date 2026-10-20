@@ -28,6 +28,11 @@ def c_hex(value):
     return "0x%08xu" % value
 
 
+def cmake_string(value):
+    """A value safe inside set(VAR "...") in the generated cmake fragment."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+
+
 def c_string_list(values):
     """A brace initializer of C strings ending in a null pointer."""
     return "{" + "".join(c_string(v) + ", " for v in values) + "0}"
@@ -116,6 +121,13 @@ def render_cmake(cfg):
     lines.append("set(RECOMP_IMAGE_BASE %s)" % c_hex(game["image_base"]))
     lines.append("set(RECOMP_HEAP_BASE %s)" % c_hex(game["heap_base"]))
     lines.append("set(RECOMP_GUEST_SIZE %s)" % c_hex(game["guest_size"]))
+    # Release metadata for host/Info.plist.in: version and build are game.toml's
+    # single source of truth, so a release bump changes exactly one file.
+    for key, variable in (("version", "RECOMP_VERSION"), ("build", "RECOMP_BUILD_NUMBER"),
+                          ("signature", "RECOMP_BUNDLE_SIGNATURE"), ("copyright", "RECOMP_COPYRIGHT"),
+                          ("development_region", "RECOMP_DEVELOPMENT_REGION"),
+                          ("minimum_macos", "RECOMP_MINIMUM_MACOS"), ("category", "RECOMP_APP_CATEGORY")):
+        lines.append('set(%s "%s")' % (variable, cmake_string(game[key])))
     # The generated sources include this header before they define FN_<addr>,
     # which is how a game replaces one translated function with a native one.
     lines.append('set(RECOMP_OVERRIDE_HEADER "%s")'

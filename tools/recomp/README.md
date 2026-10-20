@@ -11,6 +11,7 @@ Use those wrappers for an ordinary first build.
 | `symbols/` | Reviewed metadata for stable hooks and guest globals |
 | `buildlock.sh`, `buildlock.py` | The shared process lock over build/recomp, as a shell entry and a Python module |
 | `build_core.py`, `finish_bundle.py`, `snapshot_gen.py` | Install core mods reproducibly, finish the app bundle, copy one consistent generation of gen/ |
+| `macos_icon.py` | Extract the game executable's icon resources and build the cached macOS AppIcon.icns |
 | `mode_probe.py`, `mode_probe.sh` | Exercise candidate modes with isolated settings and explicit evidence |
 | `smoke/` | Scripted menu, graphics and gameplay scenarios |
 | `texture_pack.py`, `terrain_detail.py`, `package_texture_pack.py` | Prepare and package local texture inputs |

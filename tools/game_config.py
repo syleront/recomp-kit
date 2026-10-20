@@ -16,6 +16,21 @@ REQUIRED_GAME_KEYS = ("id", "name", "app_name", "bundle_id", "executable", "sha2
 
 HEAP_BASE_DEFAULT = 0x01000000
 
+# [game] release metadata. version is the one source of truth for the macOS
+# bundle's CFBundleShortVersionString and build for CFBundleVersion: a game
+# bumps those two when it cuts a release, and no git description leaks into a
+# plist field that must be numeric. The rest refine Info.plist's presentation.
+VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){0,2}$")
+GAME_METADATA_DEFAULTS = {
+    "version": "0.1.0",
+    "build": 1,
+    "signature": "????",  # legacy four-character CFBundleSignature
+    "copyright": "",
+    "development_region": "en",
+    "minimum_macos": "14.0",
+    "category": "public.app-category.games",
+}
+
 # The settings page's rows, in mods/display_settings.h DisplayRow order; the
 # controls' seven rows are one entry. [settings] rows names the ones a game
 # shows. Without the key a game shows every row. "keypad" is the pre-touch-
@@ -69,6 +84,26 @@ def windows_version(value):
     if major > 255 or minor > 255 or build > 32767:
         raise ValueError("[game] windows_version requires byte-sized major/minor and a 15-bit build")
     return major, minor, build, 2 if major >= 5 else 1
+
+
+def validate_release_metadata(game, source):
+    """Fill in and check the optional [game] fields that feed the macOS plist."""
+    for key, default in GAME_METADATA_DEFAULTS.items():
+        game.setdefault(key, default)
+    version = game["version"]
+    if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
+        raise ValueError("%s: [game] version must be 1-3 dot-separated numbers, not %r"
+                         % (source, version))
+    build = game["build"]
+    if type(build) is not int or build < 1:
+        raise ValueError("%s: [game] build must be a positive integer, not %r" % (source, build))
+    signature = game["signature"]
+    if not isinstance(signature, str) or len(signature) != 4:
+        raise ValueError("%s: [game] signature must be four characters, not %r" % (source, signature))
+    for key in ("copyright", "development_region", "minimum_macos", "category"):
+        if not isinstance(game[key], str):
+            raise ValueError("%s: [game] %s must be a string, not %r" % (source, key, game[key]))
+    return game
 
 
 def validate_heap_base(value):
@@ -192,6 +227,7 @@ def load(game_dir):
     missing = [key for key in REQUIRED_GAME_KEYS if key not in game]
     if missing:
         raise ValueError("%s: missing [game] keys: %s" % (source, ", ".join(missing)))
+    validate_release_metadata(game, source)
     merge_aux_fragment(cfg, game, game_dir, source)
     game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)))
     windows_version(game.setdefault("windows_version", "4.10"))

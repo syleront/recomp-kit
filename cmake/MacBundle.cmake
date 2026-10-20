@@ -29,12 +29,18 @@ function(pop_mac_bundle target)
       list(APPEND video_args --ffmpeg-library "${library}")
     endforeach()
   endif()
+  # The finishing step writes the plist and the icon, so their inputs must
+  # relink the host: otherwise a version bump or an icon-tool change would
+  # leave a stale bundle behind.
   set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS
-    ${POP_ROOT}/tools/recomp/finish_bundle.py)
+    ${POP_ROOT}/tools/recomp/finish_bundle.py
+    ${POP_ROOT}/tools/recomp/macos_icon.py
+    ${CMAKE_BINARY_DIR}/generated/Info.plist)
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${Python3_EXECUTABLE} ${POP_ROOT}/tools/recomp/finish_bundle.py
             --bundle ${POP_BUILD_DIR}/${RECOMP_APP_NAME}.app
-            --name ${RECOMP_APP_NAME} --cc ${CMAKE_C_COMPILER} --version ${POP_RECOMP_VERSION}
+            --name ${RECOMP_APP_NAME} --cc ${CMAKE_C_COMPILER}
+            --version ${RECOMP_VERSION} --build ${RECOMP_BUILD_NUMBER}
             --build-root ${POP_BUILD_ROOT} --game-dir ${RECOMP_GAME_DIR}
             ${video_args}
     WORKING_DIRECTORY ${POP_ROOT}

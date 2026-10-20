@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>@RECOMP_APP_NAME@</string>
+    <string>@RECOMP_GAME_NAME@</string>
     <key>CFBundleDisplayName</key>
     <string>@RECOMP_GAME_NAME@</string>
     <key>CFBundleIdentifier</key>
@@ -12,14 +12,28 @@
     <string>@RECOMP_APP_NAME@</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
+    <key>CFBundleSignature</key>
+    <string>@RECOMP_BUNDLE_SIGNATURE@</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1</string>
+    <string>@RECOMP_VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@RECOMP_BUILD_NUMBER@</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>@RECOMP_DEVELOPMENT_REGION@</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>@RECOMP_MINIMUM_MACOS@</string>
+    <key>LSApplicationCategoryType</key>
+    <string>@RECOMP_APP_CATEGORY@</string>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+    </array>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>@RECOMP_COPYRIGHT@</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>
