@@ -410,6 +410,7 @@ reaches the same point in the same way with one fewer frame presented.
 | `RECOMP_EXE` | image to load (default the loader's) |
 | `RECOMP_NO_ACTIVATE` | do not synthesise activation |
 | `RECOMP_PIN_CLOCK` | `1`, or `<start>:<step>`, to pin the guest's clock |
+| `RECOMP_HOST_AUDIO_CAPTURE` | write the mixer's own output as 16-bit stereo PCM to this `.wav`, at the mix rate; the headless host writes its offline render, the windowed host its device mix, and headless measures the mix either way |
 
 `RECOMP_PIN_CLOCK` is read by every host that boots through `boot.cpp`,
 which is the headless host, the smoke host and the windowed app. It replaces
@@ -447,6 +448,7 @@ The windowed host reads `RECOMP_EXE` too, and adds:
 | `RECOMP_HOST_D3D_NOCULL` | ignore `D3DRENDERSTATE_CULLMODE` |
 | `RECOMP_HOST_NO_AUDIO` | never start the audio engine |
 | `RECOMP_D3D11_SOFTWARE` | draw every Direct3D 11 call in the software rasterizer |
+| `RECOMP_MOUSE_SYNTH` | windowed only: a `;`-separated list of window points `x,y`, pushed one at a time through the real mouse-motion path every `RECOMP_MOUSE_SYNTH_EVERY` host turns (default 30), cycling the list; a test seam where no window server exists |
 
 `RECOMP_LOG`, `RECOMP_IMPORT_STATS`, `RECOMP_CREATETHREAD` and the rest are the
 runtime's, documented in `runtime/README.md`.
