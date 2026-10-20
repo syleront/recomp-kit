@@ -148,17 +148,24 @@ def merge_aux_fragment(cfg, game, game_dir, source):
     [modules] aux_file names a TOML fragment, a path relative to game.toml,
     whose tables are merged here before validation: its [game] guest_size fills
     in the arena (an explicit value in game.toml wins) and its tables join the
-    game's own [modules.aux]. Absent by default; named but missing is an error.
+    game's own [modules.aux]. Absent by default; named but missing is not an
+    error at load time, because linking, analysis and host-only builds do not
+    need the module list. `aux_file_path` and `aux_file_missing` record it so a
+    build that does need the modules can refuse with a clear message.
     A key defined in both files is an error, so a stale fragment can neither
     silently override nor be silently overridden."""
+    cfg["aux_file_path"] = None
+    cfg["aux_file_missing"] = False
     aux_file = cfg.get("modules", {}).get("aux_file")
     if aux_file is None:
         return
     if not isinstance(aux_file, str):
         raise ValueError("%s: [modules] aux_file must be a string, not %r" % (source, aux_file))
     path = game_dir / aux_file
+    cfg["aux_file_path"] = path
     if not path.is_file():
-        raise ValueError("%s: [modules] aux_file names no file: %s" % (source, path))
+        cfg["aux_file_missing"] = True
+        return
     with path.open("rb") as fh:
         fragment = tomllib.load(fh)
     fragment_aux = fragment.get("modules", {}).get("aux", {})

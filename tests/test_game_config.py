@@ -213,8 +213,10 @@ class LoadTests(unittest.TestCase):
         game.toml) whose [modules.aux.*] tables and [game] guest_size are
         merged before validation, so a game with hundreds of generated modules
         can keep game.toml hand-written. tomllib has no include directive.
-        Absent by default; named but missing is an error, as is a key defined
-        in both files; an explicit guest_size in game.toml wins."""
+        Absent by default; named but missing loads without the modules (a clean
+        checkout can link and analyze before the content build runs) and is
+        recorded for the build that needs them. A key defined in both files is
+        an error; an explicit guest_size in game.toml wins."""
         with tempfile.TemporaryDirectory() as tmp:
             game = Path(tmp) / "g"
             game.mkdir()
@@ -226,9 +228,12 @@ class LoadTests(unittest.TestCase):
             # No aux_file at all is the common case and needs no fragment.
             self.assertEqual(game_config.load(ROOT / "games/stub")["aux_modules"], [])
 
-            # Named but absent is an error; it must not silently load nothing.
-            with self.assertRaisesRegex(ValueError, "aux_file names no file"):
-                game_config.load(game)
+            # Named but absent loads without the generated modules, and says so
+            # for the build that needs them; linking and analysis still work.
+            cfg = game_config.load(game)
+            self.assertEqual(cfg["aux_modules"], [])
+            self.assertTrue(cfg["aux_file_missing"])
+            self.assertEqual(cfg["aux_file_path"], game / "build/content/modules.toml")
 
             fragment = game / "build/content/modules.toml"
             fragment.parent.mkdir(parents=True)
@@ -237,6 +242,7 @@ class LoadTests(unittest.TestCase):
                 '[modules.aux.bone_toy]\nname = "Bone.toy"\npath = "original/Bone.toy"\n'
                 'sha256 = "%s"\nbase = 0x10000000\nsize = 0x11000\n' % ("cd" * 32))
             cfg = game_config.load(game)
+            self.assertFalse(cfg["aux_file_missing"])
             self.assertEqual(cfg["game"]["guest_size"], 0x10100000)
             self.assertEqual(len(cfg["aux_modules"]), 1)
             mod = cfg["aux_modules"][0]

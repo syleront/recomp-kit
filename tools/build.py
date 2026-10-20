@@ -458,6 +458,14 @@ def main():
         # The lock lives at <build root>/recomp/.lock: BuildLock joins build/recomp/.lock onto its argument.
         with buildlock.BuildLock(args.build_root.parent, "tools/build.py"):
             if args.target in NEEDS_GEN and args.regenerate:
+                # A [modules] aux_file is a generated fragment (the repository's
+                # content build creates it). Translating without it would emit
+                # an image that silently lacks every auxiliary module, so refuse
+                # instead. Linking and analysis (which load the config too) do
+                # not need it.
+                if cfg.get("aux_file_missing"):
+                    parser.error("[modules] aux_file %s is missing; prepare the game's content modules "
+                                 "before --regenerate" % cfg["aux_file_path"])
                 if not (cfg["listings_path"] / "functions.tsv").is_file():
                     parser.error("Translation listings are missing; run tools/setup.py without --link-only")
                 publish_generated(args.build_root,
