@@ -324,6 +324,25 @@ bool load_aux_module(const AuxSpec &spec) {
             found = read_file(m.path.c_str(), file);
         }
         if (!found) {
+            // A build may keep its rebased modules outside the game directory
+            // (this project: build/content/Resource/Area/...). A portable copy
+            // carries the same install subfolders beside the executable, so
+            // try each trailing suffix of the configured path (Resource/Area/
+            // Name.env, Area/Name.env, Name.env) under the game directory.
+            const std::string base = dirname_of(g_exe_path);
+            std::string rest = configured;
+            for (size_t slash = rest.find('/'); slash != std::string::npos && !found;
+                 slash = rest.find('/')) {
+                rest = rest.substr(slash + 1);
+                if (rest.empty())
+                    break;
+                const std::string candidate = base + "/" + rest;
+                found = read_file(candidate.c_str(), file);
+                if (found)
+                    m.path = candidate;
+            }
+        }
+        if (!found) {
             g_error =
                 std::string("cannot read auxiliary module ") + spec.name + " beside " + g_exe_path;
             return false;

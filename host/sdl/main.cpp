@@ -1842,6 +1842,12 @@ int main(int argc, char **argv) {
 #else
     GamePath game = platform_ui_resolve_game(exe_flag, &game_error);
 #endif
+    // A portable bundle's game is also what this copy plays: record it in the
+    // profile so game-path.txt exists beside the other portable state. A later
+    // launch still prefers the bundled data when this path goes stale after
+    // the folder is moved.
+    if (game.source == GamePathSource::Bundled)
+        game_path_save(game.exe);
     if (!game_error.empty()) {
 #ifdef __ANDROID__
         // The kit page needs a running presenter and initialized mod rows;

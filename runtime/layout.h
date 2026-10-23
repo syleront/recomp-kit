@@ -5,6 +5,10 @@
 // RECOMP_RESOURCES_DIR (like RECOMP_PROFILE_DIR for the profile) wins over
 // the computed resources directory whenever it is set: the Android host
 // names its app data folder there, having no executable path to go by.
+//
+// A packaged macOS app whose Contents/Resources holds a `portable` marker
+// keeps its profile in <directory holding the .app>/saves instead of the
+// per-user data directory. Explicit RECOMP_PROFILE_DIR still wins.
 #pragma once
 #include <string>
 

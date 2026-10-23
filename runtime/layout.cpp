@@ -1,5 +1,6 @@
 #include "layout.h"
 #include "game_config.h"
+#include "guest.h"
 
 #include "../platform/os.h"
 
@@ -27,6 +28,36 @@ std::string parent(const std::string &p) {
 bool ends_with(const std::string &s, const char *suffix) {
     size_t n = strlen(suffix);
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+void mkdir_p(const std::string &path) {
+    std::string acc;
+    for (size_t i = 0; i <= path.size(); ++i) {
+        if (i == path.size() || path[i] == '/') {
+            if (!acc.empty())
+                os_mkdir(acc.c_str());
+        }
+        if (i < path.size())
+            acc.push_back(path[i]);
+    }
+}
+
+// A portable save folder is only usable if this user may actually write in it.
+// Creating it is not enough: a read-only volume or a folder owned by someone
+// else would otherwise fail later, when adopts and settings are saved.
+bool make_writable_dir(const std::string &dir) {
+    mkdir_p(dir);
+    OsStat st;
+    if (os_stat(dir.c_str(), &st) != 0 || !st.is_dir)
+        return false;
+    const std::string probe = dir + "/.recomp-write-test";
+    os_unlink(probe.c_str());
+    const int fd = os_fd_open(probe.c_str(), OS_O_WRONLY | OS_O_CREAT | OS_O_EXCL);
+    if (fd < 0)
+        return false;
+    os_fd_close(fd);
+    os_unlink(probe.c_str());
+    return true;
 }
 
 HostLayout compute() {
@@ -79,11 +110,32 @@ HostLayout compute() {
     else if (l.developer)
         l.profile_dir = l.build_dir + "/profile";
     else {
-        char buf[4096];
-        if (os_user_data_dir(RECOMP_APP_NAME, buf, sizeof buf) == 0)
-            l.profile_dir = buf;
-        else
-            l.profile_dir = "profile"; // no home at all: beside the cwd
+        // A packaged app that carries Contents/Resources/portable keeps its
+        // saves beside the .app (../saves), so the whole folder can move
+        // between machines. The marker is opt-in: a plain release still uses
+        // the per-user data directory. An explicit RECOMP_PROFILE_DIR already
+        // won above and is never overridden.
+        bool portable = false;
+        if (ends_with(l.resources_dir, "/Contents/Resources") &&
+            exists(l.resources_dir + "/portable")) {
+            const std::string app_dir = parent(parent(parent(l.resources_dir)));
+            const std::string saves = app_dir + "/saves";
+            if (make_writable_dir(saves)) {
+                l.profile_dir = saves;
+                log_msg(1, "[host] portable saves: %s", saves.c_str());
+                portable = true;
+            } else {
+                log_msg(1, "[host] portable saves: %s is not writable; using the user data directory",
+                        saves.c_str());
+            }
+        }
+        if (!portable) {
+            char buf[4096];
+            if (os_user_data_dir(RECOMP_APP_NAME, buf, sizeof buf) == 0)
+                l.profile_dir = buf;
+            else
+                l.profile_dir = "profile"; // no home at all: beside the cwd
+        }
     }
     return l;
 }

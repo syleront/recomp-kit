@@ -3,14 +3,15 @@
 #pragma once
 #include <string>
 
-enum class GamePathSource { Flag, Environment, Checkout, Saved, DataRoot, None };
+enum class GamePathSource { Flag, Environment, Checkout, Saved, Bundled, DataRoot, None };
 struct GamePath {
     std::string exe; // "" when nothing resolved
     GamePathSource source = GamePathSource::None;
 };
 // Order: `flag`, RECOMP_EXE, the checkout's original/gog above the
 // executable (developer mode), <profile_dir>/game-path.txt when its file
-// exists and hashes to the supported digest.
+// exists and hashes to the supported digest, then a portable bundle's
+// <resources>/game/<executable> when that hashes to the supported digest.
 // When data_root is supplied, search only <data_root>/game/<executable>.
 // The platform host supplies the root; the loader still verifies the hash.
 GamePath game_path_resolve(const char *flag, const char *data_root = nullptr);

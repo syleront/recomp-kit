@@ -1,6 +1,7 @@
 #include "game_path.h"
 #include "game_config.h"
 
+#include "../runtime/guest.h"
 #include "../runtime/layout.h"
 #include "../platform/os.h"
 #include "../runtime/loader.h"
@@ -89,6 +90,18 @@ GamePath game_path_resolve(const char *flag, const char *data_root) {
             }
         }
         fclose(f);
+    }
+    // A portable bundle may carry the game itself in Contents/Resources/game.
+    // It is a last resort, after every explicit and remembered location, and
+    // only when it hashes to the pinned image: no launcher prompt, no import.
+    if (g.exe.empty() && !l.resources_dir.empty()) {
+        const std::string root = l.resources_dir + "/game";
+        const std::string candidate = root + "/" RECOMP_EXECUTABLE;
+        if (game_path_is_supported(candidate, nullptr)) {
+            g.exe = candidate;
+            g.source = GamePathSource::Bundled;
+            log_msg(1, "[host] bundled game data: %s", root.c_str());
+        }
     }
     return g;
 }
